@@ -1,153 +1,329 @@
 //! `logi_ffi` — the narrow C ABI between Unreal (caller) and the Rust simulation.
 //!
-//! Contract (ADR-0005): plain data only, NO Unreal types cross, and Rust never
-//! calls Unreal. Every entry point catches panics so a Rust panic can never
-//! unwind across the C boundary (which would be undefined behavior).
+//! Contract (ADR-0005 / AGENTS.md): plain data only, NO Unreal types cross, and
+//! Rust never calls Unreal. Opaque handles; explicit ownership; every exported
+//! function validates the ABI version + null pointers; the hot path is batched
+//! (one snapshot, never per-entity calls). Panics never cross the boundary:
+//! release builds use `panic = "abort"`; non-abort builds are caught here.
 
+use core::slice;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use logi_render_extract::AgentInstance;
-use logi_runtime::LogiRuntime;
-use logi_schema::{AgentSpawnRecipe, LogiAgentId, LogiRouteId, LogiTileId, Vec3};
+use logi_render_extract::LogiAgentInstance;
+use logi_runtime::{LogiWorld, WorldConfig};
+use logi_schema::{LogiCameraView, LogiPlayerIntent, LogiSpawnCommand};
 
-/// ABI version. Bump the major on any breaking change to this header.
-pub const LOGI_ABI_MAJOR: u32 = 0;
-pub const LOGI_ABI_MINOR: u32 = 1;
+/// ABI version. Bump on any breaking change to this header. Callers pass their
+/// compiled-against version in `LogiInitDesc::abi_version`; mismatches are rejected.
+pub const LOGI_ABI_VERSION: u32 = 1;
 
-/// Versioned ABI descriptor returned by [`logi_abi_version`].
+// Status / error codes (returned in `status` fields and `LogiError::code`).
+pub const LOGI_OK: u32 = 0;
+pub const LOGI_ERR_NULL: u32 = 1;
+pub const LOGI_ERR_ABI: u32 = 2;
+pub const LOGI_ERR_PANIC: u32 = 3;
+pub const LOGI_ERR_SNAPSHOT: u32 = 4;
+
+const LOGI_ERROR_MSG_LEN: usize = 256;
+
+/// Structured error out-parameter. The caller owns the storage; `message` is a
+/// fixed, null-terminated buffer (no allocation crosses the boundary).
 #[repr(C)]
-pub struct LogiAbiVersion {
-    pub major: u32,
-    pub minor: u32,
+pub struct LogiError {
+	pub code: u32,
+	pub message: [core::ffi::c_char; 256],
 }
 
-/// Status codes returned across the boundary.
-#[repr(i32)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum LogiStatus {
-    Ok = 0,
-    NullHandle = 1,
-    Panic = 2,
-}
-
-/// Borrowed, read-only view over the runtime's agent snapshot buffer. Valid only
-/// until the next call that mutates the same runtime.
+/// Creation parameters.
 #[repr(C)]
-pub struct LogiInstanceView {
-    pub ptr: *const AgentInstance,
-    pub len: usize,
+pub struct LogiInitDesc {
+	pub abi_version: u32,
+	pub worker_thread_count: u32,
+	pub fixed_step_hz: u32,
+	pub deterministic_seed: u64,
+	pub flags: u32,
 }
 
-/// Plain-data spawn recipe as it crosses the ABI.
+/// Per-frame input from Unreal. `cameras`/`player_intents` are borrowed for the
+/// duration of the call only.
 #[repr(C)]
-pub struct LogiAgentSpawnDesc {
-    pub agent_id: u64,
-    pub route_id: u64,
-    pub tile_id: u64,
-    pub position: Vec3,
-    pub payload_kg: f64,
+pub struct LogiFrameInput {
+	pub unreal_time_seconds: f64,
+	pub frame_delta_seconds: f32,
+	pub max_fixed_steps: u32,
+	pub camera_count: u32,
+	pub cameras: *const LogiCameraView,
+	pub player_intent_count: u32,
+	pub player_intents: *const LogiPlayerIntent,
 }
 
-/// Opaque handle to a runtime instance (a boxed `LogiRuntime`).
-pub type LogiRuntimeHandle = *mut LogiRuntime;
-
-/// Return the ABI version the library was built with.
-#[no_mangle]
-pub extern "C" fn logi_abi_version() -> LogiAbiVersion {
-    LogiAbiVersion { major: LOGI_ABI_MAJOR, minor: LOGI_ABI_MINOR }
+/// Result of a tick.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LogiTickResult {
+	pub fixed_steps_run: u32,
+	pub dropped_steps: u32,
+	pub sim_tick: u64,
+	pub render_snapshot_id: u64,
+	pub status: u32,
 }
 
-/// Create a runtime with a deterministic seed. Returns null on failure.
-#[no_mangle]
-pub extern "C" fn logi_runtime_create(seed: u64) -> LogiRuntimeHandle {
-    catch_unwind(|| Box::into_raw(Box::new(LogiRuntime::new(seed)))).unwrap_or(std::ptr::null_mut())
+impl LogiTickResult {
+	fn empty(status: u32) -> Self {
+		Self { fixed_steps_run: 0, dropped_steps: 0, sim_tick: 0, render_snapshot_id: 0, status }
+	}
 }
 
-/// Destroy a runtime created by [`logi_runtime_create`].
-#[no_mangle]
-pub extern "C" fn logi_runtime_destroy(handle: LogiRuntimeHandle) {
-    if handle.is_null() {
-        return;
-    }
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: `handle` came from `Box::into_raw` and is non-null.
-        unsafe { drop(Box::from_raw(handle)) };
-    }));
+/// Borrowed view over a render snapshot. `agents` is valid only until the next
+/// `logi_world_tick` on the same world.
+#[repr(C)]
+pub struct LogiRenderSnapshot {
+	pub snapshot_id: u64,
+	pub sim_tick: u64,
+	pub agents: *const LogiAgentInstance,
+	pub agent_count: u32,
 }
 
-/// Spawn one agent. Returns its entity bits, or 0 on failure.
-#[no_mangle]
-pub extern "C" fn logi_runtime_spawn_agent(handle: LogiRuntimeHandle, desc: LogiAgentSpawnDesc) -> u64 {
-    if handle.is_null() {
-        return 0;
-    }
-    catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: non-null handle owned by the caller for the call's duration.
-        let rt = unsafe { &mut *handle };
-        rt.spawn_agent(AgentSpawnRecipe {
-            agent: LogiAgentId(desc.agent_id),
-            route: LogiRouteId(desc.route_id),
-            tile: LogiTileId(desc.tile_id),
-            position: desc.position,
-            payload_kg: desc.payload_kg,
-        })
-    }))
-    .unwrap_or(0)
+/// Opaque owned buffer. Reserved for owned out-buffers; release with
+/// [`logi_buffer_release`]. (The snapshot hot path uses a borrowed view instead.)
+#[allow(dead_code)]
+pub struct LogiBuffer {
+	data: Vec<u8>,
 }
 
-/// Advance the deterministic sim by `steps` fixed ticks.
-#[no_mangle]
-pub extern "C" fn logi_runtime_tick(handle: LogiRuntimeHandle, steps: u32) -> LogiStatus {
-    if handle.is_null() {
-        return LogiStatus::NullHandle;
-    }
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        let rt = unsafe { &mut *handle };
-        rt.tick(steps);
-    }));
-    if r.is_ok() {
-        LogiStatus::Ok
-    } else {
-        LogiStatus::Panic
-    }
+// --- error helpers -----------------------------------------------------------
+
+#[derive(thiserror::Error, Debug)]
+enum FfiError {
+	#[error("null pointer argument: {0}")]
+	NullArg(&'static str),
+	#[error("ABI version mismatch: caller={caller}, library={library}")]
+	AbiMismatch { caller: u32, library: u32 },
+	#[error("operation panicked: {0}")]
+	Panic(&'static str),
+	#[error("render snapshot {0} is unavailable")]
+	SnapshotUnavailable(u64),
 }
 
-/// Re-extract and borrow the agent render snapshot. The view is valid until the
-/// next mutating call on this runtime. Fills `out_view`, or zeroes it on error.
-#[no_mangle]
-pub extern "C" fn logi_runtime_extract(handle: LogiRuntimeHandle, out_view: *mut LogiInstanceView) -> LogiStatus {
-    if out_view.is_null() {
-        return LogiStatus::NullHandle;
-    }
-    // Default the out-param to an empty view.
-    // SAFETY: caller guarantees `out_view` points to writable storage.
-    unsafe { *out_view = LogiInstanceView { ptr: std::ptr::null(), len: 0 } };
-    if handle.is_null() {
-        return LogiStatus::NullHandle;
-    }
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        let rt = unsafe { &mut *handle };
-        let snap = rt.extract();
-        LogiInstanceView { ptr: snap.agents.as_ptr(), len: snap.agents.len() }
-    }));
-    match r {
-        Ok(view) => {
-            unsafe { *out_view = view };
-            LogiStatus::Ok
-        }
-        Err(_) => LogiStatus::Panic,
-    }
+impl FfiError {
+	fn code(&self) -> u32 {
+		match self {
+			FfiError::NullArg(_) => LOGI_ERR_NULL,
+			FfiError::AbiMismatch { .. } => LOGI_ERR_ABI,
+			FfiError::Panic(_) => LOGI_ERR_PANIC,
+			FfiError::SnapshotUnavailable(_) => LOGI_ERR_SNAPSHOT,
+		}
+	}
 }
 
-/// Current fixed-step tick (0 on null handle).
+/// Write a structured error into the caller's out-param (no-op if null).
+fn write_err(err: *mut LogiError, e: &FfiError) {
+	if err.is_null() {
+		return;
+	}
+	let msg = e.to_string();
+	let bytes = msg.as_bytes();
+	let n = bytes.len().min(LOGI_ERROR_MSG_LEN - 1);
+	// SAFETY: caller guarantees `err` points to writable LogiError storage.
+	unsafe {
+		(*err).code = e.code();
+		let dst = (*err).message.as_mut_ptr() as *mut u8;
+		core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, n);
+		*dst.add(n) = 0;
+	}
+}
+
+/// Reset the caller's error out-param to "ok".
+fn clear_err(err: *mut LogiError) {
+	if err.is_null() {
+		return;
+	}
+	// SAFETY: caller guarantees `err` points to writable LogiError storage.
+	unsafe {
+		(*err).code = LOGI_OK;
+		(*err).message[0] = 0;
+	}
+}
+
+// --- exported C ABI ----------------------------------------------------------
+
+/// Return the ABI version this library was built with.
 #[no_mangle]
-pub extern "C" fn logi_runtime_tick_count(handle: LogiRuntimeHandle) -> u64 {
-    if handle.is_null() {
-        return 0;
-    }
-    catch_unwind(AssertUnwindSafe(|| {
-        let rt = unsafe { &*handle };
-        rt.tick_count()
-    }))
-    .unwrap_or(0)
+pub extern "C" fn logi_abi_version() -> u32 {
+	LOGI_ABI_VERSION
+}
+
+/// Create a world. Validates the ABI version. Returns null on failure (and fills `err`).
+#[no_mangle]
+pub extern "C" fn logi_world_create(desc: *const LogiInitDesc, err: *mut LogiError) -> *mut LogiWorld {
+	clear_err(err);
+	if desc.is_null() {
+		write_err(err, &FfiError::NullArg("desc"));
+		return std::ptr::null_mut();
+	}
+	// SAFETY: non-null, checked above.
+	let desc = unsafe { &*desc };
+	if desc.abi_version != LOGI_ABI_VERSION {
+		write_err(err, &FfiError::AbiMismatch { caller: desc.abi_version, library: LOGI_ABI_VERSION });
+		return std::ptr::null_mut();
+	}
+
+	let config = WorldConfig {
+		fixed_step_hz: desc.fixed_step_hz,
+		deterministic_seed: desc.deterministic_seed,
+		worker_thread_count: desc.worker_thread_count,
+		flags: desc.flags,
+	};
+
+	match catch_unwind(AssertUnwindSafe(|| Box::into_raw(Box::new(LogiWorld::new(config))))) {
+		Ok(ptr) => ptr,
+		Err(_) => {
+			write_err(err, &FfiError::Panic("logi_world_create"));
+			std::ptr::null_mut()
+		}
+	}
+}
+
+/// Destroy a world created by [`logi_world_create`].
+#[no_mangle]
+pub extern "C" fn logi_world_destroy(world: *mut LogiWorld) {
+	if world.is_null() {
+		return;
+	}
+	// SAFETY: `world` came from Box::into_raw and is non-null.
+	let _ = catch_unwind(AssertUnwindSafe(|| unsafe { drop(Box::from_raw(world)) }));
+}
+
+/// Advance the simulation. The fixed-step accumulator is internal to Rust.
+#[no_mangle]
+pub extern "C" fn logi_world_tick(world: *mut LogiWorld, input: *const LogiFrameInput, err: *mut LogiError) -> LogiTickResult {
+	clear_err(err);
+	if world.is_null() || input.is_null() {
+		write_err(err, &FfiError::NullArg(if world.is_null() { "world" } else { "input" }));
+		return LogiTickResult::empty(LOGI_ERR_NULL);
+	}
+
+	// SAFETY: both non-null (checked). `world` is uniquely owned by the caller
+	// for this call (rule 7: not reentrant).
+	let result = catch_unwind(AssertUnwindSafe(|| {
+		let world = unsafe { &mut *world };
+		let input = unsafe { &*input };
+
+		let cameras: &[LogiCameraView] = if input.cameras.is_null() || input.camera_count == 0 {
+			&[]
+		} else {
+			unsafe { slice::from_raw_parts(input.cameras, input.camera_count as usize) }
+		};
+		let intents: &[LogiPlayerIntent] = if input.player_intents.is_null() || input.player_intent_count == 0 {
+			&[]
+		} else {
+			unsafe { slice::from_raw_parts(input.player_intents, input.player_intent_count as usize) }
+		};
+
+		world.tick(input.frame_delta_seconds, input.max_fixed_steps, cameras, intents)
+	}));
+
+	match result {
+		Ok(o) => LogiTickResult {
+			fixed_steps_run: o.fixed_steps_run,
+			dropped_steps: o.dropped_steps,
+			sim_tick: o.sim_tick,
+			render_snapshot_id: o.render_snapshot_id,
+			status: LOGI_OK,
+		},
+		Err(_) => {
+			write_err(err, &FfiError::Panic("logi_world_tick"));
+			LogiTickResult::empty(LOGI_ERR_PANIC)
+		}
+	}
+}
+
+/// Fill `out_snapshot` with a borrowed view of a render snapshot. Pass
+/// `snapshot_id == 0` for the latest. View is valid until the next tick.
+#[no_mangle]
+pub extern "C" fn logi_world_get_render_snapshot(
+	world: *mut LogiWorld,
+	snapshot_id: u64,
+	out_snapshot: *mut LogiRenderSnapshot,
+	err: *mut LogiError,
+) -> u32 {
+	clear_err(err);
+	if world.is_null() || out_snapshot.is_null() {
+		write_err(err, &FfiError::NullArg(if world.is_null() { "world" } else { "out_snapshot" }));
+		return LOGI_ERR_NULL;
+	}
+	// Default the out-param to empty.
+	// SAFETY: non-null, checked above.
+	unsafe {
+		*out_snapshot = LogiRenderSnapshot { snapshot_id: 0, sim_tick: 0, agents: std::ptr::null(), agent_count: 0 };
+	}
+
+	let result = catch_unwind(AssertUnwindSafe(|| {
+		let world = unsafe { &*world };
+		world.snapshot_view(snapshot_id).map(|s| LogiRenderSnapshot {
+			snapshot_id: s.snapshot_id,
+			sim_tick: s.sim_tick,
+			agents: s.agents.as_ptr(),
+			agent_count: s.agents.len() as u32,
+		})
+	}));
+
+	match result {
+		Ok(Some(view)) => {
+			unsafe { *out_snapshot = view };
+			LOGI_OK
+		}
+		Ok(None) => {
+			write_err(err, &FfiError::SnapshotUnavailable(snapshot_id));
+			LOGI_ERR_SNAPSHOT
+		}
+		Err(_) => {
+			write_err(err, &FfiError::Panic("logi_world_get_render_snapshot"));
+			LOGI_ERR_PANIC
+		}
+	}
+}
+
+/// Submit a batch of spawn commands (a controlled mutation phase). Returns the
+/// number applied; 0 with an error set on failure.
+#[no_mangle]
+pub extern "C" fn logi_submit_spawn_commands(
+	world: *mut LogiWorld,
+	commands: *const LogiSpawnCommand,
+	count: u32,
+	err: *mut LogiError,
+) -> u32 {
+	clear_err(err);
+	if world.is_null() || (commands.is_null() && count != 0) {
+		write_err(err, &FfiError::NullArg(if world.is_null() { "world" } else { "commands" }));
+		return 0;
+	}
+	if count == 0 {
+		return 0;
+	}
+
+	let result = catch_unwind(AssertUnwindSafe(|| {
+		let world = unsafe { &mut *world };
+		let cmds = unsafe { slice::from_raw_parts(commands, count as usize) };
+		world.submit_spawn_commands(cmds)
+	}));
+
+	match result {
+		Ok(applied) => applied,
+		Err(_) => {
+			write_err(err, &FfiError::Panic("logi_submit_spawn_commands"));
+			0
+		}
+	}
+}
+
+/// Release an owned buffer previously handed out by the API. (Reserved; the
+/// snapshot path uses borrowed views.)
+#[no_mangle]
+pub extern "C" fn logi_buffer_release(_world: *mut LogiWorld, buffer: *mut LogiBuffer) {
+	if buffer.is_null() {
+		return;
+	}
+	// SAFETY: `buffer`, if non-null, was produced by this library via Box::into_raw.
+	let _ = catch_unwind(AssertUnwindSafe(|| unsafe { drop(Box::from_raw(buffer)) }));
 }

@@ -1,8 +1,0 @@
-[package]
-name = "logi_terrain"
-edition.workspace = true
-version.workspace = true
-publish = false
-
-[dependencies]
-logi_schema = { path = "../logi_schema" }

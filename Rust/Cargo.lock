@@ -586,6 +586,7 @@ dependencies = [
  "logi_render_extract",
  "logi_runtime",
  "logi_schema",
+ "thiserror",
 ]
 
 [[package]]
@@ -605,26 +606,20 @@ dependencies = [
  "logi_render_extract",
  "logi_schema",
  "logi_sim",
- "logi_terrain",
 ]
 
 [[package]]
 name = "logi_schema"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "logi_sim"
 version = "0.1.0"
 dependencies = [
  "bevy_ecs",
- "logi_schema",
- "logi_terrain",
-]
-
-[[package]]
-name = "logi_terrain"
-version = "0.1.0"
-dependencies = [
  "logi_schema",
 ]
 

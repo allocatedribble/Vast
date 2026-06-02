@@ -5,3 +5,4 @@ version.workspace = true
 publish = false
 
 [dependencies]
+serde = { workspace = true }

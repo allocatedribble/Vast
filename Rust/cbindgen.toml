@@ -11,13 +11,13 @@ cpp_compat = true
 documentation = true
 style = "type"
 
-# The handle target is a boxed Rust `LogiRuntime` (non-C, lives in logi_runtime),
-# so cbindgen can't see its layout. Forward-declare it as an opaque struct.
-after_includes = "\n/* Opaque: a boxed Rust LogiRuntime instance (crate logi_runtime). */\ntypedef struct LogiRuntime LogiRuntime;"
+# Opaque handles are boxed Rust types cbindgen can't see through; forward-declare
+# them and exclude their (non-existent) definitions from generation.
+after_includes = "\n/* Opaque handles owned by Rust. */\ntypedef struct LogiWorld LogiWorld;\ntypedef struct LogiBuffer LogiBuffer;"
 
 [parse]
 parse_deps = true
 include = ["logi_ffi", "logi_render_extract", "logi_schema"]
 
 [export]
-# Emit the opaque runtime handle as a forward-declared struct.
+exclude = ["LogiWorld", "LogiBuffer"]

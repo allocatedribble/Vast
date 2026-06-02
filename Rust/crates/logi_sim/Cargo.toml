@@ -7,4 +7,3 @@ publish = false
 [dependencies]
 bevy_ecs.workspace = true
 logi_schema = { path = "../logi_schema" }
-logi_terrain = { path = "../logi_terrain" }

@@ -1,6 +1,7 @@
 // Copyright LogiUE. All Rights Reserved.
 
 #include "LogiBevySubsystem.h"
+#include "Engine/World.h"
 
 #if LOGI_BEVY_HAVE_RUST
 #include "logi_bevy_ffi.h"
@@ -11,38 +12,45 @@ void ULogiBevySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	Super::Initialize(Collection);
 
 #if LOGI_BEVY_HAVE_RUST
-	// Seed 'LOGI' for a deterministic start. Spawn a few demo agents so the
-	// snapshot pipeline has something to surface.
-	RuntimeHandle = static_cast<void*>(logi_runtime_create(0x4C4F4749ull));
-	if (RuntimeHandle != nullptr)
+	LogiInitDesc Desc{};
+	Desc.abi_version = LOGI_ABI_VERSION;
+	Desc.worker_thread_count = 0;
+	Desc.fixed_step_hz = 30;
+	Desc.deterministic_seed = 0x4C4F4749ull; // 'LOGI'
+	Desc.flags = 0;
+
+	LogiError Err{};
+	WorldHandle = static_cast<void*>(logi_world_create(&Desc, &Err));
+	if (WorldHandle == nullptr)
 	{
-		for (int32 Index = 0; Index < 4; ++Index)
-		{
-			LogiAgentSpawnDesc Desc{};
-			Desc.agent_id = static_cast<uint64>(Index + 1);
-			Desc.route_id = 1;
-			Desc.tile_id = 1;
-			Desc.position = Vec3{ static_cast<float>(Index) * 200.0f, 0.0f, 0.0f };
-			Desc.payload_kg = 10.0;
-			logi_runtime_spawn_agent(static_cast<LogiRuntimeHandle>(RuntimeHandle), Desc);
-		}
-		AdvanceAndExtract(1);
-		UE_LOG(LogLogiBevy, Log, TEXT("Bevy runtime created; %d demo agents in snapshot."), AgentInstances.Num());
+		UE_LOG(LogLogiBevy, Error, TEXT("logi_world_create failed (code %u): %s"), Err.code, UTF8_TO_TCHAR(Err.message));
+		return;
 	}
-	else
+
+	// Seed a few demo agents through the batched spawn-command path.
+	LogiSpawnCommand Commands[4];
+	FMemory::Memzero(Commands, sizeof(Commands));
+	for (int32 Index = 0; Index < 4; ++Index)
 	{
-		UE_LOG(LogLogiBevy, Error, TEXT("logi_runtime_create returned null."));
+		Commands[Index].kind = 1;
+		Commands[Index].position[0] = static_cast<double>(Index) * 200.0;
+		Commands[Index].route_id = 1;
+		Commands[Index].payload_kg = 10.0;
 	}
+
+	LogiError SpawnErr{};
+	const uint32 Applied = logi_submit_spawn_commands(static_cast<LogiWorld*>(WorldHandle), Commands, 4, &SpawnErr);
+	UE_LOG(LogLogiBevy, Log, TEXT("Bevy world created; %u demo agents submitted."), Applied);
 #endif
 }
 
 void ULogiBevySubsystem::Deinitialize()
 {
 #if LOGI_BEVY_HAVE_RUST
-	if (RuntimeHandle != nullptr)
+	if (WorldHandle != nullptr)
 	{
-		logi_runtime_destroy(static_cast<LogiRuntimeHandle>(RuntimeHandle));
-		RuntimeHandle = nullptr;
+		logi_world_destroy(static_cast<LogiWorld*>(WorldHandle));
+		WorldHandle = nullptr;
 	}
 #endif
 	AgentInstances.Reset();
@@ -55,7 +63,6 @@ bool ULogiBevySubsystem::ShouldCreateSubsystem(UObject* Outer) const
 	{
 		return false;
 	}
-	// Real game worlds only (incl. PIE) — not editor preview/inactive worlds.
 	if (const UWorld* World = Cast<UWorld>(Outer))
 	{
 		return World->IsGameWorld();
@@ -68,64 +75,48 @@ void ULogiBevySubsystem::Tick(float DeltaTime)
 	Super::Tick(DeltaTime);
 
 #if LOGI_BEVY_HAVE_RUST
-	if (RuntimeHandle == nullptr)
+	if (WorldHandle == nullptr)
 	{
 		return;
 	}
 
-	Accumulator += DeltaTime;
-	int32 Steps = 0;
-	// Fixed-step catch-up, clamped so a hitch can't spiral.
-	while (Accumulator >= FixedStepSeconds && Steps < 8)
-	{
-		Accumulator -= FixedStepSeconds;
-		++Steps;
-	}
-	if (Steps > 0)
-	{
-		AdvanceAndExtract(Steps);
-	}
-#endif
-}
+	// Hand the frame delta to Rust; the fixed-step accumulator + clamp live there.
+	LogiFrameInput Input{};
+	Input.unreal_time_seconds = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+	Input.frame_delta_seconds = DeltaTime;
+	Input.max_fixed_steps = 8;
+	Input.camera_count = 0;
+	Input.cameras = nullptr;
+	Input.player_intent_count = 0;
+	Input.player_intents = nullptr;
 
-void ULogiBevySubsystem::AdvanceAndExtract(int32 Steps)
-{
-#if LOGI_BEVY_HAVE_RUST
-	if (RuntimeHandle == nullptr)
+	LogiError TickErr{};
+	const LogiTickResult Result = logi_world_tick(static_cast<LogiWorld*>(WorldHandle), &Input, &TickErr);
+	if (Result.status != LOGI_OK)
 	{
+		UE_LOG(LogLogiBevy, Warning, TEXT("logi_world_tick status %u: %s"), Result.status, UTF8_TO_TCHAR(TickErr.message));
 		return;
 	}
+	LastSimTick = static_cast<int64>(Result.sim_tick);
 
-	logi_runtime_tick(static_cast<LogiRuntimeHandle>(RuntimeHandle), static_cast<uint32>(Steps));
-
-	LogiInstanceView View{};
-	if (logi_runtime_extract(static_cast<LogiRuntimeHandle>(RuntimeHandle), &View) == LogiStatus::Ok)
+	// Pull the latest batched snapshot (one call, not per-entity).
+	LogiRenderSnapshot Snapshot{};
+	LogiError SnapErr{};
+	if (logi_world_get_render_snapshot(static_cast<LogiWorld*>(WorldHandle), 0 /*latest*/, &Snapshot, &SnapErr) == LOGI_OK)
 	{
-		AgentInstances.Reset(static_cast<int32>(View.len));
-		for (uintptr_t Index = 0; Index < View.len; ++Index)
+		AgentInstances.Reset(static_cast<int32>(Snapshot.agent_count));
+		for (uint32 Index = 0; Index < Snapshot.agent_count; ++Index)
 		{
-			const AgentInstance& Src = View.ptr[Index];
+			const LogiAgentInstance& Src = Snapshot.agents[Index];
 			FLogiAgentInstance& Dst = AgentInstances.AddDefaulted_GetRef();
-			Dst.Entity = static_cast<int64>(Src.entity);
+			Dst.EntityIndex = static_cast<int64>(Src.id.index);
+			Dst.EntityGeneration = static_cast<int32>(Src.id.generation);
+			Dst.EntityKind = static_cast<int32>(Src.id.kind);
 			Dst.Location = FVector(Src.x, Src.y, Src.z);
-			Dst.AgentId = static_cast<int64>(Src.agent_id);
 			Dst.SimLOD = Src.sim_lod;
 		}
 	}
-#else
-	(void)Steps;
 #endif
-}
-
-int64 ULogiBevySubsystem::GetSimTick() const
-{
-#if LOGI_BEVY_HAVE_RUST
-	if (RuntimeHandle != nullptr)
-	{
-		return static_cast<int64>(logi_runtime_tick_count(static_cast<LogiRuntimeHandle>(RuntimeHandle)));
-	}
-#endif
-	return 0;
 }
 
 TStatId ULogiBevySubsystem::GetStatId() const

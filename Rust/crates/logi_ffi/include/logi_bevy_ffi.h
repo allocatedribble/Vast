@@ -10,137 +10,185 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-/* Opaque: a boxed Rust LogiRuntime instance (crate logi_runtime). */
-typedef struct LogiRuntime LogiRuntime;
+/* Opaque handles owned by Rust. */
+typedef struct LogiWorld LogiWorld;
+typedef struct LogiBuffer LogiBuffer;
 
 /**
- * ABI version. Bump the major on any breaking change to this header.
+ * ABI version. Bump on any breaking change to this header. Callers pass their
+ * compiled-against version in `LogiInitDesc::abi_version`; mismatches are rejected.
  */
-#define LOGI_ABI_MAJOR 0
+#define LOGI_ABI_VERSION 1
 
-#define LOGI_ABI_MINOR 1
+#define LOGI_OK 0
 
-/**
- * Status codes returned across the boundary.
- */
-enum LogiStatus
-#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
-  : int32_t
-#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
- {
-  Ok = 0,
-  NullHandle = 1,
-  Panic = 2,
-};
-#ifndef __cplusplus
-#if __STDC_VERSION__ >= 202311L
-typedef enum LogiStatus LogiStatus;
-#else
-typedef int32_t LogiStatus;
-#endif // __STDC_VERSION__ >= 202311L
-#endif // __cplusplus
+#define LOGI_ERR_NULL 1
+
+#define LOGI_ERR_ABI 2
+
+#define LOGI_ERR_PANIC 3
+
+#define LOGI_ERR_SNAPSHOT 4
 
 /**
- * Versioned ABI descriptor returned by [`logi_abi_version`].
+ * Creation parameters.
  */
 typedef struct {
-  uint32_t major;
-  uint32_t minor;
-} LogiAbiVersion;
+  uint32_t abi_version;
+  uint32_t worker_thread_count;
+  uint32_t fixed_step_hz;
+  uint64_t deterministic_seed;
+  uint32_t flags;
+} LogiInitDesc;
 
 /**
- * Opaque handle to a runtime instance (a boxed `LogiRuntime`).
- */
-typedef LogiRuntime *LogiRuntimeHandle;
-
-/**
- * Minimal POD 3-vector. `repr(C)` so it crosses the FFI verbatim; `f32` for
- * parity with Unreal's render-side instance data.
+ * Structured error out-parameter. The caller owns the storage; `message` is a
+ * fixed, null-terminated buffer (no allocation crosses the boundary).
  */
 typedef struct {
-  float x;
-  float y;
-  float z;
-} Vec3;
-#define Vec3_ZERO (Vec3){ .x = 0.0, .y = 0.0, .z = 0.0 }
+  uint32_t code;
+  char message[256];
+} LogiError;
 
 /**
- * Plain-data spawn recipe as it crosses the ABI.
+ * Result of a tick.
  */
 typedef struct {
-  uint64_t agent_id;
-  uint64_t route_id;
-  uint64_t tile_id;
-  Vec3 position;
-  double payload_kg;
-} LogiAgentSpawnDesc;
+  uint32_t fixed_steps_run;
+  uint32_t dropped_steps;
+  uint64_t sim_tick;
+  uint64_t render_snapshot_id;
+  uint32_t status;
+} LogiTickResult;
+
+/**
+ * A camera view feeding the significance model (ADR-0003). World-scale, so f64.
+ */
+typedef struct {
+  double position[3];
+  double forward[3];
+  float fov_degrees;
+  float screen_height_px;
+} LogiCameraView;
+
+/**
+ * The durable simulation identity exposed to Unreal. Stable across the entity's
+ * life and independent of `bevy_ecs::Entity` (which is recycled and internal).
+ * `index == 0` (with `generation == 0`) denotes "invalid / auto-allocate".
+ */
+typedef struct {
+  uint64_t index;
+  uint32_t generation;
+  uint16_t shard;
+  uint16_t kind;
+} LogiEntityId;
+
+/**
+ * A player intent (select, pin, command). Non-authoritative input.
+ */
+typedef struct {
+  uint32_t kind;
+  LogiEntityId target;
+  double params[4];
+} LogiPlayerIntent;
+
+/**
+ * Per-frame input from Unreal. `cameras`/`player_intents` are borrowed for the
+ * duration of the call only.
+ */
+typedef struct {
+  double unreal_time_seconds;
+  float frame_delta_seconds;
+  uint32_t max_fixed_steps;
+  uint32_t camera_count;
+  const LogiCameraView *cameras;
+  uint32_t player_intent_count;
+  const LogiPlayerIntent *player_intents;
+} LogiFrameInput;
 
 /**
  * One agent's render-relevant state. `repr(C)`: crosses the FFI verbatim.
  */
 typedef struct {
-  /**
-   * Bevy entity bits (stable within a runtime instance).
-   */
-  uint64_t entity;
+  LogiEntityId id;
   float x;
   float y;
   float z;
-  uint64_t agent_id;
   /**
    * 0 = High, 1 = Medium, 2 = Low, 3 = Off (significance-driven; ADR-0003).
    */
   uint8_t sim_lod;
-} AgentInstance;
+} LogiAgentInstance;
 
 /**
- * Borrowed, read-only view over the runtime's agent snapshot buffer. Valid only
- * until the next call that mutates the same runtime.
+ * Borrowed view over a render snapshot. `agents` is valid only until the next
+ * `logi_world_tick` on the same world.
  */
 typedef struct {
-  const AgentInstance *ptr;
-  uintptr_t len;
-} LogiInstanceView;
+  uint64_t snapshot_id;
+  uint64_t sim_tick;
+  const LogiAgentInstance *agents;
+  uint32_t agent_count;
+} LogiRenderSnapshot;
+
+/**
+ * A request to spawn one entity. `requested_id` invalid => auto-allocate.
+ */
+typedef struct {
+  uint16_t kind;
+  LogiEntityId requested_id;
+  double position[3];
+  uint64_t route_id;
+  double payload_kg;
+} LogiSpawnCommand;
 
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
 
 /**
- * Return the ABI version the library was built with.
+ * Return the ABI version this library was built with.
  */
-LogiAbiVersion logi_abi_version(void);
+uint32_t logi_abi_version(void);
 
 /**
- * Create a runtime with a deterministic seed. Returns null on failure.
+ * Create a world. Validates the ABI version. Returns null on failure (and fills `err`).
  */
-LogiRuntimeHandle logi_runtime_create(uint64_t seed);
+LogiWorld *logi_world_create(const LogiInitDesc *desc, LogiError *err);
 
 /**
- * Destroy a runtime created by [`logi_runtime_create`].
+ * Destroy a world created by [`logi_world_create`].
  */
-void logi_runtime_destroy(LogiRuntimeHandle handle);
+void logi_world_destroy(LogiWorld *world);
 
 /**
- * Spawn one agent. Returns its entity bits, or 0 on failure.
+ * Advance the simulation. The fixed-step accumulator is internal to Rust.
  */
-uint64_t logi_runtime_spawn_agent(LogiRuntimeHandle handle, LogiAgentSpawnDesc desc);
+LogiTickResult logi_world_tick(LogiWorld *world, const LogiFrameInput *input, LogiError *err);
 
 /**
- * Advance the deterministic sim by `steps` fixed ticks.
+ * Fill `out_snapshot` with a borrowed view of a render snapshot. Pass
+ * `snapshot_id == 0` for the latest. View is valid until the next tick.
  */
-LogiStatus logi_runtime_tick(LogiRuntimeHandle handle, uint32_t steps);
+uint32_t logi_world_get_render_snapshot(LogiWorld *world,
+                                        uint64_t snapshot_id,
+                                        LogiRenderSnapshot *out_snapshot,
+                                        LogiError *err);
 
 /**
- * Re-extract and borrow the agent render snapshot. The view is valid until the
- * next mutating call on this runtime. Fills `out_view`, or zeroes it on error.
+ * Submit a batch of spawn commands (a controlled mutation phase). Returns the
+ * number applied; 0 with an error set on failure.
  */
-LogiStatus logi_runtime_extract(LogiRuntimeHandle handle, LogiInstanceView *out_view);
+uint32_t logi_submit_spawn_commands(LogiWorld *world,
+                                    const LogiSpawnCommand *commands,
+                                    uint32_t count,
+                                    LogiError *err);
 
 /**
- * Current fixed-step tick (0 on null handle).
+ * Release an owned buffer previously handed out by the API. (Reserved; the
+ * snapshot path uses borrowed views.)
  */
-uint64_t logi_runtime_tick_count(LogiRuntimeHandle handle);
+void logi_buffer_release(LogiWorld *_world, LogiBuffer *buffer);
 
 #ifdef __cplusplus
 }  // extern "C"
