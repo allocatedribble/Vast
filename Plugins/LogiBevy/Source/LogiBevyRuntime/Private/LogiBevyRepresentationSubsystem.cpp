@@ -102,6 +102,8 @@ bool ULogiBevyRepresentationSubsystem::ShouldCreateSubsystem(UObject* Outer) con
 
 void ULogiBevyRepresentationSubsystem::TickRepresentation(float DeltaTime)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(LogiBevy_RepresentationApply);
+
 	UWorld* World = GetWorld();
 	if (World == nullptr)
 	{

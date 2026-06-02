@@ -112,6 +112,8 @@ void ULogiBevySubsystem::TickSimulation(float DeltaTime)
 		return;
 	}
 
+	TRACE_CPUPROFILER_EVENT_SCOPE(LogiBevy_SimTick);
+
 	LogiFrameInput Input{};
 	Input.unreal_time_seconds = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
 	Input.frame_delta_seconds = DeltaTime;

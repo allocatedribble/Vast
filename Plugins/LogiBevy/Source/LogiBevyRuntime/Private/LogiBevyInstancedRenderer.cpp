@@ -94,6 +94,8 @@ UInstancedStaticMeshComponent* FLogiInstancedRenderer::GetOrCreateComponent(cons
 
 void FLogiInstancedRenderer::ApplyBatch(const LogiStaticBatch& Batch)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE(LogiBevy_IsmUpload);
+
 	const FLogiBucketKey Key{ Batch.mesh.stable_hash, Batch.material.stable_hash, Batch.lod };
 	UInstancedStaticMeshComponent* Ism = GetOrCreateComponent(Key);
 	if (Ism == nullptr)

@@ -20,7 +20,15 @@ void FLogiActorPool::Shutdown()
 			Actor->Destroy();
 		}
 	}
+	for (TWeakObjectPtr<AStaticMeshActor>& Weak : Pool)
+	{
+		if (AStaticMeshActor* Actor = Weak.Get())
+		{
+			Actor->Destroy();
+		}
+	}
 	EntityToActor.Reset();
+	Pool.Reset();
 	World.Reset();
 }
 
@@ -49,8 +57,8 @@ AStaticMeshActor* FLogiActorPool::SpawnActor(const FVector& Location)
 
 	if (UStaticMeshComponent* MeshComp = Actor->GetStaticMeshComponent())
 	{
-		// Configure before FinishSpawning so a Movable static-mesh actor is valid.
 		MeshComp->SetMobility(EComponentMobility::Movable);
+		// TODO: resolve actor_class / skeletal_mesh via ULogiBevyAssetRegistry. Default cube for now.
 		if (UStaticMesh* Cube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube")))
 		{
 			MeshComp->SetStaticMesh(Cube);
@@ -59,6 +67,32 @@ AStaticMeshActor* FLogiActorPool::SpawnActor(const FVector& Location)
 
 	Actor->FinishSpawning(SpawnTransform);
 	return Actor;
+}
+
+AStaticMeshActor* FLogiActorPool::AcquireActor(const FVector& Location)
+{
+	// Reuse a pooled (hidden) actor if available; skip any GC'd entries.
+	while (Pool.Num() > 0)
+	{
+		TWeakObjectPtr<AStaticMeshActor> Weak = Pool.Pop(EAllowShrinking::No);
+		if (AStaticMeshActor* Actor = Weak.Get())
+		{
+			Actor->SetActorHiddenInGame(false);
+			Actor->SetActorLocation(Location);
+			return Actor;
+		}
+	}
+	return SpawnActor(Location);
+}
+
+void FLogiActorPool::HideAndPool(AStaticMeshActor* Actor)
+{
+	if (Actor == nullptr)
+	{
+		return;
+	}
+	Actor->SetActorHiddenInGame(true);
+	Pool.Add(Actor);
 }
 
 void FLogiActorPool::ApplyActorUpdate(const LogiActorUpdate& Update)
@@ -70,13 +104,12 @@ void FLogiActorPool::ApplyActorUpdate(const LogiActorUpdate& Update)
 	TWeakObjectPtr<AStaticMeshActor>& Slot = EntityToActor.FindOrAdd(Entity);
 	if (!Slot.IsValid())
 	{
-		Slot = SpawnActor(Location);
+		Slot = AcquireActor(Location);
 	}
 	if (AStaticMeshActor* Actor = Slot.Get())
 	{
 		Actor->SetActorLocation(Location);
-		// TODO: rotation/scale from transform_3x4; skeletal mesh from Update.skeletal_mesh
-		// via ULogiBevyAssetRegistry; animation deferred (per user request).
+		// TODO: rotation/scale from transform_3x4; skeletal mesh from Update.skeletal_mesh.
 	}
 }
 
@@ -85,9 +118,6 @@ void FLogiActorPool::ReleaseEntity(uint64 EntityIndex)
 	TWeakObjectPtr<AStaticMeshActor> Removed;
 	if (EntityToActor.RemoveAndCopyValue(EntityIndex, Removed))
 	{
-		if (AStaticMeshActor* Actor = Removed.Get())
-		{
-			Actor->Destroy();
-		}
+		HideAndPool(Removed.Get());
 	}
 }

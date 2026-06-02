@@ -6,6 +6,10 @@
 #include "HAL/PlatformProcess.h"
 #include "Misc/Paths.h"
 
+#if LOGI_BEVY_HAVE_RUST
+#include "logi_bevy_ffi.h"
+#endif
+
 DEFINE_LOG_CATEGORY(LogLogiBevy);
 
 /**
@@ -33,6 +37,16 @@ public:
 		UE_CLOG(DllHandle == nullptr, LogLogiBevy, Error,
 			TEXT("Failed to load logi_ffi.dll (looked for '%s'). The Bevy sim will be unavailable."), *DllPath);
 		UE_CLOG(DllHandle != nullptr, LogLogiBevy, Log, TEXT("Loaded logi_ffi.dll: '%s'."), *DllPath);
+
+		if (DllHandle != nullptr)
+		{
+			// Fail loud on a stale DLL (ABI drift) rather than crashing in a later call.
+			const uint32 LibVersion = logi_abi_version();
+			UE_CLOG(LibVersion != LOGI_ABI_VERSION, LogLogiBevy, Error,
+				TEXT("logi_ffi ABI MISMATCH: header=%u, loaded DLL=%u. Rebuild the plugin (editor closed) to stage the matching DLL."),
+				static_cast<uint32>(LOGI_ABI_VERSION), LibVersion);
+			UE_CLOG(LibVersion == LOGI_ABI_VERSION, LogLogiBevy, Log, TEXT("logi_ffi ABI version %u OK."), LibVersion);
+		}
 #endif
 	}
 
