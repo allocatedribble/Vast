@@ -3,9 +3,14 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "UObject/WeakObjectPtr.h"
 #include "logi_bevy_ffi.h"
 
-/** Identifies a retained instancing bucket: one ISM/HISM per mesh/material/LOD. */
+class UWorld;
+class AActor;
+class UInstancedStaticMeshComponent;
+
+/** Identifies a retained instancing bucket: one ISM per mesh/material/LOD. */
 struct FLogiBucketKey
 {
 	uint64 Mesh = 0;
@@ -24,16 +29,25 @@ FORCEINLINE uint32 GetTypeHash(const FLogiBucketKey& Key)
 }
 
 /**
- * Retained instanced-static-mesh renderer (§8): one logical bucket per
- * mesh/material/LOD, a stable entity->slot table, and a per-bucket free-list.
- * Applies batched instance deltas; keeps slots stable across frames.
+ * Retained instanced-static-mesh renderer (§8 / audit #2): one ISM component per
+ * mesh/material/LOD bucket, all owned by a single transient host actor (no
+ * per-entity actor). A stable entity->slot table + per-bucket free-list keeps
+ * instance indices stable across frames; despawns HIDE (zero-scale) and recycle a
+ * slot rather than RemoveInstance (which would renumber every later instance).
+ * Instances are uploaded in world space = frame origin + rebased local (P0 #6).
  *
- * (UObject HISM creation, asset resolution, and transform upload are TODOs
- * pending the asset-handle->UObject bridge; the retained bookkeeping is real.)
+ * Mesh/material come from the bucket handle via ULogiBevyAssetRegistry (TODO:
+ * wired next); a default cube stands in until then.
  */
 class FLogiInstancedRenderer
 {
 public:
+	void Initialize(UWorld* InWorld);
+	void Shutdown();
+
+	/// Local-frame origin (world cm) for the current snapshot (P0 #6).
+	void SetFrameOrigin(const FVector& InOrigin) { FrameOrigin = InOrigin; }
+
 	void ApplyBatch(const LogiStaticBatch& Batch);
 	void ApplyDespawn(uint64 EntityIndex);
 	void Reset();
@@ -44,10 +58,16 @@ public:
 private:
 	struct FBucket
 	{
-		int32 HighWater = 0;     // next never-used slot
-		TArray<int32> FreeSlots; // recycled slots
+		TWeakObjectPtr<UInstancedStaticMeshComponent> Ism;
+		int32 HighWater = 0;     // next never-used instance index
+		TArray<int32> FreeSlots; // hidden, recycled indices
 
-		int32 Acquire() { return FreeSlots.Num() > 0 ? FreeSlots.Pop() : HighWater++; }
+		int32 Acquire(bool& bOutIsNew)
+		{
+			if (FreeSlots.Num() > 0) { bOutIsNew = false; return FreeSlots.Pop(); }
+			bOutIsNew = true;
+			return HighWater++;
+		}
 		void Release(int32 Slot) { FreeSlots.Add(Slot); }
 	};
 
@@ -57,6 +77,11 @@ private:
 		int32 Slot = INDEX_NONE;
 	};
 
+	UInstancedStaticMeshComponent* GetOrCreateComponent(const FLogiBucketKey& Key);
+
+	TWeakObjectPtr<UWorld> World;
+	TWeakObjectPtr<AActor> HostActor;
+	FVector FrameOrigin = FVector::ZeroVector;
 	TMap<FLogiBucketKey, FBucket> Buckets;
 	TMap<uint64 /*entity index*/, FSlotRef> EntityToSlot;
 };

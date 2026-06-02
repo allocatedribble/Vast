@@ -58,7 +58,12 @@ void ULogiBevyRepresentationSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 		RepTickFunction.AddPrerequisite(Sim, Sim->GetSimTickFunction());
 	}
 
-	// The actor pool spawns real actors into this world for promoted entities.
+	// The renderers create world objects: the instanced renderer's host actor + ISM
+	// components for the many, and the actor pool's promoted actors for the few.
+	if (InstancedRenderer.IsValid())
+	{
+		InstancedRenderer->Initialize(&InWorld);
+	}
 	if (ActorPool.IsValid())
 	{
 		ActorPool->Initialize(&InWorld);
@@ -70,6 +75,10 @@ void ULogiBevyRepresentationSubsystem::Deinitialize()
 	if (RepTickFunction.IsTickFunctionRegistered())
 	{
 		RepTickFunction.UnRegisterTickFunction();
+	}
+	if (InstancedRenderer.IsValid())
+	{
+		InstancedRenderer->Shutdown();
 	}
 	if (ActorPool.IsValid())
 	{
@@ -113,6 +122,11 @@ void ULogiBevyRepresentationSubsystem::TickRepresentation(float DeltaTime)
 		return;
 	}
 
+	// Local-frame origin (P0 #6): both renderers place content at origin + rebased local.
+	const FVector FrameOrigin(Snapshot.world_origin_cm[0], Snapshot.world_origin_cm[1], Snapshot.world_origin_cm[2]);
+	InstancedRenderer->SetFrameOrigin(FrameOrigin);
+	ActorPool->SetFrameOrigin(FrameOrigin);
+
 	// Despawns: drop the entity from every representation.
 	for (uint32 D = 0; D < Snapshot.despawn_count; ++D)
 	{
@@ -134,9 +148,6 @@ void ULogiBevyRepresentationSubsystem::TickRepresentation(float DeltaTime)
 		}
 		InstancedRenderer->ApplyBatch(Batch);
 	}
-
-	// Local-frame origin (P0 #6): actors are placed at origin + rebased local transform.
-	ActorPool->SetFrameOrigin(FVector(Snapshot.world_origin_cm[0], Snapshot.world_origin_cm[1], Snapshot.world_origin_cm[2]));
 
 	// Actor updates: move entities out of ISM, then apply actor + animation.
 	for (uint32 A = 0; A < Snapshot.actor_update_count; ++A)
