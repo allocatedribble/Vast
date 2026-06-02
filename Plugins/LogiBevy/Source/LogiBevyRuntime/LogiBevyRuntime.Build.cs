@@ -27,6 +27,12 @@ public class LogiBevyRuntime : ModuleRules
 			"ProceduralMeshComponent", // actorless terrain debug-lane mesh (ADR-0007 / D)
 		});
 
+		if (Target.bBuildEditor)
+		{
+			// Editor-only: feed the level-viewport camera so terrain streams in-editor (D).
+			PrivateDependencyModuleNames.Add("UnrealEd");
+		}
+
 		// Plugins/LogiBevy/Source/LogiBevyRuntime -> .../Plugins/LogiBevy -> <ProjectRoot>
 		string PluginDir = Path.GetFullPath(Path.Combine(ModuleDirectory, "..", ".."));
 		string ProjectRoot = Path.GetFullPath(Path.Combine(PluginDir, "..", ".."));

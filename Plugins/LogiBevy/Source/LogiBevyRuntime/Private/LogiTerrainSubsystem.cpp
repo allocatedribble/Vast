@@ -8,6 +8,10 @@
 #include "GameFramework/PlayerController.h"
 #include "ProceduralMeshComponent.h"
 
+#if WITH_EDITOR
+#include "LevelEditorViewport.h" // GCurrentLevelEditingViewportClient
+#endif
+
 #if LOGI_BEVY_HAVE_TERRAIN
 #include "logi_terrain_ffi.h"
 #endif
@@ -16,6 +20,26 @@ namespace
 {
 	// The terrain kernel works in metres; Unreal in centimetres.
 	constexpr double LogiTerrainToUnreal = 100.0;
+
+	// View point for streaming: the PIE/game player camera, else (editor, no PIE)
+	// the active level-viewport camera so terrain streams in the editor viewport.
+	bool GetTerrainViewPoint(UWorld* World, FVector& OutLoc, FRotator& OutRot)
+	{
+		if (APlayerController* PC = World->GetFirstPlayerController())
+		{
+			PC->GetPlayerViewPoint(OutLoc, OutRot);
+			return true;
+		}
+#if WITH_EDITOR
+		if (GCurrentLevelEditingViewportClient != nullptr)
+		{
+			OutLoc = GCurrentLevelEditingViewportClient->GetViewLocation();
+			OutRot = GCurrentLevelEditingViewportClient->GetViewRotation();
+			return true;
+		}
+#endif
+		return false;
+	}
 
 #if LOGI_BEVY_HAVE_TERRAIN
 	// Build one procedural-mesh section from a tile's interleaved 32-byte vertices
@@ -104,7 +128,9 @@ bool ULogiTerrainSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 	}
 	if (const UWorld* World = Cast<UWorld>(Outer))
 	{
-		return World->IsGameWorld();
+		// Game/PIE for play; Editor for in-viewport streaming without PIE (ADR-0007 / D).
+		const EWorldType::Type Type = World->WorldType;
+		return Type == EWorldType::Game || Type == EWorldType::PIE || Type == EWorldType::Editor;
 	}
 	return false;
 }
@@ -195,11 +221,10 @@ void ULogiTerrainSubsystem::Tick(float DeltaTime)
 	Cam.viewport_width = 1920.0f;
 	Cam.viewport_height = 1080.0f;
 	Cam.sse_target_pixels = 8.0f;
-	if (APlayerController* PC = World->GetFirstPlayerController())
+	FVector Loc;
+	FRotator Rot;
+	if (GetTerrainViewPoint(World, Loc, Rot))
 	{
-		FVector Loc;
-		FRotator Rot;
-		PC->GetPlayerViewPoint(Loc, Rot);
 		Cam.position = LogiDVec3{ Loc.X / LogiTerrainToUnreal, Loc.Z / LogiTerrainToUnreal, Loc.Y / LogiTerrainToUnreal };
 		const FVector F = Rot.Vector();
 		Cam.forward = LogiVec3{ static_cast<float>(F.X), static_cast<float>(F.Z), static_cast<float>(F.Y) };
