@@ -91,8 +91,9 @@ No Mass or Unity vocabulary in gameplay code. The only place those terms may app
 
 Unreal Actors/objects are permitted only as **shells** that mirror Rust-owned state and/or capture
 intent: (1) high-res representation actors + ISM/HISM, (2) player pawn & camera rig (issues intent),
-(3) terrain host actors, (4) UI/HUD, (5) audio, (6) editor/authoring actors, (7) debug/visualization.
-None of them own gameplay truth.
+(3) ~~terrain host actors~~ **— SUPERSEDED by [ADR-0007](ADR-0007-Actorless-Rust-Terrain.md): terrain
+uses NO `AActor`, only renderer-facing component/proxy shells**, (4) UI/HUD, (5) audio,
+(6) editor/authoring actors, (7) debug/visualization. None of them own gameplay truth.
 
 ### Disposition of Mass
 

@@ -25,10 +25,15 @@ public:
 	void ApplyActorUpdate(const LogiActorUpdate& Update);
 	void ReleaseEntity(uint64 EntityIndex);
 
+	/// Local-frame origin (world cm) for the current snapshot, added back to each
+	/// rebased local transform to recover world position (P0 #6 planetary precision).
+	void SetFrameOrigin(const FVector& InOrigin) { FrameOrigin = InOrigin; }
+
 	int32 AssignedCount() const { return EntityToActor.Num(); }
 
 private:
 	TWeakObjectPtr<UWorld> World;
+	FVector FrameOrigin = FVector::ZeroVector;
 	TMap<uint64 /*entity index*/, TWeakObjectPtr<AStaticMeshActor>> EntityToActor;
 
 	AStaticMeshActor* SpawnActor(const FVector& Location);

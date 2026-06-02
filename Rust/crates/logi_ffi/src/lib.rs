@@ -15,7 +15,7 @@ use logi_schema::{LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnComma
 
 /// ABI version. Bump on any breaking change to this header. Callers pass their
 /// compiled-against version in `LogiInitDesc::abi_version`; mismatches are rejected.
-pub const LOGI_ABI_VERSION: u32 = 4;
+pub const LOGI_ABI_VERSION: u32 = 5;
 
 // Status / error codes (returned in `status` fields and `LogiError::code`).
 pub const LOGI_OK: u32 = 0;
@@ -90,6 +90,9 @@ impl LogiTickResult {
 pub struct LogiRenderSnapshot {
 	pub snapshot_id: u64,
 	pub sim_tick: u64,
+	/// Local-frame origin (world cm, f64); add to each `transform_3x4` translation
+	/// to recover world position (P0 #6 planetary precision).
+	pub world_origin_cm: [f64; 3],
 	pub static_batch_count: u32,
 	pub static_batches: *const LogiStaticBatch,
 	pub actor_update_count: u32,
@@ -280,6 +283,7 @@ pub extern "C" fn logi_world_get_render_snapshot(
 		*out_snapshot = LogiRenderSnapshot {
 			snapshot_id: 0,
 			sim_tick: 0,
+			world_origin_cm: [0.0; 3],
 			static_batch_count: 0,
 			static_batches: std::ptr::null(),
 			actor_update_count: 0,
@@ -301,6 +305,7 @@ pub extern "C" fn logi_world_get_render_snapshot(
 		Some(LogiRenderSnapshot {
 			snapshot_id: world.snapshot_id(),
 			sim_tick: world.snapshot_sim_tick(),
+			world_origin_cm: world.snapshot_world_origin(),
 			static_batch_count: batches.len() as u32,
 			static_batches: batches.as_ptr(),
 			actor_update_count: actors.len() as u32,

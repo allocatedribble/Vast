@@ -64,7 +64,8 @@ AStaticMeshActor* FLogiActorPool::SpawnActor(const FVector& Location)
 void FLogiActorPool::ApplyActorUpdate(const LogiActorUpdate& Update)
 {
 	const uint64 Entity = Update.entity.index;
-	const FVector Location = TranslationOf(Update);
+	// Snapshot transforms are local to the frame origin (P0 #6); rebase to world.
+	const FVector Location = FrameOrigin + TranslationOf(Update);
 
 	TWeakObjectPtr<AStaticMeshActor>& Slot = EntityToActor.FindOrAdd(Entity);
 	if (!Slot.IsValid())

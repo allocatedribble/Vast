@@ -17,6 +17,11 @@ See [`AGENTS.md`](AGENTS.md) § 1 and [ADR-0005](Docs/Architecture/ADR-0005-Bevy
 
 - [ADR-0005 — Bevy ECS Authority](Docs/Architecture/ADR-0005-Bevy-ECS-Authority.md) — **the current law.**
   Bevy ECS (Rust) owns gameplay; supersedes the Mass-authority parts of ADR-0001.
+- [ADR-0006 — Editor Inspectability](Docs/Architecture/ADR-0006-Editor-Inspectability.md) — editor-only
+  inspection shells (virtual Outliner rows + one selection proxy) over the Rust world; zero shipping cost.
+- [ADR-0007 — Actorless Rust Terrain](Docs/Architecture/ADR-0007-Actorless-Rust-Terrain.md) — **supersedes
+  the terrain-host-actor clause of ADR-0005.** No `AActor` per tile; Rust owns terrain truth, Unreal owns
+  renderer shells (Nanite/Lumen/VSM participants) only.
 - [ADR-0001 — Mass-First Unreal](Docs/Architecture/ADR-0001-Mass-First-Unreal.md) — **superseded in part**
   by ADR-0005. Its Determinism section and the "Unreal is a shell" principle still hold.
 - [ADR-0002 — Rust Terrain Kernel](Docs/Architecture/ADR-0002-Rust-Terrain-Kernel.md) — terrain truth in

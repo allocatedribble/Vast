@@ -61,6 +61,7 @@ pub struct TickOutcome {
 struct SnapshotSlot {
 	id: u64,
 	sim_tick: u64,
+	world_origin_cm: [f64; 3],
 	instances: Vec<LogiInstanceUpdate>,
 	ffi_batches: Vec<LogiStaticBatch>,
 	actor_updates: Vec<LogiActorUpdate>,
@@ -73,6 +74,7 @@ impl Default for SnapshotSlot {
 		Self {
 			id: 0,
 			sim_tick: 0,
+			world_origin_cm: [0.0; 3],
 			instances: Vec::new(),
 			ffi_batches: Vec::new(),
 			actor_updates: Vec::new(),
@@ -82,27 +84,47 @@ impl Default for SnapshotSlot {
 	}
 }
 
-/// Triple buffer: writing (next slot), published (Unreal reads), retired (freed
-/// after `logi_buffer_release`). Round-robin so a published slot survives two
-/// more ticks before reuse.
+/// Triple buffer with an explicit reader fence (§11 + audit #9): writing /
+/// published / retired. `publish` only writes into a slot the consumer has
+/// retired AND that is not the currently-published "latest", so a buffer Unreal
+/// may still be reading is never overwritten. If no slot is free the frame is
+/// dropped (the prior published snapshot stays latest) and counted.
 struct SnapshotRing {
 	slots: [SnapshotSlot; 3],
-	write_cursor: usize,
 	published: Option<usize>,
+	dropped_frames: u64,
 }
 
 impl SnapshotRing {
 	fn new() -> Self {
-		Self { slots: [SnapshotSlot::default(), SnapshotSlot::default(), SnapshotSlot::default()], write_cursor: 0, published: None }
+		Self {
+			slots: [SnapshotSlot::default(), SnapshotSlot::default(), SnapshotSlot::default()],
+			published: None,
+			dropped_frames: 0,
+		}
 	}
 
-	/// Copy the scratch snapshot into the next ring slot and publish it.
-	fn publish(&mut self, id: u64, scratch: &RenderSnapshotResource) {
-		let idx = self.write_cursor;
+	/// A slot is safe to overwrite iff it is retired (consumer released it) AND it
+	/// is not the slot currently served as "latest".
+	fn acquire_free_slot(&self) -> Option<usize> {
+		(0..self.slots.len()).find(|&i| self.slots[i].retired && Some(i) != self.published)
+	}
+
+	/// Copy the scratch snapshot into a free slot and publish it. Returns false
+	/// (dropping + counting the frame) when the fence finds no free slot.
+	fn publish(&mut self, id: u64, scratch: &RenderSnapshotResource) -> bool {
+		let idx = match self.acquire_free_slot() {
+			Some(i) => i,
+			None => {
+				self.dropped_frames = self.dropped_frames.wrapping_add(1);
+				return false;
+			}
+		};
 		{
 			let slot = &mut self.slots[idx];
 			slot.id = id;
 			slot.sim_tick = scratch.sim_tick;
+			slot.world_origin_cm = scratch.world_origin_cm;
 			slot.instances.clear();
 			slot.instances.extend_from_slice(&scratch.instances);
 			slot.actor_updates.clear();
@@ -127,7 +149,7 @@ impl SnapshotRing {
 			}
 		}
 		self.published = Some(idx);
-		self.write_cursor = (idx + 1) % self.slots.len();
+		true
 	}
 
 	fn published(&self) -> Option<&SnapshotSlot> {
@@ -278,8 +300,10 @@ impl LogiWorld {
 		self.schedules.maintenance.run(&mut self.world);
 
 		// Publish the scratch into a fresh ring slot (ABI-stable copy).
-		let render_snapshot_id = self.world.resource::<RenderSnapshotResource>().snapshot_id;
-		self.ring.publish(render_snapshot_id, self.world.resource::<RenderSnapshotResource>());
+		let scratch_id = self.world.resource::<RenderSnapshotResource>().snapshot_id;
+		self.ring.publish(scratch_id, self.world.resource::<RenderSnapshotResource>());
+		// Report the actually-published id (the prior one if the fence dropped this frame).
+		let render_snapshot_id = self.snapshot_id();
 
 		let tick = self.sim_tick();
 		self.world.clear_trackers();
@@ -310,6 +334,17 @@ impl LogiWorld {
 
 	pub fn snapshot_sim_tick(&self) -> u64 {
 		self.ring.published().map(|s| s.sim_tick).unwrap_or(0)
+	}
+
+	/// Local-frame origin of the published snapshot (world cm); Unreal adds this
+	/// back to the rebased f32 transforms (P0 #6).
+	pub fn snapshot_world_origin(&self) -> [f64; 3] {
+		self.ring.published().map(|s| s.world_origin_cm).unwrap_or([0.0; 3])
+	}
+
+	/// Count of frames the snapshot fence dropped (no free ring slot).
+	pub fn dropped_snapshot_frames(&self) -> u64 {
+		self.ring.dropped_frames
 	}
 
 	pub fn static_batches(&self) -> &[LogiStaticBatch] {
@@ -391,6 +426,22 @@ mod tests {
 		let b = w.tick(0.0625, 8, &[], &[]).render_snapshot_id;
 		assert!(b > a);
 		assert_eq!(w.snapshot_id(), b);
+	}
+
+	#[test]
+	fn snapshot_ring_fence_drops_when_unreleased() {
+		let mut w = LogiWorld::new(cfg(2));
+		w.submit_spawn_commands(&[spawn_cmd(20, 1.0)]);
+		// Never release: once the 3 slots fill, the fence must drop further frames
+		// and keep the last good snapshot available (never overwrite an unreleased
+		// or currently-published buffer).
+		let mut last_id = 0;
+		for _ in 0..6 {
+			last_id = w.tick(0.0625, 8, &[], &[]).render_snapshot_id;
+		}
+		assert!(w.dropped_snapshot_frames() >= 1);
+		assert_ne!(last_id, 0);
+		assert_eq!(w.snapshot_id(), last_id);
 	}
 
 	#[test]

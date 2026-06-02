@@ -17,7 +17,7 @@ typedef struct LogiWorld LogiWorld;
  * ABI version. Bump on any breaking change to this header. Callers pass their
  * compiled-against version in `LogiInitDesc::abi_version`; mismatches are rejected.
  */
-#define LOGI_ABI_VERSION 4
+#define LOGI_ABI_VERSION 5
 
 #define LOGI_OK 0
 
@@ -190,6 +190,11 @@ typedef struct {
 typedef struct {
   uint64_t snapshot_id;
   uint64_t sim_tick;
+  /**
+   * Local-frame origin (world cm, f64); add to each `transform_3x4` translation
+   * to recover world position (P0 #6 planetary precision).
+   */
+  double world_origin_cm[3];
   uint32_t static_batch_count;
   const LogiStaticBatch *static_batches;
   uint32_t actor_update_count;

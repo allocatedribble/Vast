@@ -135,6 +135,9 @@ void ULogiBevyRepresentationSubsystem::TickRepresentation(float DeltaTime)
 		InstancedRenderer->ApplyBatch(Batch);
 	}
 
+	// Local-frame origin (P0 #6): actors are placed at origin + rebased local transform.
+	ActorPool->SetFrameOrigin(FVector(Snapshot.world_origin_cm[0], Snapshot.world_origin_cm[1], Snapshot.world_origin_cm[2]));
+
 	// Actor updates: move entities out of ISM, then apply actor + animation.
 	for (uint32 A = 0; A < Snapshot.actor_update_count; ++A)
 	{

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use logi_schema::{LogiAnimationParams, LogiAssetHandle, LogiEntityId, RepresentationTier};
 use logi_sim::components::{AnimationDrive, Renderable, Representation, StableId, Transform3d};
-use logi_sim::resources::SimClock;
+use logi_sim::resources::{SimClock, UnrealFrameInput};
 
 /// One instanced-static-mesh instance delta. `stable_instance_slot` is assigned
 /// and retained by Unreal (Rust sends `u32::MAX` to mean "assign/keep").
@@ -72,15 +72,21 @@ pub struct BatchMeta {
 pub struct RenderSnapshotResource {
 	pub snapshot_id: u64,
 	pub sim_tick: u64,
+	/// Local-frame origin (world centimetres, f64). Every `transform_3x4`
+	/// translation in this snapshot is relative to it; Unreal adds it back.
+	pub world_origin_cm: [f64; 3],
 	pub instances: Vec<LogiInstanceUpdate>,
 	pub batch_metas: Vec<BatchMeta>,
 	pub actor_updates: Vec<LogiActorUpdate>,
 	pub despawns: Vec<LogiEntityId>,
 }
 
-/// Build a row-major 3x4 affine (f32) from a transform. Columns 0-2 are the
-/// rotation matrix with per-axis scale applied; column 3 is the translation.
-pub fn transform_to_3x4(t: &Transform3d) -> [f32; 12] {
+/// Build a row-major 3x4 affine (f32) from a transform, REBASED into the local
+/// frame at `origin_cm` (planetary precision, P0 #6). Columns 0-2 are the rotation
+/// matrix with per-axis scale; column 3 is `(world - origin)` narrowed to f32 --
+/// so f32 keeps centimetre precision near the origin even at f64 planetary world
+/// scale. Unreal adds `origin_cm` back when placing content.
+pub fn transform_to_3x4(t: &Transform3d, origin_cm: [f64; 3]) -> [f32; 12] {
 	let [x, y, z, w] = t.rotation_xyzw;
 	let (sx, sy, sz) = (t.scale[0], t.scale[1], t.scale[2]);
 
@@ -94,9 +100,9 @@ pub fn transform_to_3x4(t: &Transform3d) -> [f32; 12] {
 	let r21 = 2.0 * (y * z + w * x);
 	let r22 = 1.0 - 2.0 * (x * x + y * y);
 
-	let tx = t.translation_cm[0] as f32;
-	let ty = t.translation_cm[1] as f32;
-	let tz = t.translation_cm[2] as f32;
+	let tx = (t.translation_cm[0] - origin_cm[0]) as f32;
+	let ty = (t.translation_cm[1] - origin_cm[1]) as f32;
+	let tz = (t.translation_cm[2] - origin_cm[2]) as f32;
 
 	[
 		r00 * sx, r01 * sy, r02 * sz, tx,
@@ -110,6 +116,7 @@ pub fn transform_to_3x4(t: &Transform3d) -> [f32; 12] {
 /// side applies.
 pub fn extract_render_snapshot(
 	clock: Res<SimClock>,
+	frame: Res<UnrealFrameInput>,
 	mut snap: ResMut<RenderSnapshotResource>,
 	query: Query<
 		(&StableId, &Transform3d, &Renderable, &Representation, Option<&AnimationDrive>),
@@ -119,6 +126,10 @@ pub fn extract_render_snapshot(
 	let snap = &mut *snap;
 	snap.snapshot_id = snap.snapshot_id.wrapping_add(1);
 	snap.sim_tick = clock.tick;
+	// Local-frame origin for f64->f32 rebasing (P0 #6): the primary camera position,
+	// so content near the view keeps centimetre precision. Falls back to planet origin.
+	let origin = frame.cameras.first().map(|c| c.position).unwrap_or([0.0; 3]);
+	snap.world_origin_cm = origin;
 	snap.instances.clear();
 	snap.batch_metas.clear();
 	snap.actor_updates.clear();
@@ -134,7 +145,7 @@ pub fn extract_render_snapshot(
 				groups.entry((renderable.mesh, renderable.material, lod)).or_default().push(LogiInstanceUpdate {
 					entity: id.0,
 					stable_instance_slot: u32::MAX, // Unreal assigns/keeps the slot.
-					transform_3x4: transform_to_3x4(transform),
+					transform_3x4: transform_to_3x4(transform, origin),
 					custom_data: [0.0; 8],
 					flags: renderable.flags.0,
 				});
@@ -153,7 +164,7 @@ pub fn extract_render_snapshot(
 					actor_class: LogiAssetHandle::NONE, // resolved Unreal-side by tier + renderable.
 					skeletal_mesh: renderable.skeleton,
 					anim_blueprint: anim.map(|a| a.anim_graph).unwrap_or(LogiAssetHandle::NONE),
-					transform_3x4: transform_to_3x4(transform),
+					transform_3x4: transform_to_3x4(transform, origin),
 					significance: rep.significance,
 					animation,
 				});
@@ -228,6 +239,7 @@ mod tests {
 	fn ism_entities_group_into_batches_by_mesh_material() {
 		let mut world = World::new();
 		world.insert_resource(SimClock::default());
+		world.insert_resource(UnrealFrameInput::default());
 		world.insert_resource(RenderSnapshotResource::default());
 		ism(&mut world, 1, 100, 200);
 		ism(&mut world, 2, 100, 200); // same bucket
@@ -257,6 +269,7 @@ mod tests {
 	fn change_detection_emits_delta_only() {
 		let mut world = World::new();
 		world.insert_resource(SimClock::default());
+		world.insert_resource(UnrealFrameInput::default());
 		world.insert_resource(RenderSnapshotResource::default());
 		ism(&mut world, 1, 100, 200);
 
