@@ -30,7 +30,6 @@ public:
 	// FTickableGameObject
 	virtual void Tick(float DeltaTime) override;
 	virtual TStatId GetStatId() const override;
-	virtual bool IsTickableInEditor() const override { return true; } // stream in the editor viewport
 
 private:
 	struct FTileEntry

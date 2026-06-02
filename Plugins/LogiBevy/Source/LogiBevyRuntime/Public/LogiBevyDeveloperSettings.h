@@ -57,4 +57,10 @@ public:
 	/** Temporary demo agents spawned at startup (until scenario assets land). */
 	UPROPERTY(EditAnywhere, config, Category = "Demo", meta = (ClampMin = 0, ClampMax = 1000000))
 	int32 DemoAgentCount = 4;
+
+	/** Enable the actorless terrain renderer (ADR-0007 / Milestone D). OFF by default
+	 *  while the debug-lane renderer is tuned -- when on it streams + builds tile mesh
+	 *  in game/PIE worlds. */
+	UPROPERTY(EditAnywhere, config, Category = "Terrain")
+	bool bEnableTerrain = false;
 };

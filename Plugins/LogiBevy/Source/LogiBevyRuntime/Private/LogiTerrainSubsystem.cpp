@@ -3,6 +3,7 @@
 #include "LogiTerrainSubsystem.h"
 #include "LogiTerrainWorld.h"
 #include "LogiBevyTypes.h"
+#include "LogiBevyDeveloperSettings.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/PlayerController.h"
@@ -128,9 +129,11 @@ bool ULogiTerrainSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 	}
 	if (const UWorld* World = Cast<UWorld>(Outer))
 	{
-		// Game/PIE for play; Editor for in-viewport streaming without PIE (ADR-0007 / D).
-		const EWorldType::Type Type = World->WorldType;
-		return Type == EWorldType::Game || Type == EWorldType::PIE || Type == EWorldType::Editor;
+		// Opt-in + game/PIE only. (Editor-viewport streaming was reverted -- it ticked
+		// the kernel every editor frame and stalled the viewport.) The terrain renderer
+		// is OFF unless explicitly enabled in Project Settings, so it can't affect the
+		// editor/PIE until it's tuned.
+		return World->IsGameWorld() && GetDefault<ULogiBevyDeveloperSettings>()->bEnableTerrain;
 	}
 	return false;
 }
