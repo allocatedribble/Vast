@@ -9,6 +9,7 @@
 class UWorld;
 class AActor;
 class UInstancedStaticMeshComponent;
+class ULogiBevyAssetRegistry;
 
 /** Identifies a retained instancing bucket: one ISM per mesh/material/LOD. */
 struct FLogiBucketKey
@@ -48,6 +49,9 @@ public:
 	/// Local-frame origin (world cm) for the current snapshot (P0 #6).
 	void SetFrameOrigin(const FVector& InOrigin) { FrameOrigin = InOrigin; }
 
+	/// Registry resolving bucket handles -> UStaticMesh / UMaterial (cube fallback).
+	void SetAssetRegistry(ULogiBevyAssetRegistry* InRegistry) { AssetRegistry = InRegistry; }
+
 	void ApplyBatch(const LogiStaticBatch& Batch);
 	void ApplyDespawn(uint64 EntityIndex);
 	void Reset();
@@ -81,6 +85,7 @@ private:
 
 	TWeakObjectPtr<UWorld> World;
 	TWeakObjectPtr<AActor> HostActor;
+	TWeakObjectPtr<ULogiBevyAssetRegistry> AssetRegistry;
 	FVector FrameOrigin = FVector::ZeroVector;
 	TMap<FLogiBucketKey, FBucket> Buckets;
 	TMap<uint64 /*entity index*/, FSlotRef> EntityToSlot;

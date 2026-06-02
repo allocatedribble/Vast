@@ -1,9 +1,11 @@
 // Copyright LogiUE. All Rights Reserved.
 
 #include "LogiBevyInstancedRenderer.h"
+#include "LogiBevyAssetRegistry.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "Engine/StaticMesh.h"
+#include "Materials/MaterialInterface.h"
 #include "Components/SceneComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
 
@@ -82,10 +84,27 @@ UInstancedStaticMeshComponent* FLogiInstancedRenderer::GetOrCreateComponent(cons
 	Ism->SetMobility(EComponentMobility::Movable);
 	Ism->SetupAttachment(Host->GetRootComponent());
 	Ism->NumCustomDataFloats = 8;
-	// TODO: resolve Key.Mesh / Key.Material via ULogiBevyAssetRegistry. Default cube for now.
-	if (UStaticMesh* Cube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube")))
+
+	// Resolve mesh/material from the registry (non-blocking after PreloadAll);
+	// fall back to the engine cube so the bucket is always visible.
+	UStaticMesh* Mesh = nullptr;
+	UMaterialInterface* Material = nullptr;
+	if (ULogiBevyAssetRegistry* Reg = AssetRegistry.Get())
 	{
-		Ism->SetStaticMesh(Cube);
+		Mesh = Reg->ResolveStaticMesh(Key.Mesh);
+		Material = Reg->ResolveMaterial(Key.Material);
+	}
+	if (Mesh == nullptr)
+	{
+		Mesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	}
+	if (Mesh != nullptr)
+	{
+		Ism->SetStaticMesh(Mesh);
+	}
+	if (Material != nullptr)
+	{
+		Ism->SetMaterial(0, Material);
 	}
 	Ism->RegisterComponent();
 	Bucket.Ism = Ism;

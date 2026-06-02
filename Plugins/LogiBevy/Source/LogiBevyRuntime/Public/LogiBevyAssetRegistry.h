@@ -45,4 +45,12 @@ public:
 	UMaterialInterface* ResolveMaterial(uint64 StableHash) const;
 	UClass* ResolveActorClass(uint64 StableHash) const;
 	UClass* ResolveAnimInstance(uint64 StableHash) const;
+
+	/// Async-preload all soft-referenced assets so Resolve* stays non-blocking on
+	/// the hot path (no LoadSynchronous hitch). Call once when the registry is
+	/// selected (e.g. at world begin play).
+	void PreloadAll();
+
+private:
+	TSharedPtr<struct FStreamableHandle> PreloadHandle;
 };

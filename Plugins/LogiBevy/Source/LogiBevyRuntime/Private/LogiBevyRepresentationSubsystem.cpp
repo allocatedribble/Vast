@@ -7,6 +7,8 @@
 #include "LogiBevyAnimationBridge.h"
 #include "LogiBevyTelemetry.h"
 #include "LogiBevyTypes.h"
+#include "LogiBevyDeveloperSettings.h"
+#include "LogiBevyAssetRegistry.h"
 #include "Engine/World.h"
 #include "Engine/Level.h"
 
@@ -67,6 +69,18 @@ void ULogiBevyRepresentationSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	if (ActorPool.IsValid())
 	{
 		ActorPool->Initialize(&InWorld);
+	}
+
+	// Resolve + async-preload the asset registry from project settings (one sync
+	// load of the small registry data asset; its referenced meshes load async).
+	const ULogiBevyDeveloperSettings& Settings = *GetDefault<ULogiBevyDeveloperSettings>();
+	if (ULogiBevyAssetRegistry* Registry = Settings.AssetRegistry.LoadSynchronous())
+	{
+		Registry->PreloadAll();
+		if (InstancedRenderer.IsValid())
+		{
+			InstancedRenderer->SetAssetRegistry(Registry);
+		}
 	}
 }
 
