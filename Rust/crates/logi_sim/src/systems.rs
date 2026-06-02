@@ -48,8 +48,11 @@ pub fn compute_significance(
 			(1.0 / (1.0 + nearest_sq.sqrt() * 1.0e-4)) as f32
 		};
 		let area_term = cull.projected_screen_area.max(0.0);
-		let visible = if cull.visible_to_any_camera { 1.0 } else { 0.0 };
-		let significance = visible * (area_term + distance_term);
+		// Significance from nearest-camera proximity (+ projected screen area once
+		// a culling system feeds CullState). Camera position drives promotion to
+		// actor tiers; a dedicated culling/frustum system will refine visibility.
+		let _ = cull.visible_to_any_camera;
+		let significance = distance_term + area_term;
 		// Conditional write: only mark Changed when it actually changes (§8).
 		if rep.significance != significance {
 			rep.significance = significance;

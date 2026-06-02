@@ -41,10 +41,12 @@ impl LogiEntityId {
 	}
 }
 
-/// `LogiInitDesc::flags` bit: run the sim with the bounded-parallel scheduler
-/// (multi-threaded executor + a sized `ComputeTaskPool`). Default (bit unset) is
-/// the single-threaded deterministic scheduler.
-pub const LOGI_FLAG_BOUNDED_PARALLEL: u32 = 1 << 0;
+/// `LogiInitDesc::flags` bit: FORCE the single-threaded deterministic scheduler.
+/// Default (bit unset) is the bounded-parallel **multi-threaded** scheduler --
+/// Bevy systems run in parallel by default and parallelism is encouraged;
+/// determinism is preserved by explicit system ordering + commutative writes,
+/// not by serializing. Set this bit only for strict replay equality / tests.
+pub const LOGI_FLAG_FORCE_SINGLE_THREADED: u32 = 1 << 0;
 
 /// Domain IDs (deterministic, stable). 0 == invalid.
 macro_rules! logi_id {

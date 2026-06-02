@@ -12,7 +12,7 @@ use logi_render_extract::{
 	build_ffi_batches, extract_render_snapshot, LogiActorUpdate, LogiStaticBatch, RenderSnapshotResource,
 };
 use logi_schema::{
-	LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnCommand, LOGI_FLAG_BOUNDED_PARALLEL,
+	LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnCommand, LOGI_FLAG_FORCE_SINGLE_THREADED,
 };
 use logi_sim::components::{
 	Agent, CullState, Renderable, Representation, Shipment, Simulated, StableId, Transform3d, Velocity3d,
@@ -31,10 +31,13 @@ pub struct WorldConfig {
 
 impl WorldConfig {
 	fn scheduler_mode(&self) -> LogiSchedulerMode {
-		if self.flags & LOGI_FLAG_BOUNDED_PARALLEL != 0 {
-			LogiSchedulerMode::BoundedParallel
-		} else {
+		// Multi-threaded by default; single-threaded only when explicitly forced
+		// (strict replay / tests). Determinism comes from system ordering, not
+		// from serializing execution.
+		if self.flags & LOGI_FLAG_FORCE_SINGLE_THREADED != 0 {
 			LogiSchedulerMode::SingleThreadedDeterministic
+		} else {
+			LogiSchedulerMode::BoundedParallel
 		}
 	}
 }
@@ -230,9 +233,16 @@ fn increment_sim_tick(world: &mut World) {
 mod tests {
 	use super::*;
 
-	// hz = 16 -> fixed_dt = 0.0625, exactly representable in f32/f64.
+	// hz = 16 -> fixed_dt = 0.0625, exactly representable in f32/f64. Force the
+	// single-threaded scheduler so determinism assertions are reproducible
+	// (production defaults to the parallel executor).
 	fn cfg(seed: u64) -> WorldConfig {
-		WorldConfig { fixed_step_hz: 16, deterministic_seed: seed, worker_thread_count: 0, flags: 0 }
+		WorldConfig {
+			fixed_step_hz: 16,
+			deterministic_seed: seed,
+			worker_thread_count: 0,
+			flags: LOGI_FLAG_FORCE_SINGLE_THREADED,
+		}
 	}
 
 	fn spawn_cmd(index: u64, x: f64) -> LogiSpawnCommand {

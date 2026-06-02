@@ -78,10 +78,12 @@ Do **not** introduce Mass (`Fragment`, `Processor`, `Trait`, `FMassCommandBuffer
    Permitted shell zones are enumerated in [ADR-0005](Docs/Architecture/ADR-0005-Bevy-ECS-Authority.md).
 7. **Terrain truth is Rust** — now part of the same Bevy-owned authority (`logi_terrain`), not a separate
    special case. See [ADR-0002](Docs/Architecture/ADR-0002-Rust-Terrain-Kernel.md).
-8. **Determinism where required.** The sim runs on a **fixed-step Bevy schedule**, decoupled from frame
-   rate: deterministic System ordering, **seeded RNG only** (no wall-clock, no `thread_rng`), no
-   nondeterministic parallelism in the deterministic core. See
-   [ADR-0001 § Determinism](Docs/Architecture/ADR-0001-Mass-First-Unreal.md) (still in force).
+8. **Determinism by ordering, not serialization.** The sim runs on a **fixed-step Bevy schedule**,
+   decoupled from frame rate, with **seeded RNG only** (no wall-clock, no `thread_rng`). **Systems run
+   multi-threaded by default** (Bevy's parallel executor) and parallelism is *encouraged* — prefer
+   disjoint/commutative system access. Replay/snapshot determinism is preserved by **explicit system
+   ordering + commutative writes**, NOT by single-threading; a force-single-threaded mode exists for
+   strict replay/tests. See [ADR-0001 § Determinism](Docs/Architecture/ADR-0001-Mass-First-Unreal.md).
 9. **The FFI boundary is narrow and batched.** Unreal pulls a **per-frame snapshot** from
    `logi_render_extract`; it does **not** make per-entity calls across the ABI. No Unreal types in Rust;
    Rust never calls Unreal. Per-entity FFI chatter is the main performance failure mode — design against it.

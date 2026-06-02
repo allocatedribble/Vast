@@ -57,6 +57,12 @@ void ULogiBevyRepresentationSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	{
 		RepTickFunction.AddPrerequisite(Sim, Sim->GetSimTickFunction());
 	}
+
+	// The actor pool spawns real actors into this world for promoted entities.
+	if (ActorPool.IsValid())
+	{
+		ActorPool->Initialize(&InWorld);
+	}
 }
 
 void ULogiBevyRepresentationSubsystem::Deinitialize()
@@ -64,6 +70,10 @@ void ULogiBevyRepresentationSubsystem::Deinitialize()
 	if (RepTickFunction.IsTickFunctionRegistered())
 	{
 		RepTickFunction.UnRegisterTickFunction();
+	}
+	if (ActorPool.IsValid())
+	{
+		ActorPool->Shutdown();
 	}
 	Super::Deinitialize();
 }

@@ -31,11 +31,12 @@ typedef struct LogiBuffer LogiBuffer;
 #define LOGI_ERR_SNAPSHOT 4
 
 /**
- * `LogiInitDesc::flags` bit: run the bounded-parallel scheduler. Mirror of
- * `logi_schema::LOGI_FLAG_BOUNDED_PARALLEL` (kept in sync by the check below;
- * duplicated here so it appears in the generated C header).
+ * `LogiInitDesc::flags` bit: force the single-threaded deterministic scheduler
+ * (default is bounded-parallel multi-threaded). Mirror of
+ * `logi_schema::LOGI_FLAG_FORCE_SINGLE_THREADED` (kept in sync by the check
+ * below; duplicated here so it appears in the generated C header).
  */
-#define LOGI_FLAG_BOUNDED_PARALLEL 1
+#define LOGI_FLAG_FORCE_SINGLE_THREADED 1
 
 /**
  * Creation parameters.

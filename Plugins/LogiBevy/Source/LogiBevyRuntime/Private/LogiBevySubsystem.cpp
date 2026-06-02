@@ -3,6 +3,7 @@
 #include "LogiBevySubsystem.h"
 #include "Engine/World.h"
 #include "Engine/Level.h"
+#include "GameFramework/PlayerController.h"
 
 #if LOGI_BEVY_HAVE_RUST
 #include "logi_bevy_ffi.h"
@@ -115,8 +116,31 @@ void ULogiBevySubsystem::TickSimulation(float DeltaTime)
 	Input.unreal_time_seconds = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
 	Input.frame_delta_seconds = DeltaTime;
 	Input.max_fixed_steps = 8;
-	Input.camera_count = 0;
-	Input.cameras = nullptr;
+
+	// Feed the player camera so significance (and thus actor promotion) follows the view.
+	LogiCameraView Camera{};
+	uint32 CameraCount = 0;
+	if (UWorld* W = GetWorld())
+	{
+		if (APlayerController* PC = W->GetFirstPlayerController())
+		{
+			FVector ViewLoc;
+			FRotator ViewRot;
+			PC->GetPlayerViewPoint(ViewLoc, ViewRot);
+			const FVector Forward = ViewRot.Vector();
+			Camera.position[0] = ViewLoc.X;
+			Camera.position[1] = ViewLoc.Y;
+			Camera.position[2] = ViewLoc.Z;
+			Camera.forward[0] = Forward.X;
+			Camera.forward[1] = Forward.Y;
+			Camera.forward[2] = Forward.Z;
+			Camera.fov_degrees = 90.0f;
+			Camera.screen_height_px = 1080.0f;
+			CameraCount = 1;
+		}
+	}
+	Input.camera_count = CameraCount;
+	Input.cameras = (CameraCount > 0) ? &Camera : nullptr;
 	Input.player_intent_count = 0;
 	Input.player_intents = nullptr;
 

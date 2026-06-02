@@ -24,11 +24,12 @@ pub const LOGI_ERR_ABI: u32 = 2;
 pub const LOGI_ERR_PANIC: u32 = 3;
 pub const LOGI_ERR_SNAPSHOT: u32 = 4;
 
-/// `LogiInitDesc::flags` bit: run the bounded-parallel scheduler. Mirror of
-/// `logi_schema::LOGI_FLAG_BOUNDED_PARALLEL` (kept in sync by the check below;
-/// duplicated here so it appears in the generated C header).
-pub const LOGI_FLAG_BOUNDED_PARALLEL: u32 = 1;
-const _: () = assert!(LOGI_FLAG_BOUNDED_PARALLEL == logi_schema::LOGI_FLAG_BOUNDED_PARALLEL);
+/// `LogiInitDesc::flags` bit: force the single-threaded deterministic scheduler
+/// (default is bounded-parallel multi-threaded). Mirror of
+/// `logi_schema::LOGI_FLAG_FORCE_SINGLE_THREADED` (kept in sync by the check
+/// below; duplicated here so it appears in the generated C header).
+pub const LOGI_FLAG_FORCE_SINGLE_THREADED: u32 = 1;
+const _: () = assert!(LOGI_FLAG_FORCE_SINGLE_THREADED == logi_schema::LOGI_FLAG_FORCE_SINGLE_THREADED);
 
 const LOGI_ERROR_MSG_LEN: usize = 256;
 

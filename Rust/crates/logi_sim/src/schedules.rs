@@ -26,7 +26,10 @@ pub enum LogiSchedule {
 	Maintenance,
 }
 
-/// Executor staging. Default (MVP) is single-threaded + deterministic.
+/// Executor staging. Default is `BoundedParallel` (multi-threaded) -- systems run
+/// in parallel by default and parallelism is encouraged. `SingleThreadedDeterministic`
+/// is opt-in for strict replay equality / tests; determinism otherwise comes from
+/// explicit system ordering, not from serializing execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogiSchedulerMode {
 	SingleThreadedDeterministic,
