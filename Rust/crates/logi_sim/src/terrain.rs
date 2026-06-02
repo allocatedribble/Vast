@@ -1,40 +1,110 @@
-//! Terrain authority (ADR-0002), folded into `logi_sim`. Pure, deterministic —
-//! identical inputs produce identical outputs on every machine. May be
-//! re-extracted to its own `logi_terrain` crate when it grows.
+//! Terrain query surface for the sim (ADR-0002 / ADR-0007). Coarse, deterministic
+//! ground sampled from the ported terrain kernel's procedural height field
+//! (`logi_terrain_procgen`): identical inputs yield identical outputs on every
+//! machine, which is exactly what gameplay (pathing, placement, route cost) needs.
+//!
+//! The full streaming terrain — residency, Cesium/native packs, LOD — is the
+//! renderer's, owned by the terrain kernel and surfaced through the terrain FFI.
+//! Gameplay reads only this coarse deterministic representation (plan §10), so the
+//! authoritative sim never depends on what happens to be streamed in for display.
 
 use logi_schema::{LogiTileId, Vec3};
+use logi_terrain_procgen::TerrainHeights;
 
 /// A deterministic terrain surface sample.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TerrainSample {
 	/// Surface height in Unreal world units (cm).
 	pub height_cm: f64,
-	/// Up-facing surface normal.
+	/// Up-facing unit surface normal (+Z up).
 	pub normal: Vec3,
 	/// Whether the sample came from resident source data.
 	pub resident: bool,
 }
 
-/// The terrain kernel: owns residency and sampling. Flat-ground stub for now.
-#[derive(Debug, Default)]
-pub struct Terrain {}
+/// Coarse deterministic terrain sampler backing gameplay queries. Wraps the
+/// kernel's procedural height field; every position is deterministically available
+/// (gameplay needs no streaming).
+#[derive(Debug)]
+pub struct Terrain {
+	heights: TerrainHeights,
+}
+
+impl Default for Terrain {
+	fn default() -> Self {
+		Self { heights: TerrainHeights::new(0) }
+	}
+}
 
 impl Terrain {
 	pub fn new() -> Self {
 		Self::default()
 	}
 
-	pub fn is_tile_resident(&self, _tile: LogiTileId) -> bool {
-		false
+	pub fn with_seed(seed: u64) -> Self {
+		Self { heights: TerrainHeights::new(seed) }
 	}
 
-	pub fn sample_surface(&self, _tile: LogiTileId, _local_x: f64, _local_y: f64) -> TerrainSample {
+	/// Coarse terrain is procedural, so every tile is deterministically available.
+	pub fn is_tile_resident(&self, _tile: LogiTileId) -> bool {
+		true
+	}
+
+	/// Sample the coarse surface. `world_x` / `world_y` are world-plane metres (the
+	/// full tile -> ECEF rebasing lives in the renderer-facing terrain FFI; gameplay
+	/// uses this flat coarse field). Height is returned in Unreal cm.
+	pub fn sample_surface(&self, _tile: LogiTileId, world_x: f64, world_y: f64) -> TerrainSample {
+		let height_m = f64::from(self.heights.height_at(world_x, world_y));
 		TerrainSample {
-			height_cm: 0.0,
-			normal: Vec3::new(0.0, 0.0, 1.0),
-			resident: false,
+			height_cm: height_m * 100.0,
+			normal: self.surface_normal(world_x, world_y),
+			resident: true,
 		}
 	}
 
+	/// Coarse route-cost multiplier from local slope (steeper => costlier). Flat
+	/// ground is 1.0; gameplay pathing can scale edge costs by this.
+	pub fn route_cost(&self, tile: LogiTileId, world_x: f64, world_y: f64) -> f32 {
+		let n = self.sample_surface(tile, world_x, world_y).normal;
+		// n.z is cos(slope); 1/n.z grows as the surface tilts away from flat.
+		(1.0 / n.z.max(0.05)).min(20.0)
+	}
+
+	/// Surface normal via central finite differences of the height field.
+	fn surface_normal(&self, x: f64, y: f64) -> Vec3 {
+		const E: f64 = 1.0; // 1-metre epsilon
+		let dhx = f64::from(self.heights.height_at(x + E, y) - self.heights.height_at(x - E, y)) / (2.0 * E);
+		let dhy = f64::from(self.heights.height_at(x, y + E) - self.heights.height_at(x, y - E)) / (2.0 * E);
+		let (nx, ny, nz) = (-dhx as f32, -dhy as f32, 1.0_f32);
+		let len = (nx * nx + ny * ny + nz * nz).sqrt();
+		Vec3::new(nx / len, ny / len, nz / len)
+	}
+
 	pub fn request_tile(&mut self, _tile: LogiTileId) {}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn surface_is_deterministic_resident_and_unit_normal() {
+		let t = Terrain::new();
+		let tile = LogiTileId::new(1);
+		let a = t.sample_surface(tile, 1234.0, 5678.0);
+		let b = t.sample_surface(tile, 1234.0, 5678.0);
+		assert_eq!(a.height_cm, b.height_cm); // deterministic
+		assert!(a.resident);
+		let n = a.normal;
+		let len = (n.x * n.x + n.y * n.y + n.z * n.z).sqrt();
+		assert!((len - 1.0).abs() < 1e-4, "normal must be unit, got {len}");
+		assert!(t.route_cost(tile, 1234.0, 5678.0) >= 1.0);
+	}
+
+	#[test]
+	fn seed_changes_the_field() {
+		let a = Terrain::with_seed(1).sample_surface(LogiTileId::new(1), 100.0, 200.0);
+		let b = Terrain::with_seed(2).sample_surface(LogiTileId::new(1), 100.0, 200.0);
+		assert_ne!(a.height_cm, b.height_cm);
+	}
 }

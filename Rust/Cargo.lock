@@ -622,6 +622,7 @@ dependencies = [
  "bevy_ecs",
  "bevy_tasks",
  "logi_schema",
+ "logi_terrain_procgen",
 ]
 
 [[package]]
