@@ -18,7 +18,7 @@ typedef struct LogiBuffer LogiBuffer;
  * ABI version. Bump on any breaking change to this header. Callers pass their
  * compiled-against version in `LogiInitDesc::abi_version`; mismatches are rejected.
  */
-#define LOGI_ABI_VERSION 2
+#define LOGI_ABI_VERSION 3
 
 #define LOGI_OK 0
 
@@ -114,12 +114,16 @@ typedef struct {
 } LogiFrameInput;
 
 /**
- * Opaque handle to an Unreal-side asset (mesh, material, skeleton, anim graph).
- * Unreal resolves it via its asset registry; Rust treats it as an opaque key.
- * 0 == none.
+ * Handle to an Unreal-side asset (§9). Rust stores handles, never `UObject*`;
+ * Unreal owns the mapping. `kind` selects the asset category and `stable_hash`
+ * keys it. `stable_hash == 0` means "none". Used for meshes, materials,
+ * skeletons, actor classes, and anim instances alike.
  */
-typedef uint64_t LogiAssetHandle;
-#define LogiAssetHandle_NONE 0
+typedef struct {
+  uint64_t stable_hash;
+  uint32_t kind;
+} LogiAssetHandle;
+#define LogiAssetHandle_NONE (LogiAssetHandle){ .stable_hash = 0, .kind = asset_kind_NONE }
 
 /**
  * One instanced-static-mesh instance delta. `stable_instance_slot` is assigned
@@ -139,7 +143,7 @@ typedef struct {
 /**
  * A batch of instances sharing mesh/material/LOD. `instances` points into the
  * snapshot's instance buffer (valid until the next tick). Built at the FFI
- * boundary — NOT stored in the (Send+Sync) resource.
+ * boundary -- NOT stored in the (Send+Sync) resource.
  */
 typedef struct {
   LogiAssetHandle mesh;
@@ -148,12 +152,6 @@ typedef struct {
   uint32_t instance_count;
   const LogiInstanceUpdate *instances;
 } LogiStaticBatch;
-
-/**
- * Opaque handle to an Unreal Actor class (for pooled high/low-res actors).
- */
-typedef uint64_t LogiActorClassHandle;
-#define LogiActorClassHandle_NONE 0
 
 /**
  * Animation parameters Unreal feeds to an AnimInstance for a represented agent.
@@ -171,7 +169,7 @@ typedef struct {
  */
 typedef struct {
   LogiEntityId entity;
-  LogiActorClassHandle actor_class;
+  LogiAssetHandle actor_class;
   LogiAssetHandle skeletal_mesh;
   LogiAssetHandle anim_blueprint;
   float transform_3x4[12];

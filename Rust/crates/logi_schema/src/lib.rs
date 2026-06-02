@@ -70,32 +70,38 @@ logi_id!(LogiRouteId);
 logi_id!(LogiAgentId);
 logi_id!(LogiShipmentId);
 
-/// Opaque handle to an Unreal-side asset (mesh, material, skeleton, anim graph).
-/// Unreal resolves it via its asset registry; Rust treats it as an opaque key.
-/// 0 == none.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct LogiAssetHandle(pub u64);
+/// Handle to an Unreal-side asset (§9). Rust stores handles, never `UObject*`;
+/// Unreal owns the mapping. `kind` selects the asset category and `stable_hash`
+/// keys it. `stable_hash == 0` means "none". Used for meshes, materials,
+/// skeletons, actor classes, and anim instances alike.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LogiAssetHandle {
+	pub stable_hash: u64,
+	pub kind: u32,
+}
 
 impl LogiAssetHandle {
-	pub const NONE: LogiAssetHandle = LogiAssetHandle(0);
+	pub const NONE: LogiAssetHandle = LogiAssetHandle { stable_hash: 0, kind: asset_kind::NONE };
+	#[inline]
+	pub const fn new(stable_hash: u64, kind: u32) -> Self {
+		Self { stable_hash, kind }
+	}
 	#[inline]
 	pub const fn is_valid(self) -> bool {
-		self.0 != 0
+		self.stable_hash != 0
 	}
 }
 
-/// Opaque handle to an Unreal Actor class (for pooled high/low-res actors).
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct LogiActorClassHandle(pub u64);
-
-impl LogiActorClassHandle {
-	pub const NONE: LogiActorClassHandle = LogiActorClassHandle(0);
-	#[inline]
-	pub const fn is_valid(self) -> bool {
-		self.0 != 0
-	}
+/// Asset categories for `LogiAssetHandle::kind`. Unreal maps each to a concrete
+/// asset/class type (§9).
+pub mod asset_kind {
+	pub const NONE: u32 = 0;
+	pub const STATIC_MESH: u32 = 1;
+	pub const SKELETAL_MESH: u32 = 2;
+	pub const MATERIAL: u32 = 3;
+	pub const ACTOR_CLASS: u32 = 4;
+	pub const ANIM_INSTANCE: u32 = 5;
 }
 
 /// Animation parameters Unreal feeds to an AnimInstance for a represented agent.

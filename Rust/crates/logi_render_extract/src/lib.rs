@@ -3,7 +3,7 @@
 //! relevant components changed, splits them by representation tier into
 //! instanced-mesh batches (grouped by mesh/material/LOD) vs. per-actor updates,
 //! and writes a `RenderSnapshotResource`. Unreal consumes the batched snapshot
-//! and applies deltas to retained ISM/actors — never per-entity Rust queries.
+//! and applies deltas to retained ISM/actors -- never per-entity Rust queries.
 //!
 //! The resource stays `Send + Sync` (no raw pointers); the pointer-bearing
 //! C `LogiStaticBatch` array is marshalled at the FFI boundary (see
@@ -12,9 +12,7 @@
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 
-use logi_schema::{
-	LogiActorClassHandle, LogiAnimationParams, LogiAssetHandle, LogiEntityId, RepresentationTier,
-};
+use logi_schema::{LogiAnimationParams, LogiAssetHandle, LogiEntityId, RepresentationTier};
 use logi_sim::components::{AnimationDrive, Renderable, Representation, StableId, Transform3d};
 use logi_sim::resources::SimClock;
 
@@ -33,7 +31,7 @@ pub struct LogiInstanceUpdate {
 
 /// A batch of instances sharing mesh/material/LOD. `instances` points into the
 /// snapshot's instance buffer (valid until the next tick). Built at the FFI
-/// boundary — NOT stored in the (Send+Sync) resource.
+/// boundary -- NOT stored in the (Send+Sync) resource.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct LogiStaticBatch {
@@ -49,7 +47,7 @@ pub struct LogiStaticBatch {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LogiActorUpdate {
 	pub entity: LogiEntityId,
-	pub actor_class: LogiActorClassHandle,
+	pub actor_class: LogiAssetHandle,
 	pub skeletal_mesh: LogiAssetHandle,
 	pub anim_blueprint: LogiAssetHandle,
 	pub transform_3x4: [f32; 12],
@@ -126,14 +124,14 @@ pub fn extract_render_snapshot(
 	snap.actor_updates.clear();
 	snap.despawns.clear();
 
-	// Group ISM instances by (mesh, material, lod).
-	let mut groups: HashMap<(u64, u64, u32), Vec<LogiInstanceUpdate>> = HashMap::new();
+	// Group ISM instances by (mesh, material, lod) handle.
+	let mut groups: HashMap<(LogiAssetHandle, LogiAssetHandle, u32), Vec<LogiInstanceUpdate>> = HashMap::new();
 
 	for (id, transform, renderable, rep, anim) in query.iter() {
 		match rep.current_tier {
 			RepresentationTier::InstancedStaticMesh => {
 				let lod = 0u32; // TODO: LOD selection from significance/screen size.
-				groups.entry((renderable.mesh.0, renderable.material.0, lod)).or_default().push(LogiInstanceUpdate {
+				groups.entry((renderable.mesh, renderable.material, lod)).or_default().push(LogiInstanceUpdate {
 					entity: id.0,
 					stable_instance_slot: u32::MAX, // Unreal assigns/keeps the slot.
 					transform_3x4: transform_to_3x4(transform),
@@ -152,7 +150,7 @@ pub fn extract_render_snapshot(
 					.unwrap_or_default();
 				snap.actor_updates.push(LogiActorUpdate {
 					entity: id.0,
-					actor_class: LogiActorClassHandle::NONE, // resolved Unreal-side by tier + renderable.
+					actor_class: LogiAssetHandle::NONE, // resolved Unreal-side by tier + renderable.
 					skeletal_mesh: renderable.skeleton,
 					anim_blueprint: anim.map(|a| a.anim_graph).unwrap_or(LogiAssetHandle::NONE),
 					transform_3x4: transform_to_3x4(transform),
@@ -165,16 +163,16 @@ pub fn extract_render_snapshot(
 	}
 
 	// Flatten groups into the contiguous instance buffer + batch metadata.
-	// Deterministic batch order: sort by key.
-	let mut keys: Vec<(u64, u64, u32)> = groups.keys().copied().collect();
+	// Deterministic batch order: sort by handle key.
+	let mut keys: Vec<(LogiAssetHandle, LogiAssetHandle, u32)> = groups.keys().copied().collect();
 	keys.sort_unstable();
 	for key in keys {
 		let group = &groups[&key];
 		let offset = snap.instances.len() as u32;
 		snap.instances.extend_from_slice(group);
 		snap.batch_metas.push(BatchMeta {
-			mesh: LogiAssetHandle(key.0),
-			material: LogiAssetHandle(key.1),
+			mesh: key.0,
+			material: key.1,
 			lod: key.2,
 			offset,
 			count: group.len() as u32,
@@ -204,15 +202,15 @@ pub fn build_ffi_batches(snapshot: &RenderSnapshotResource, out: &mut Vec<LogiSt
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use logi_schema::{LogiEntityId, RenderFlags};
+	use logi_schema::{asset_kind, LogiEntityId, RenderFlags};
 
 	fn ism(world: &mut World, index: u64, mesh: u64, material: u64) {
 		world.spawn((
 			StableId(LogiEntityId { index, generation: 1, shard: 0, kind: 1 }),
 			Transform3d::default(),
 			Renderable {
-				mesh: LogiAssetHandle(mesh),
-				material: LogiAssetHandle(material),
+				mesh: LogiAssetHandle::new(mesh, asset_kind::STATIC_MESH),
+				material: LogiAssetHandle::new(material, asset_kind::MATERIAL),
 				skeleton: LogiAssetHandle::NONE,
 				flags: RenderFlags::NONE,
 			},
@@ -237,7 +235,12 @@ mod tests {
 		world.spawn((
 			StableId(LogiEntityId { index: 4, generation: 1, shard: 0, kind: 1 }),
 			Transform3d::default(),
-			Renderable { mesh: LogiAssetHandle::NONE, material: LogiAssetHandle::NONE, skeleton: LogiAssetHandle(300), flags: RenderFlags::NONE },
+			Renderable {
+				mesh: LogiAssetHandle::NONE,
+				material: LogiAssetHandle::NONE,
+				skeleton: LogiAssetHandle::new(300, asset_kind::SKELETAL_MESH),
+				flags: RenderFlags::NONE,
+			},
 			Representation { current_tier: RepresentationTier::HighResActor, ..Default::default() },
 		));
 
@@ -246,8 +249,8 @@ mod tests {
 		assert_eq!(snap.batch_metas.len(), 2);
 		assert_eq!(snap.instances.len(), 3);
 		assert_eq!(snap.actor_updates.len(), 1);
-		let b = snap.batch_metas.iter().find(|m| m.mesh.0 == 100).expect("bucket");
-		assert_eq!(b.count, 2);
+		let bucket = snap.batch_metas.iter().find(|m| m.mesh.stable_hash == 100).expect("bucket");
+		assert_eq!(bucket.count, 2);
 	}
 
 	#[test]

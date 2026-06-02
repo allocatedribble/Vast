@@ -4,7 +4,7 @@
 
 void FLogiInstancedRenderer::ApplyBatch(const LogiStaticBatch& Batch)
 {
-	const FLogiBucketKey Key{ Batch.mesh, Batch.material, Batch.lod };
+	const FLogiBucketKey Key{ Batch.mesh.stable_hash, Batch.material.stable_hash, Batch.lod };
 	FBucket& Bucket = Buckets.FindOrAdd(Key);
 
 	for (uint32 Index = 0; Index < Batch.instance_count; ++Index)

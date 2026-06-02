@@ -15,7 +15,7 @@ use logi_schema::{LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnComma
 
 /// ABI version. Bump on any breaking change to this header. Callers pass their
 /// compiled-against version in `LogiInitDesc::abi_version`; mismatches are rejected.
-pub const LOGI_ABI_VERSION: u32 = 2;
+pub const LOGI_ABI_VERSION: u32 = 3;
 
 // Status / error codes (returned in `status` fields and `LogiError::code`).
 pub const LOGI_OK: u32 = 0;
