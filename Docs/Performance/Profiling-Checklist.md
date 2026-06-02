@@ -1,0 +1,64 @@
+# Profiling Checklist
+
+How to measure each budget in [Budgets.md](Budgets.md), and what must hold before a change merges.
+**Profile before you optimize, and profile per world view** — orbital and street-level have entirely
+different cost shapes ([ADR-0003](../Architecture/ADR-0003-Representation-LOD.md)).
+
+## Tools
+
+- **Unreal Insights** — primary timeline profiler (game/render/GPU threads, frame breakdown).
+- **MassInsights** — Mass-specific tracing (entities, processors, archetypes). *Confirmed mounted in
+  this project* — use it for all Mass profiling.
+- **`stat` commands** in the editor/PIE console (the MCP `console_command` action can drive these):
+  - `stat unit` — frame, game, render, GPU at a glance.
+  - `stat game` — game-thread breakdown.
+  - `stat gpu` — GPU pass costs (Lumen, VSM, Nanite, RVT).
+  - `stat scenerendering` — draw calls, primitives.
+  - `stat animation` / Animation Budget Allocator stats — skeletal-mesh tick cost.
+  - `stat streaming` — texture/asset streaming.
+- **`mass.*` / `ai.debug.*` console commands** — Mass LOD and representation debugging.
+- **`stat startfile` / `stat stopfile`** or Insights `.utrace` captures — keep captures that back any
+  number written into [Budgets.md](Budgets.md).
+
+## Per-budget measurement map
+
+| Budget row | How to measure |
+|---|---|
+| Frame / thread split (§1) | `stat unit` + Insights timeline at the target entity count and view. |
+| Mass sim-step time (§2) | MassInsights processor timings; isolate the fixed-step tick. |
+| High/Medium sim-LOD counts (§2) | Mass LOD debug views; confirm caps are enforced, not exceeded. |
+| Fragment memory / entity (§2) | Memory report + archetype/fragment sizes. |
+| Representation tier counts (§3) | Mass representation debug; count actors vs. ISM vs. none. |
+| Animation CPU (§4) | Animation Budget Allocator stats; verify it holds the cap under load. |
+| MetaHuman LOD costs (§4) | Official spec for the table; Insights to confirm in-engine cost. |
+| Lumen/VSM/Nanite/RVT (§5) | `stat gpu` per view; capture orbital **and** street separately. |
+| World Partition streaming (§5) | `stat streaming`, World Partition cell visualization. |
+| Dynamic vs. static draws (§6) | `stat scenerendering`; flag per-frame dynamic mesh rebuilds. |
+
+## Determinism checks (when replay/snapshot equality is in scope)
+
+- Run the same seeded scenario twice; assert **snapshot equality** of the simulation state.
+- Vary frame rate (cap to 30/60/120) and confirm the deterministic core produces identical results —
+  any divergence means frame-rate-dependent math leaked into the sim
+  ([ADR-0001 § Determinism](../Architecture/ADR-0001-Mass-First-Unreal.md)).
+- Confirm no `FMath::Rand`/`rand()`/wall-clock seeds in the deterministic core; only seeded
+  `FRandomStream`.
+
+## Pre-merge checklist
+
+Before merging a change that touches runtime simulation or representation:
+
+- [ ] **Budgets hold** at the target entity count and view (frame, Mass sim, representation, animation).
+- [ ] **No new `Error:`/`Fatal`** lines in `Saved/Logs/LogiUE.log`; no new warnings you can't justify.
+- [ ] **Structural changes go through `FMassCommandBuffer`** — no direct add/remove of Fragments or
+      create/destroy of entities during processing.
+- [ ] **No new gameplay authority on Actors/components/Blueprints** — truth stayed in Fragments
+      ([ADR-0001](../Architecture/ADR-0001-Mass-First-Unreal.md)).
+- [ ] **No per-frame dynamic mesh rebuilds** introduced; static/retained draw paths preferred
+      ([Budgets §6](Budgets.md)).
+- [ ] **Significance, not distance** — any new LOD decision feeds from the unified score, allocated
+      against a budget ([ADR-0003](../Architecture/ADR-0003-Representation-LOD.md)).
+- [ ] **Determinism preserved** if the change is in the deterministic core (re-run the equality check).
+- [ ] **No Unity vocabulary / no version-fallback branches** introduced
+      ([ADR-0004](../Architecture/ADR-0004-No-Compatibility-Code.md)).
+- [ ] A **profile capture** backs any new number written into [Budgets.md](Budgets.md).
