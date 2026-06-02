@@ -32,5 +32,10 @@ public:
 	virtual TStatId GetStatId() const override;
 
 private:
+	void EnsureRenderTarget();
+
 	TPimplPtr<FLogiTerrainWorld> TerrainWorld;
+	TWeakObjectPtr<AActor> HostActor;
+	TWeakObjectPtr<class UProceduralMeshComponent> TerrainMesh;
+	TMap<uint64 /*patch handle*/, int32 /*mesh section*/> TileSection;
 };

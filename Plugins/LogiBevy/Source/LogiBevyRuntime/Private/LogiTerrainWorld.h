@@ -74,6 +74,12 @@ public:
 		}
 	}
 
+	bool AcquireBufferView(LogiBufferHandle BufferHandle, LogiBufferView& OutView) const
+	{
+		return Handle != nullptr
+			&& logi_terrain_world_acquire_buffer_view(Handle, BufferHandle, &OutView) == LOGI_TERRAIN_OK;
+	}
+
 private:
 	LogiTerrainWorld* Handle = nullptr;
 #else

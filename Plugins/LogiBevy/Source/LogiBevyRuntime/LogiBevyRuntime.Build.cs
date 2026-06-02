@@ -22,8 +22,9 @@ public class LogiBevyRuntime : ModuleRules
 			"Core",
 			"CoreUObject",
 			"Engine",
-			"Projects",          // IPluginManager (locating the staged DLL at runtime)
-			"DeveloperSettings", // ULogiBevyDeveloperSettings (Project Settings)
+			"Projects",                // IPluginManager (locating the staged DLL at runtime)
+			"DeveloperSettings",       // ULogiBevyDeveloperSettings (Project Settings)
+			"ProceduralMeshComponent", // actorless terrain debug-lane mesh (ADR-0007 / D)
 		});
 
 		// Plugins/LogiBevy/Source/LogiBevyRuntime -> .../Plugins/LogiBevy -> <ProjectRoot>
