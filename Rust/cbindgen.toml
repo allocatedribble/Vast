@@ -13,11 +13,11 @@ style = "type"
 
 # Opaque handles are boxed Rust types cbindgen can't see through; forward-declare
 # them and exclude their (non-existent) definitions from generation.
-after_includes = "\n/* Opaque handles owned by Rust. */\ntypedef struct LogiWorld LogiWorld;\ntypedef struct LogiBuffer LogiBuffer;"
+after_includes = "\n/* Opaque handle owned by Rust. */\ntypedef struct LogiWorld LogiWorld;"
 
 [parse]
 parse_deps = true
 include = ["logi_ffi", "logi_render_extract", "logi_schema"]
 
 [export]
-exclude = ["LogiWorld", "LogiBuffer"]
+exclude = ["LogiWorld"]

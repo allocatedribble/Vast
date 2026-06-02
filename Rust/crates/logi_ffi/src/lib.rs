@@ -15,7 +15,7 @@ use logi_schema::{LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnComma
 
 /// ABI version. Bump on any breaking change to this header. Callers pass their
 /// compiled-against version in `LogiInitDesc::abi_version`; mismatches are rejected.
-pub const LOGI_ABI_VERSION: u32 = 3;
+pub const LOGI_ABI_VERSION: u32 = 4;
 
 // Status / error codes (returned in `status` fields and `LogiError::code`).
 pub const LOGI_OK: u32 = 0;
@@ -23,6 +23,8 @@ pub const LOGI_ERR_NULL: u32 = 1;
 pub const LOGI_ERR_ABI: u32 = 2;
 pub const LOGI_ERR_PANIC: u32 = 3;
 pub const LOGI_ERR_SNAPSHOT: u32 = 4;
+/// A mutating call arrived from a thread other than the world's owner (§11).
+pub const LOGI_ERR_WRONG_THREAD: u32 = 5;
 
 /// `LogiInitDesc::flags` bit: force the single-threaded deterministic scheduler
 /// (default is bounded-parallel multi-threaded). Mirror of
@@ -81,9 +83,9 @@ impl LogiTickResult {
 	}
 }
 
-/// Borrowed view over a render snapshot (§8): instanced-mesh batches, per-actor
-/// updates, and despawns. All pointers are valid only until the next
-/// `logi_world_tick` on the same world.
+/// Borrowed view over a published render snapshot (§8). Triple-buffered (§11):
+/// the pointers stay valid until the buffer is retired via `logi_buffer_release`
+/// or its ring slot is reused (>= 2 ticks later), whichever comes first.
 #[repr(C)]
 pub struct LogiRenderSnapshot {
 	pub snapshot_id: u64,
@@ -94,13 +96,6 @@ pub struct LogiRenderSnapshot {
 	pub actor_updates: *const LogiActorUpdate,
 	pub despawn_count: u32,
 	pub despawns: *const LogiEntityId,
-}
-
-/// Opaque owned buffer. Reserved for owned out-buffers; release with
-/// [`logi_buffer_release`]. (The snapshot hot path uses a borrowed view instead.)
-#[allow(dead_code)]
-pub struct LogiBuffer {
-	data: Vec<u8>,
 }
 
 // --- error helpers -----------------------------------------------------------
@@ -115,6 +110,8 @@ enum FfiError {
 	Panic(&'static str),
 	#[error("render snapshot {0} is unavailable")]
 	SnapshotUnavailable(u64),
+	#[error("{0} called from a non-owner thread (§11: single mutable world owner)")]
+	WrongThread(&'static str),
 }
 
 impl FfiError {
@@ -124,6 +121,7 @@ impl FfiError {
 			FfiError::AbiMismatch { .. } => LOGI_ERR_ABI,
 			FfiError::Panic(_) => LOGI_ERR_PANIC,
 			FfiError::SnapshotUnavailable(_) => LOGI_ERR_SNAPSHOT,
+			FfiError::WrongThread(_) => LOGI_ERR_WRONG_THREAD,
 		}
 	}
 }
@@ -202,7 +200,13 @@ pub extern "C" fn logi_world_destroy(world: *mut LogiWorld) {
 	if world.is_null() {
 		return;
 	}
-	// SAFETY: `world` came from Box::into_raw and is non-null.
+	// §11: only the owner thread may destroy (a mutating teardown). On mismatch,
+	// refuse rather than risk dropping a !Send world cross-thread -- the C++ RAII
+	// guarantees this runs on the owner (game) thread.
+	// SAFETY: non-null (checked); came from Box::into_raw.
+	if !unsafe { &*world }.is_owner_thread() {
+		return;
+	}
 	let _ = catch_unwind(AssertUnwindSafe(|| unsafe { drop(Box::from_raw(world)) }));
 }
 
@@ -213,6 +217,12 @@ pub extern "C" fn logi_world_tick(world: *mut LogiWorld, input: *const LogiFrame
 	if world.is_null() || input.is_null() {
 		write_err(err, &FfiError::NullArg(if world.is_null() { "world" } else { "input" }));
 		return LogiTickResult::empty(LOGI_ERR_NULL);
+	}
+	// §11: only the owner thread may tick (mutating).
+	// SAFETY: non-null, checked above.
+	if !unsafe { &*world }.is_owner_thread() {
+		write_err(err, &FfiError::WrongThread("logi_world_tick"));
+		return LogiTickResult::empty(LOGI_ERR_WRONG_THREAD);
 	}
 
 	// SAFETY: both non-null (checked). `world` is uniquely owned by the caller
@@ -330,6 +340,12 @@ pub extern "C" fn logi_submit_spawn_commands(
 		write_err(err, &FfiError::NullArg(if world.is_null() { "world" } else { "commands" }));
 		return 0;
 	}
+	// §11: only the owner thread may submit spawns (mutating).
+	// SAFETY: non-null, checked above.
+	if !unsafe { &*world }.is_owner_thread() {
+		write_err(err, &FfiError::WrongThread("logi_submit_spawn_commands"));
+		return 0;
+	}
 	if count == 0 {
 		return 0;
 	}
@@ -349,13 +365,20 @@ pub extern "C" fn logi_submit_spawn_commands(
 	}
 }
 
-/// Release an owned buffer previously handed out by the API. (Reserved; the
-/// snapshot path uses borrowed views.)
+/// Retire a published snapshot buffer after Unreal has consumed it (§11 triple
+/// buffer: writing / published / retired). Pass the `snapshot_id` from the
+/// snapshot you are done reading. Must be called from the owner thread. Returns
+/// `LOGI_OK` even if the id was already retired/unknown (idempotent release).
 #[no_mangle]
-pub extern "C" fn logi_buffer_release(_world: *mut LogiWorld, buffer: *mut LogiBuffer) {
-	if buffer.is_null() {
-		return;
+pub extern "C" fn logi_buffer_release(world: *mut LogiWorld, snapshot_id: u64) -> u32 {
+	if world.is_null() {
+		return LOGI_ERR_NULL;
 	}
-	// SAFETY: `buffer`, if non-null, was produced by this library via Box::into_raw.
-	let _ = catch_unwind(AssertUnwindSafe(|| unsafe { drop(Box::from_raw(buffer)) }));
+	// SAFETY: non-null, checked above.
+	let w = unsafe { &mut *world };
+	if !w.is_owner_thread() {
+		return LOGI_ERR_WRONG_THREAD;
+	}
+	let _ = w.release_snapshot(snapshot_id);
+	LOGI_OK
 }

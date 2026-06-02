@@ -145,6 +145,13 @@ void ULogiBevyRepresentationSubsystem::TickRepresentation(float DeltaTime)
 	}
 
 	Telemetry->RecordFrame(InstancedRenderer->LiveInstanceCount(), ActorPool->AssignedCount(), Sim->GetSimTick());
+
+	// §11 thread-safety policy: representation only READS the published snapshot
+	// and then RETIRES it (triple buffer). This runs on the game thread in
+	// TG_PostPhysics -- the same (owner) thread as the sim's TG_PrePhysics tick,
+	// so the owner-thread guard passes. No render/animation worker thread ever
+	// calls into LogiWorld; all mutation goes through ULogiBevySubsystem.
+	logi_buffer_release(static_cast<LogiWorld*>(Sim->GetWorldHandle()), Snapshot.snapshot_id);
 #else
 	(void)DeltaTime;
 #endif

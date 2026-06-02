@@ -10,15 +10,14 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-/* Opaque handles owned by Rust. */
+/* Opaque handle owned by Rust. */
 typedef struct LogiWorld LogiWorld;
-typedef struct LogiBuffer LogiBuffer;
 
 /**
  * ABI version. Bump on any breaking change to this header. Callers pass their
  * compiled-against version in `LogiInitDesc::abi_version`; mismatches are rejected.
  */
-#define LOGI_ABI_VERSION 3
+#define LOGI_ABI_VERSION 4
 
 #define LOGI_OK 0
 
@@ -29,6 +28,11 @@ typedef struct LogiBuffer LogiBuffer;
 #define LOGI_ERR_PANIC 3
 
 #define LOGI_ERR_SNAPSHOT 4
+
+/**
+ * A mutating call arrived from a thread other than the world's owner (§11).
+ */
+#define LOGI_ERR_WRONG_THREAD 5
 
 /**
  * `LogiInitDesc::flags` bit: force the single-threaded deterministic scheduler
@@ -179,9 +183,9 @@ typedef struct {
 } LogiActorUpdate;
 
 /**
- * Borrowed view over a render snapshot (§8): instanced-mesh batches, per-actor
- * updates, and despawns. All pointers are valid only until the next
- * `logi_world_tick` on the same world.
+ * Borrowed view over a published render snapshot (§8). Triple-buffered (§11):
+ * the pointers stay valid until the buffer is retired via `logi_buffer_release`
+ * or its ring slot is reused (>= 2 ticks later), whichever comes first.
  */
 typedef struct {
   uint64_t snapshot_id;
@@ -248,10 +252,12 @@ uint32_t logi_submit_spawn_commands(LogiWorld *world,
                                     LogiError *err);
 
 /**
- * Release an owned buffer previously handed out by the API. (Reserved; the
- * snapshot path uses borrowed views.)
+ * Retire a published snapshot buffer after Unreal has consumed it (§11 triple
+ * buffer: writing / published / retired). Pass the `snapshot_id` from the
+ * snapshot you are done reading. Must be called from the owner thread. Returns
+ * `LOGI_OK` even if the id was already retired/unknown (idempotent release).
  */
-void logi_buffer_release(LogiWorld *_world, LogiBuffer *buffer);
+uint32_t logi_buffer_release(LogiWorld *world, uint64_t snapshot_id);
 
 #ifdef __cplusplus
 }  // extern "C"
