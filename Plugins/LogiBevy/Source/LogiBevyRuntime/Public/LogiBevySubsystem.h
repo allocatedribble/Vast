@@ -6,9 +6,11 @@
 #include "Subsystems/WorldSubsystem.h"
 #include "Engine/EngineBaseTypes.h"
 #include "LogiBevyTypes.h"
+#include "Templates/PimplPtr.h"
 #include "LogiBevySubsystem.generated.h"
 
 class ULogiBevySubsystem;
+class FLogiBevyWorld;
 
 /**
  * PrePhysics tick that advances the Rust simulation (ADR-0005 scheduling treaty).
@@ -53,10 +55,10 @@ public:
 	/** The sim tick function, so the representation subsystem can depend on it. */
 	FLogiBevySimTickFunction& GetSimTickFunction() { return SimTickFunction; }
 
-	/** Opaque `LogiWorld*` for the representation subsystem to query the snapshot. */
-	void* GetWorldHandle() const { return WorldHandle; }
+	/** The RAII-owned Rust world, for the representation subsystem to read snapshots. */
+	FLogiBevyWorld* GetBevyWorld() const { return BevyWorld.Get(); }
 
-	bool IsRuntimeValid() const { return WorldHandle != nullptr; }
+	bool IsRuntimeValid() const;
 
 	UFUNCTION(BlueprintCallable, Category = "LogiBevy")
 	int64 GetSimTick() const { return LastSimTick; }
@@ -65,6 +67,6 @@ private:
 	UPROPERTY()
 	FLogiBevySimTickFunction SimTickFunction;
 
-	void* WorldHandle = nullptr;
+	TPimplPtr<FLogiBevyWorld> BevyWorld;
 	int64 LastSimTick = 0;
 };

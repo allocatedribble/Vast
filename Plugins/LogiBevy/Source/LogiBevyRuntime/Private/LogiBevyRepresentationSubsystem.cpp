@@ -9,6 +9,7 @@
 #include "LogiBevyTypes.h"
 #include "LogiBevyDeveloperSettings.h"
 #include "LogiBevyAssetRegistry.h"
+#include "LogiBevyWorld.h"
 #include "Engine/World.h"
 #include "Engine/Level.h"
 
@@ -131,9 +132,15 @@ void ULogiBevyRepresentationSubsystem::TickRepresentation(float DeltaTime)
 	}
 
 #if LOGI_BEVY_HAVE_RUST
+	FLogiBevyWorld* BevyWorld = Sim->GetBevyWorld();
+	if (BevyWorld == nullptr)
+	{
+		return;
+	}
+
 	LogiRenderSnapshot Snapshot{};
 	LogiError Err{};
-	if (logi_world_get_render_snapshot(static_cast<LogiWorld*>(Sim->GetWorldHandle()), 0 /*latest*/, &Snapshot, &Err) != LOGI_OK)
+	if (BevyWorld->GetSnapshot(Snapshot, Err) != LOGI_OK)
 	{
 		return;
 	}
@@ -181,7 +188,7 @@ void ULogiBevyRepresentationSubsystem::TickRepresentation(float DeltaTime)
 	// TG_PostPhysics -- the same (owner) thread as the sim's TG_PrePhysics tick,
 	// so the owner-thread guard passes. No render/animation worker thread ever
 	// calls into LogiWorld; all mutation goes through ULogiBevySubsystem.
-	logi_buffer_release(static_cast<LogiWorld*>(Sim->GetWorldHandle()), Snapshot.snapshot_id);
+	BevyWorld->ReleaseSnapshot(Snapshot.snapshot_id);
 #else
 	(void)DeltaTime;
 #endif

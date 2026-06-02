@@ -2,6 +2,7 @@
 
 #include "LogiBevySubsystem.h"
 #include "LogiBevyDeveloperSettings.h"
+#include "LogiBevyWorld.h"
 #include "Engine/World.h"
 #include "Engine/Level.h"
 #include "GameFramework/PlayerController.h"
@@ -40,9 +41,9 @@ void ULogiBevySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	Desc.low_res_actor_budget = static_cast<uint32>(FMath::Max(0, Settings.LowResActorBudget));
 	Desc.instanced_mesh_budget = static_cast<uint32>(FMath::Max(0, Settings.InstancedMeshBudget));
 
+	BevyWorld = MakePimpl<FLogiBevyWorld>();
 	LogiError Err{};
-	WorldHandle = static_cast<void*>(logi_world_create(&Desc, &Err));
-	if (WorldHandle == nullptr)
+	if (!BevyWorld->Create(Desc, Err))
 	{
 		UE_LOG(LogLogiBevy, Error, TEXT("logi_world_create failed (code %u): %s"), Err.code, UTF8_TO_TCHAR(Err.message));
 		return;
@@ -61,8 +62,7 @@ void ULogiBevySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 			Commands[Index].payload_kg = 10.0;
 		}
 		LogiError SpawnErr{};
-		const uint32 Applied = logi_submit_spawn_commands(
-			static_cast<LogiWorld*>(WorldHandle), Commands.GetData(), static_cast<uint32>(NumDemo), &SpawnErr);
+		const uint32 Applied = BevyWorld->SubmitSpawns(Commands.GetData(), static_cast<uint32>(NumDemo), SpawnErr);
 		UE_LOG(LogLogiBevy, Log, TEXT("Bevy world created; %u demo agents submitted (budgets %u/%u/%u)."),
 			Applied, Desc.high_res_actor_budget, Desc.low_res_actor_budget, Desc.instanced_mesh_budget);
 	}
@@ -77,7 +77,7 @@ void ULogiBevySubsystem::OnWorldBeginPlay(UWorld& InWorld)
 {
 	Super::OnWorldBeginPlay(InWorld);
 
-	if (WorldHandle == nullptr || InWorld.PersistentLevel == nullptr)
+	if (!IsRuntimeValid() || InWorld.PersistentLevel == nullptr)
 	{
 		return;
 	}
@@ -98,10 +98,9 @@ void ULogiBevySubsystem::Deinitialize()
 	}
 
 #if LOGI_BEVY_HAVE_RUST
-	if (WorldHandle != nullptr)
+	if (BevyWorld.IsValid())
 	{
-		logi_world_destroy(static_cast<LogiWorld*>(WorldHandle));
-		WorldHandle = nullptr;
+		BevyWorld->Destroy();
 	}
 #endif
 	Super::Deinitialize();
@@ -120,10 +119,15 @@ bool ULogiBevySubsystem::ShouldCreateSubsystem(UObject* Outer) const
 	return false;
 }
 
+bool ULogiBevySubsystem::IsRuntimeValid() const
+{
+	return BevyWorld.IsValid() && BevyWorld->IsValid();
+}
+
 void ULogiBevySubsystem::TickSimulation(float DeltaTime)
 {
 #if LOGI_BEVY_HAVE_RUST
-	if (WorldHandle == nullptr)
+	if (!BevyWorld.IsValid() || !BevyWorld->IsValid())
 	{
 		return;
 	}
@@ -163,7 +167,7 @@ void ULogiBevySubsystem::TickSimulation(float DeltaTime)
 	Input.player_intents = nullptr;
 
 	LogiError TickErr{};
-	const LogiTickResult Result = logi_world_tick(static_cast<LogiWorld*>(WorldHandle), &Input, &TickErr);
+	const LogiTickResult Result = BevyWorld->Tick(Input, TickErr);
 	if (Result.status != LOGI_OK)
 	{
 		UE_LOG(LogLogiBevy, Warning, TEXT("logi_world_tick status %u: %s"), Result.status, UTF8_TO_TCHAR(TickErr.message));
