@@ -1,9 +1,16 @@
 # ADR-0001 — Mass-First Unreal
 
-- **Status:** Accepted
+- **Status:** **Superseded in part by [ADR-0005](ADR-0005-Bevy-ECS-Authority.md)**
 - **Date:** 2026-06-01
 - **Deciders:** LogiUE architecture
 - **Supersedes:** the prior Unity/DOTS data-oriented architecture (intent preserved, implementation discarded)
+
+> ⚠️ **Superseded in part by [ADR-0005 — Bevy ECS Authority](ADR-0005-Bevy-ECS-Authority.md).**
+> The decision that *Mass* is the runtime authority is **withdrawn** — gameplay truth now lives in a Rust
+> `bevy_ecs` `World`, and Unreal is the renderer/host. What **carries forward unchanged**: the
+> data-oriented intent, the **§ Determinism** contract below, and the principle that Unreal
+> Actors/UObjects/Blueprints are *shells* that never own truth. Read the Mass-specific text below as
+> historical record: "Fragment → Component, Processor → System, Trait → Bundle, command buffer → Commands."
 
 ## Context
 
@@ -23,6 +30,9 @@ instances: per-object overhead, virtual dispatch, scattered memory, and tick cos
 the *authority* for simulation state. It remains excellent for *presentation* and *engine integration*.
 
 ## Decision
+
+> ⚠️ **Withdrawn by [ADR-0005](ADR-0005-Bevy-ECS-Authority.md).** The authority is now Rust `bevy_ecs`,
+> not Mass. The text below is retained for history; the data-oriented intent it expresses is preserved.
 
 **Mass is the single authority for runtime gameplay state.** Specifically:
 

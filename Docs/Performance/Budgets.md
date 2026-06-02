@@ -6,6 +6,11 @@
 > that must be replaced with measured/official values before they are treated as authoritative — do not
 > ship guesses as facts.
 
+> **Updated by [ADR-0005](../Architecture/ADR-0005-Bevy-ECS-Authority.md):** the simulation is now **Rust
+> `bevy_ecs`**, not Mass. Read the "Mass simulation" rows below as the **Bevy fixed-step sim**, profiled
+> with a Rust profiler (Tracy / `puffin`) under `cargo` — not MassInsights. The **FFI snapshot crossing**
+> (Rust → Unreal, per frame) is a new budgeted line item. Unreal Insights still covers the bridge + rendering.
+
 ## 1. Frame budget
 
 Target interactive frame rate: **60 fps → 16.6 ms** per frame at street-level views.
@@ -23,7 +28,7 @@ Target interactive frame rate: **60 fps → 16.6 ms** per frame at street-level 
 > ([ADR-0001 § Determinism](../Architecture/ADR-0001-Mass-First-Unreal.md)); its budget is per
 > **sim tick**, which may run at a different cadence than rendering.
 
-## 2. Mass simulation budgets
+## 2. Bevy simulation budgets (Rust)
 
 | Quantity | Target | Notes |
 |---|---|---|

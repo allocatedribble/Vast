@@ -3,7 +3,11 @@
 - **Status:** Accepted
 - **Date:** 2026-06-01
 - **Deciders:** LogiUE architecture
-- **Related:** [ADR-0001](ADR-0001-Mass-First-Unreal.md), [ADR-0003](ADR-0003-Representation-LOD.md)
+- **Related:** [ADR-0005](ADR-0005-Bevy-ECS-Authority.md) (generalizes this ADR), [ADR-0001](ADR-0001-Mass-First-Unreal.md), [ADR-0003](ADR-0003-Representation-LOD.md)
+
+> **Generalized by [ADR-0005](ADR-0005-Bevy-ECS-Authority.md).** This ADR's principle — Rust owns truth
+> behind a narrow C ABI, Unreal renders, Rust never calls Unreal — is now the project-wide law, not a
+> terrain special case. Terrain authority lives in the `logi_terrain` crate inside the Rust workspace.
 
 ## Context
 

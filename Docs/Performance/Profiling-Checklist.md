@@ -4,6 +4,12 @@ How to measure each budget in [Budgets.md](Budgets.md), and what must hold befor
 **Profile before you optimize, and profile per world view** — orbital and street-level have entirely
 different cost shapes ([ADR-0003](../Architecture/ADR-0003-Representation-LOD.md)).
 
+> **Updated by [ADR-0005](../Architecture/ADR-0005-Bevy-ECS-Authority.md):** the **simulation** is profiled
+> in Rust — `cargo` benches, Tracy / `puffin`, and deterministic `cargo test` for replay equality (headless,
+> no editor). **MassInsights is retired for the sim.** Unreal Insights + `stat` commands now cover the
+> **C++ bridge, the FFI snapshot crossing, and rendering** only. Where "Mass" appears below, read "the Bevy
+> sim (Rust)" for simulation rows and "the LogiBevy bridge" for the Unreal-side cost.
+
 ## Tools
 
 - **Unreal Insights** — primary timeline profiler (game/render/GPU threads, frame breakdown).

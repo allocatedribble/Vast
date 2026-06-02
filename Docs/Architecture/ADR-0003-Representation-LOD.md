@@ -3,7 +3,12 @@
 - **Status:** Accepted
 - **Date:** 2026-06-01
 - **Deciders:** LogiUE architecture
-- **Related:** [ADR-0001](ADR-0001-Mass-First-Unreal.md), [Budgets](../Performance/Budgets.md)
+- **Related:** [ADR-0005](ADR-0005-Bevy-ECS-Authority.md), [ADR-0001](ADR-0001-Mass-First-Unreal.md), [Budgets](../Performance/Budgets.md)
+
+> **Still in force under [ADR-0005](ADR-0005-Bevy-ECS-Authority.md).** The unified significance-score model
+> is unchanged. Only the owner moves: **simulation LOD is now computed in Bevy (Rust)** and feeds a batched
+> representation snapshot; Unreal consumes it for representation / MetaHuman LODSync / Animation Budget
+> Allocator. Read "Mass simulation LOD" below as "the sim's LOD, computed in Bevy."
 
 ## Context
 

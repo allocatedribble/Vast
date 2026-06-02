@@ -3,7 +3,12 @@
 - **Status:** Accepted
 - **Date:** 2026-06-01
 - **Deciders:** LogiUE architecture
-- **Related:** [ADR-0001](ADR-0001-Mass-First-Unreal.md)
+- **Related:** [ADR-0001](ADR-0001-Mass-First-Unreal.md), [ADR-0005](ADR-0005-Bevy-ECS-Authority.md)
+
+> **Reinforced by [ADR-0005](ADR-0005-Bevy-ECS-Authority.md).** The same rule now applies to Rust: depend
+> on **`bevy_ecs` as a library** at its current version — never the full `bevy` engine, never
+> `bevy_render`/`bevy_window`/`wgpu`/`bevy_audio`. No compatibility shims across engine or crate versions;
+> migrate forward and delete.
 
 ## Context
 
