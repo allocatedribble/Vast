@@ -1,13 +1,13 @@
 //! The C-ABI entry points (runtime-model.md §3.1). Every call is wrapped so a Rust panic becomes a
 //! status code / null instead of unwinding across FFI (UB). The world handle is an opaque
-//! `*mut LogiWorld` (a boxed pointer); null is invalid.
+//! `*mut LogiTerrainWorld` (a boxed pointer); null is invalid.
 
 use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
 
 use logi_terrain_scene::{
     LogiBufferHandle, LogiBufferView, LogiCameraState, LogiFrameId, LogiFramePacket,
-    LogiStreamingBudget, LogiWorld, LogiWorldCreateInfo,
+    LogiStreamingBudget, LogiTerrainWorld, LogiWorldCreateInfo,
 };
 
 /// Status codes returned across the boundary. Matches `LogiStatus` (int32) in `logi_terrain.h`.
@@ -42,27 +42,27 @@ fn guard(f: impl FnOnce() -> LogiStatus) -> LogiStatus {
 
 /// Returns the ABI version. Unity must verify this before any other call.
 #[no_mangle]
-pub extern "C" fn logi_abi_version() -> u32 {
+pub extern "C" fn logi_terrain_abi_version() -> u32 {
     crate::LOGI_ABI_VERSION
 }
 
 /// Creates a world. Pass `info == null` for defaults. Returns null on failure.
 #[no_mangle]
-pub extern "C" fn logi_world_create(info: *const LogiWorldCreateInfo) -> *mut LogiWorld {
+pub extern "C" fn logi_terrain_world_create(info: *const LogiWorldCreateInfo) -> *mut LogiTerrainWorld {
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         let info = if info.is_null() {
             LogiWorldCreateInfo::defaults()
         } else {
             unsafe { *info }
         };
-        Box::into_raw(Box::new(LogiWorld::new(info)))
+        Box::into_raw(Box::new(LogiTerrainWorld::new(info)))
     }));
     result.unwrap_or(std::ptr::null_mut())
 }
 
-/// Destroys a world created by [`logi_world_create`].
+/// Destroys a world created by [`logi_terrain_world_create`].
 #[no_mangle]
-pub extern "C" fn logi_world_destroy(world: *mut LogiWorld) {
+pub extern "C" fn logi_terrain_world_destroy(world: *mut LogiTerrainWorld) {
     if world.is_null() {
         return;
     }
@@ -73,8 +73,8 @@ pub extern "C" fn logi_world_destroy(world: *mut LogiWorld) {
 
 /// Sets the camera state used by the next `step`.
 #[no_mangle]
-pub extern "C" fn logi_world_set_camera(
-    world: *mut LogiWorld,
+pub extern "C" fn logi_terrain_world_set_camera(
+    world: *mut LogiTerrainWorld,
     camera: *const LogiCameraState,
 ) -> LogiStatus {
     guard(|| {
@@ -92,8 +92,8 @@ pub extern "C" fn logi_world_set_camera(
 
 /// Re-budgets streaming (memory + in-flight cap).
 #[no_mangle]
-pub extern "C" fn logi_world_set_budget(
-    world: *mut LogiWorld,
+pub extern "C" fn logi_terrain_world_set_budget(
+    world: *mut LogiTerrainWorld,
     budget: *const LogiStreamingBudget,
 ) -> LogiStatus {
     guard(|| {
@@ -111,8 +111,8 @@ pub extern "C" fn logi_world_set_budget(
 
 /// Advances one frame and writes the new frame id to `out_frame_id`.
 #[no_mangle]
-pub extern "C" fn logi_world_step(
-    world: *mut LogiWorld,
+pub extern "C" fn logi_terrain_world_step(
+    world: *mut LogiTerrainWorld,
     delta_seconds: f64,
     out_frame_id: *mut LogiFrameId,
 ) -> LogiStatus {
@@ -132,8 +132,8 @@ pub extern "C" fn logi_world_step(
 
 /// Writes the frame packet for `frame_id` (must be a live frame) to `out_packet`.
 #[no_mangle]
-pub extern "C" fn logi_world_get_frame_packet(
-    world: *mut LogiWorld,
+pub extern "C" fn logi_terrain_world_get_frame_packet(
+    world: *mut LogiTerrainWorld,
     frame_id: LogiFrameId,
     out_packet: *mut LogiFramePacket,
 ) -> LogiStatus {
@@ -151,7 +151,7 @@ pub extern "C" fn logi_world_get_frame_packet(
                 LogiStatus::Ok
             }
             None => {
-                set_last_error("logi_world_get_frame_packet: stale or unknown frame_id");
+                set_last_error("logi_terrain_world_get_frame_packet: stale or unknown frame_id");
                 LogiStatus::InvalidHandle
             }
         }
@@ -160,8 +160,8 @@ pub extern "C" fn logi_world_get_frame_packet(
 
 /// Resolves a buffer handle to a zero-copy view of Rust-owned bytes.
 #[no_mangle]
-pub extern "C" fn logi_world_acquire_buffer_view(
-    world: *mut LogiWorld,
+pub extern "C" fn logi_terrain_world_acquire_buffer_view(
+    world: *mut LogiTerrainWorld,
     handle: LogiBufferHandle,
     out_view: *mut LogiBufferView,
 ) -> LogiStatus {
@@ -179,7 +179,7 @@ pub extern "C" fn logi_world_acquire_buffer_view(
                 LogiStatus::Ok
             }
             None => {
-                set_last_error("logi_world_acquire_buffer_view: unknown buffer handle");
+                set_last_error("logi_terrain_world_acquire_buffer_view: unknown buffer handle");
                 LogiStatus::InvalidHandle
             }
         }
@@ -188,7 +188,7 @@ pub extern "C" fn logi_world_acquire_buffer_view(
 
 /// Releases a frame, freeing its ring slot.
 #[no_mangle]
-pub extern "C" fn logi_world_release_frame(world: *mut LogiWorld, frame_id: LogiFrameId) {
+pub extern "C" fn logi_terrain_world_release_frame(world: *mut LogiTerrainWorld, frame_id: LogiFrameId) {
     if world.is_null() {
         return;
     }
@@ -201,7 +201,7 @@ pub extern "C" fn logi_world_release_frame(world: *mut LogiWorld, frame_id: Logi
 
 /// Copies the last error message (UTF-8, not NUL-terminated) into `buf`; returns bytes written.
 #[no_mangle]
-pub extern "C" fn logi_last_error_message(buf: *mut u8, buf_len: usize) -> usize {
+pub extern "C" fn logi_terrain_last_error_message(buf: *mut u8, buf_len: usize) -> usize {
     if buf.is_null() || buf_len == 0 {
         return 0;
     }

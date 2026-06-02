@@ -1,6 +1,6 @@
-//! The `LogiWorld` runtime object + the C-ABI frame-packet contract (runtime-model.md §3).
+//! The `LogiTerrainWorld` runtime object + the C-ABI frame-packet contract (runtime-model.md §3).
 //!
-//! `LogiWorld` wraps the streaming engine, owns a small frame ring, and assembles a [`LogiFramePacket`]
+//! `LogiTerrainWorld` wraps the streaming engine, owns a small frame ring, and assembles a [`LogiFramePacket`]
 //! each `step`. Geometry is referenced by [`LogiBufferHandle`] and fetched zero-copy via a
 //! [`LogiBufferView`] (the bytes stay Rust-owned). Field order in every `#[repr(C)]` struct is the
 //! contract — mirror it byte-for-byte in `include/logi_terrain.h` and the Unity bindings.
@@ -269,7 +269,7 @@ impl FrameSlot {
 }
 
 /// The opaque runtime world object (runtime-model.md §3.1).
-pub struct LogiWorld {
+pub struct LogiTerrainWorld {
     stream_world: StreamWorld,
     engine: StreamEngine<SyntheticProvider>,
     heights: TerrainHeights,
@@ -281,7 +281,7 @@ pub struct LogiWorld {
     frames: Vec<FrameSlot>,
 }
 
-impl LogiWorld {
+impl LogiTerrainWorld {
     pub fn new(info: LogiWorldCreateInfo) -> Self {
         let max_level = info.max_level.min(20) as u8;
         let mut stream_world = StreamWorld::new(info.world_size, max_level, info.world_size / 4.0);
