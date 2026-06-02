@@ -9,6 +9,12 @@ publish = false
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
+[features]
+default = []
+# Editor-only entity introspection ABI (ADR-0006). Enabled by the Unreal editor
+# build only; produces the logi_editor_* exports + logi_bevy_editor_ffi.h.
+editor_inspector = ["logi_runtime/editor_inspector"]
+
 [dependencies]
 logi_runtime = { path = "../logi_runtime" }
 logi_render_extract = { path = "../logi_render_extract" }

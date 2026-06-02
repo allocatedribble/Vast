@@ -37,7 +37,10 @@ public class LogiBevyRuntime : ModuleRules
 
 		if (Target.Platform == UnrealTargetPlatform.Win64)
 		{
-			TryBuildRustArtifact(RustDir);
+			// Editor builds get the editor_inspector feature (logi_editor_* exports);
+			// Game/Shipping stay clean (zero editor cost, ADR-0006).
+			bool bWithEditorInspector = Target.Type == TargetType.Editor;
+			TryBuildRustArtifact(RustDir, bWithEditorInspector);
 
 			string ImportLib = Path.Combine(RustOutDir, "logi_ffi.dll.lib");
 			string Dll = Path.Combine(RustOutDir, "logi_ffi.dll");
@@ -56,24 +59,27 @@ public class LogiBevyRuntime : ModuleRules
 			RuntimeDependencies.Add("$(BinaryOutputDir)/logi_ffi.dll", Dll);
 
 			PublicDefinitions.Add("LOGI_BEVY_HAVE_RUST=1");
+			PublicDefinitions.Add("LOGI_BEVY_HAVE_EDITOR_INSPECTOR=" + (bWithEditorInspector ? "1" : "0"));
 		}
 		else
 		{
 			// Other platforms: the bridge compiles to no-ops until the Rust target is added.
 			PublicDefinitions.Add("LOGI_BEVY_HAVE_RUST=0");
+			PublicDefinitions.Add("LOGI_BEVY_HAVE_EDITOR_INSPECTOR=0");
 		}
 	}
 
 	// Best-effort: keep the linked artifact fresh. If cargo is unavailable we fall
 	// back to a prebuilt artifact (validated by the File.Exists checks above).
-	private void TryBuildRustArtifact(string RustDir)
+	private void TryBuildRustArtifact(string RustDir, bool WithEditorInspector)
 	{
 		try
 		{
+			string Features = WithEditorInspector ? " --features editor_inspector" : "";
 			var Psi = new ProcessStartInfo
 			{
 				FileName = "cargo",
-				Arguments = "build --release -p logi_ffi",
+				Arguments = "build --release -p logi_ffi" + Features,
 				WorkingDirectory = RustDir,
 				UseShellExecute = false,
 				CreateNoWindow = true,

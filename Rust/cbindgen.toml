@@ -20,4 +20,4 @@ parse_deps = true
 include = ["logi_ffi", "logi_render_extract", "logi_schema"]
 
 [export]
-exclude = ["LogiWorld"]
+exclude = ["LogiWorld", "LogiEntitySummary"]

@@ -178,6 +178,20 @@ pub struct LogiSpawnCommand {
 	pub payload_kg: f64,
 }
 
+/// Editor-only inspection summary of one entity (ADR-0006). POD + paged. Excluded
+/// from the runtime header (cbindgen `exclude`); emitted into the separate
+/// `logi_bevy_editor_ffi.h`. Mirrors a row in the Bevy Entity Outliner.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LogiEntitySummary {
+	pub id: LogiEntityId,
+	pub position_cm: [f64; 3],
+	pub significance: f32,
+	pub representation_tier: u8,
+	pub pinned: u8,
+	pub _pad: [u8; 2],
+}
+
 /// Plain-data recipe describing one agent to spawn (authoring -> sim).
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct AgentSpawnRecipe {

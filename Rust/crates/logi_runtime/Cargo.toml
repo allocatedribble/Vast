@@ -4,6 +4,11 @@ edition.workspace = true
 version.workspace = true
 publish = false
 
+[features]
+default = []
+# Editor-only entity introspection (ADR-0006). Off in shipping builds.
+editor_inspector = []
+
 [dependencies]
 bevy_ecs.workspace = true
 logi_schema = { path = "../logi_schema" }

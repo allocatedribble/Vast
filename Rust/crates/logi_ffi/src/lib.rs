@@ -13,6 +13,11 @@ use logi_render_extract::{LogiActorUpdate, LogiStaticBatch};
 use logi_runtime::{LogiWorld, WorldConfig};
 use logi_schema::{LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnCommand};
 
+/// Editor-only entity introspection ABI (ADR-0006); compiled only with the
+/// `editor_inspector` feature, never in shipping builds.
+#[cfg(feature = "editor_inspector")]
+pub mod editor;
+
 /// ABI version. Bump on any breaking change to this header. Callers pass their
 /// compiled-against version in `LogiInitDesc::abi_version`; mismatches are rejected.
 pub const LOGI_ABI_VERSION: u32 = 6;

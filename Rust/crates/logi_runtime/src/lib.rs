@@ -17,6 +17,8 @@ use logi_render_extract::{
 use logi_schema::{
 	LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnCommand, LOGI_FLAG_FORCE_SINGLE_THREADED,
 };
+#[cfg(feature = "editor_inspector")]
+use logi_schema::LogiEntitySummary;
 use logi_sim::components::{
 	Agent, CullState, Renderable, Representation, Shipment, Simulated, StableId, Transform3d, Velocity3d,
 };
@@ -182,6 +184,10 @@ pub struct LogiWorld {
 	shard: u16,
 	accumulator: f64,
 	fixed_dt: f64,
+	#[cfg(feature = "editor_inspector")]
+	pinned: std::collections::HashSet<LogiEntityId>,
+	#[cfg(feature = "editor_inspector")]
+	editor_query_buf: Vec<LogiEntitySummary>,
 }
 
 impl LogiWorld {
@@ -222,6 +228,10 @@ impl LogiWorld {
 			shard: 0,
 			accumulator: 0.0,
 			fixed_dt: 1.0 / hz as f64,
+			#[cfg(feature = "editor_inspector")]
+			pinned: std::collections::HashSet::new(),
+			#[cfg(feature = "editor_inspector")]
+			editor_query_buf: Vec::new(),
 		}
 	}
 
@@ -374,6 +384,52 @@ impl LogiWorld {
 	pub fn despawns(&self) -> &[LogiEntityId] {
 		self.ring.published().map(|s| s.despawns.as_slice()).unwrap_or(&[])
 	}
+
+	// --- Editor introspection (ADR-0006; `editor_inspector` feature only) ---
+
+	/// Pin/unpin an entity for editor debug focus.
+	#[cfg(feature = "editor_inspector")]
+	pub fn editor_set_pin(&mut self, id: LogiEntityId, pinned: bool) {
+		if pinned {
+			self.pinned.insert(id);
+		} else {
+			self.pinned.remove(&id);
+		}
+	}
+
+	/// Fill the editor query buffer with a page of entity summaries; returns the
+	/// total entity count (for the editor's paging). Sampled (5-10 Hz), not hot.
+	#[cfg(feature = "editor_inspector")]
+	pub fn editor_query_entities(&mut self, offset: u32, limit: u32) -> u32 {
+		use logi_sim::components::{Representation, StableId, Transform3d};
+		let mut state = self.world.query::<(&StableId, &Transform3d, &Representation)>();
+		let total = state.iter(&self.world).count() as u32;
+		let rows: Vec<(LogiEntityId, [f64; 3], f32, u8)> = state
+			.iter(&self.world)
+			.skip(offset as usize)
+			.take(limit as usize)
+			.map(|(sid, t, rep)| (sid.0, t.translation_cm, rep.significance, rep.current_tier as u8))
+			.collect();
+		self.editor_query_buf.clear();
+		for (id, position_cm, significance, representation_tier) in rows {
+			let pinned = u8::from(self.pinned.contains(&id));
+			self.editor_query_buf.push(LogiEntitySummary {
+				id,
+				position_cm,
+				significance,
+				representation_tier,
+				pinned,
+				_pad: [0; 2],
+			});
+		}
+		total
+	}
+
+	/// The page filled by the last [`editor_query_entities`] (borrowed view).
+	#[cfg(feature = "editor_inspector")]
+	pub fn editor_entities(&self) -> &[LogiEntitySummary] {
+		&self.editor_query_buf
+	}
 }
 
 /// Advance the authoritative tick counter (one explicit step between phases).
@@ -461,6 +517,23 @@ mod tests {
 		assert!(w.dropped_snapshot_frames() >= 1);
 		assert_ne!(last_id, 0);
 		assert_eq!(w.snapshot_id(), last_id);
+	}
+
+	#[cfg(feature = "editor_inspector")]
+	#[test]
+	fn editor_query_pages_and_pins() {
+		let mut w = LogiWorld::new(cfg(1));
+		for i in 0..5 {
+			w.spawn(&spawn_cmd(100 + i, i as f64));
+		}
+		// total = 5, page capped at 3.
+		assert_eq!(w.editor_query_entities(0, 3), 5);
+		assert_eq!(w.editor_entities().len(), 3);
+		// Pin one entity; it reads back pinned on the next query.
+		let id = w.editor_entities()[0].id;
+		w.editor_set_pin(id, true);
+		w.editor_query_entities(0, 10);
+		assert_eq!(w.editor_entities().iter().filter(|e| e.pinned != 0).count(), 1);
 	}
 
 	#[test]
