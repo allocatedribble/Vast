@@ -86,6 +86,9 @@ void ULogiTerrainSubsystem::Deinitialize()
 	HostActor.Reset();
 	TerrainMesh.Reset();
 	TileSection.Reset();
+	FreeSections.Reset();
+	NextSection = 0;
+	FrameCounter = 0;
 	if (TerrainWorld.IsValid())
 	{
 		TerrainWorld->Destroy();
@@ -137,6 +140,38 @@ void ULogiTerrainSubsystem::EnsureRenderTarget()
 	TerrainMesh = Mesh;
 }
 
+void ULogiTerrainSubsystem::EvictIfOverBudget()
+{
+	constexpr int32 MaxSections = 2048;
+	UProceduralMeshComponent* Mesh = TerrainMesh.Get();
+	if (Mesh == nullptr)
+	{
+		return;
+	}
+	while (TileSection.Num() > MaxSections)
+	{
+		uint64 OldestKey = 0;
+		uint64 OldestSeen = MAX_uint64;
+		int32 OldestSection = INDEX_NONE;
+		for (const TPair<uint64, FTileEntry>& Pair : TileSection)
+		{
+			if (Pair.Value.LastSeen < OldestSeen)
+			{
+				OldestSeen = Pair.Value.LastSeen;
+				OldestKey = Pair.Key;
+				OldestSection = Pair.Value.Section;
+			}
+		}
+		if (OldestSection == INDEX_NONE)
+		{
+			break;
+		}
+		Mesh->ClearMeshSection(OldestSection);
+		FreeSections.Add(OldestSection);
+		TileSection.Remove(OldestKey);
+	}
+}
+
 void ULogiTerrainSubsystem::Tick(float DeltaTime)
 {
 #if LOGI_BEVY_HAVE_TERRAIN
@@ -179,6 +214,7 @@ void ULogiTerrainSubsystem::Tick(float DeltaTime)
 		return;
 	}
 
+	++FrameCounter;
 	LogiFramePacket Packet{};
 	if (TerrainWorld->GetFramePacket(Frame, Packet))
 	{
@@ -190,9 +226,10 @@ void ULogiTerrainSubsystem::Tick(float DeltaTime)
 			const uint64 Key = P.patch_handle;
 			Resident.Add(Key);
 
-			if (const int32* Existing = TileSection.Find(Key))
+			if (FTileEntry* Existing = TileSection.Find(Key))
 			{
-				Mesh->SetMeshSectionVisible(*Existing, true); // decoded mesh is stable; just reveal
+				Existing->LastSeen = FrameCounter;
+				Mesh->SetMeshSectionVisible(Existing->Section, true); // decoded mesh is stable; just reveal
 				continue;
 			}
 
@@ -202,20 +239,22 @@ void ULogiTerrainSubsystem::Tick(float DeltaTime)
 				&& TerrainWorld->AcquireBufferView(P.index_buffer, IView)
 				&& VView.data != nullptr && IView.data != nullptr && P.vertex_count > 0)
 			{
-				const int32 Section = TileSection.Num();
+				const int32 Section = (FreeSections.Num() > 0) ? FreeSections.Pop(EAllowShrinking::No) : NextSection++;
 				BuildSection(Mesh, Section, P, VView, IView, Packet.local_frame.origin);
-				TileSection.Add(Key, Section);
+				TileSection.Add(Key, FTileEntry{ Section, FrameCounter });
 			}
 		}
 
 		// Hide sections whose tile is not resident this frame (kept for reuse).
-		for (const TPair<uint64, int32>& Pair : TileSection)
+		for (const TPair<uint64, FTileEntry>& Pair : TileSection)
 		{
 			if (!Resident.Contains(Pair.Key))
 			{
-				Mesh->SetMeshSectionVisible(Pair.Value, false);
+				Mesh->SetMeshSectionVisible(Pair.Value.Section, false);
 			}
 		}
+
+		EvictIfOverBudget();
 	}
 	TerrainWorld->ReleaseFrame(Frame);
 #else

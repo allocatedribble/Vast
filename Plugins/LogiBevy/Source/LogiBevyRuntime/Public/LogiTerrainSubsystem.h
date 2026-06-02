@@ -32,10 +32,20 @@ public:
 	virtual TStatId GetStatId() const override;
 
 private:
+	struct FTileEntry
+	{
+		int32 Section = INDEX_NONE;
+		uint64 LastSeen = 0;
+	};
+
 	void EnsureRenderTarget();
+	void EvictIfOverBudget();
 
 	TPimplPtr<FLogiTerrainWorld> TerrainWorld;
 	TWeakObjectPtr<AActor> HostActor;
 	TWeakObjectPtr<class UProceduralMeshComponent> TerrainMesh;
-	TMap<uint64 /*patch handle*/, int32 /*mesh section*/> TileSection;
+	TMap<uint64 /*patch handle*/, FTileEntry> TileSection;
+	TArray<int32> FreeSections; // cleared section indices available for reuse
+	int32 NextSection = 0;
+	uint64 FrameCounter = 0;
 };
