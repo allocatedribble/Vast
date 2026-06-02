@@ -1,0 +1,15 @@
+[package]
+name = "logi_ffi"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+# Start with cdylib (delay-loaded DLL) for iteration; staticlib also emitted so
+# Unreal can switch link strategy after profiling (ADR-0005 / AGENTS.md § 5).
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+logi_runtime = { path = "../logi_runtime" }
+logi_render_extract = { path = "../logi_render_extract" }
+logi_schema = { path = "../logi_schema" }

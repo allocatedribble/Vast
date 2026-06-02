@@ -1,0 +1,20 @@
+# LogiUE simulation workspace — the gameplay authority (ADR-0005).
+# bevy_ecs is used as a LIBRARY. Never depend on bevy_render/bevy_window/wgpu/
+# bevy_audio or the umbrella `bevy` crate — Unreal renders; Bevy only simulates.
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+bevy_ecs = "0.18"
+
+# Tuned for the runtime artifact linked into Unreal.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,7 @@
+[package]
+name = "logi_schema"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]

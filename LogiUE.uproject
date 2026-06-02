@@ -29,6 +29,10 @@
 		{
 			"Name": "MassGameplay",
 			"Enabled": true
+		},
+		{
+			"Name": "LogiBevy",
+			"Enabled": true
 		}
 	]
 }

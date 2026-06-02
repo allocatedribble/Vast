@@ -1,0 +1,10 @@
+[package]
+name = "logi_render_extract"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+bevy_ecs.workspace = true
+logi_schema = { path = "../logi_schema" }
+logi_sim = { path = "../logi_sim" }

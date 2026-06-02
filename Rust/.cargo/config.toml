@@ -1,0 +1,9 @@
+# LogiUE Rust workspace build config.
+#
+# Host/target is x86_64-pc-windows-msvc, matching Unreal's MSVC ABI on Windows.
+# We build a `cdylib` (delay-loaded DLL) for fast iteration; its dynamic MSVC CRT
+# matches Unreal's expectations. Revisit `crt-static` only if/when we move to a
+# `staticlib` link and measure the link-time/packaging tradeoff (see ADR-0005).
+
+[build]
+# target = "x86_64-pc-windows-msvc"  # default host on this machine; uncomment to force.

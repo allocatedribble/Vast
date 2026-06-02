@@ -1,0 +1,25 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "LogiBevy",
+	"Description": "Bridge to the Rust bevy_ecs gameplay authority (ADR-0005). Unreal calls Rust over a narrow C ABI; Rust never calls Unreal.",
+	"Category": "LogiUE",
+	"CreatedBy": "LogiUE",
+	"CanContainContent": true,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"EnabledByDefault": true,
+	"Modules": [
+		{
+			"Name": "LogiBevyRuntime",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "LogiBevyEditor",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		}
+	]
+}
