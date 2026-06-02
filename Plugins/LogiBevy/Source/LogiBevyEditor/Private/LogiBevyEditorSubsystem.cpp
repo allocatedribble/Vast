@@ -73,11 +73,14 @@ TSharedRef<SDockTab> ULogiBevyEditorSubsystem::SpawnOutlinerTab(const FSpawnTabA
 	DetailsView = PropertyEditor.CreateDetailView(DetailsArgs);
 	DetailsView->SetObject(SelectionProxy);
 
-	ListView = SNew(SListView<TSharedPtr<FLogiBevyEntityRow>>)
+	using FEntityListView = SListView<TSharedPtr<FLogiBevyEntityRow>>;
+	ListView = SNew(FEntityListView)
 		.ListItemsSource(&Items)
 		.SelectionMode(ESelectionMode::Single)
-		.OnGenerateRow(this, &ULogiBevyEditorSubsystem::GenerateRow)
-		.OnSelectionChanged(this, &ULogiBevyEditorSubsystem::OnSelectionChanged);
+		// Bind via CreateUObject: UObjects aren't TSharedFromThis, so the (this, &Method)
+		// shorthand (which uses CreateSP -> AsShared) does not compile here.
+		.OnGenerateRow(FEntityListView::FOnGenerateRow::CreateUObject(this, &ULogiBevyEditorSubsystem::GenerateRow))
+		.OnSelectionChanged(FEntityListView::FOnSelectionChanged::CreateUObject(this, &ULogiBevyEditorSubsystem::OnSelectionChanged));
 
 	HeaderText = SNew(STextBlock).Text(LOCTEXT("Header", "Bevy Entity Outliner (start PIE to inspect)"));
 
