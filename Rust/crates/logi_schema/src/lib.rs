@@ -1,7 +1,8 @@
 //! `logi_schema` — foundational, dependency-light POD types shared across the
 //! LogiUE Rust workspace and across the FFI boundary: the stable simulation
-//! identity, IDs, vectors, camera/intent/spawn inputs, and spawn recipes.
-//! No `bevy`, no Unreal. (`bevy_ecs::Entity` is NEVER the durable identity.)
+//! identity, IDs, vectors, asset handles, representation tiers, camera/intent/
+//! spawn inputs, and spawn recipes. No `bevy`, no Unreal.
+//! (`bevy_ecs::Entity` is NEVER the durable identity.)
 
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +69,50 @@ logi_id!(LogiTileId);
 logi_id!(LogiRouteId);
 logi_id!(LogiAgentId);
 logi_id!(LogiShipmentId);
+
+/// Opaque handle to an Unreal-side asset (mesh, material, skeleton, anim graph).
+/// Unreal resolves it via its asset registry; Rust treats it as an opaque key.
+/// 0 == none.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AssetHandle(pub u64);
+
+impl AssetHandle {
+	pub const NONE: AssetHandle = AssetHandle(0);
+	#[inline]
+	pub const fn is_valid(self) -> bool {
+		self.0 != 0
+	}
+}
+
+/// Representation tier (ADR-0003). **Bevy decides; Unreal executes.** `repr(u8)`
+/// so it can cross the FFI. Ordered low→high fidelity.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum RepresentationTier {
+	#[default]
+	None = 0,
+	InstancedStaticMesh = 1,
+	LowResActor = 2,
+	HighResActor = 3,
+}
+
+/// Render option bitflags carried on `Renderable`.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderFlags(pub u32);
+
+impl RenderFlags {
+	pub const NONE: RenderFlags = RenderFlags(0);
+	pub const CAST_SHADOW: RenderFlags = RenderFlags(1 << 0);
+	pub const RECEIVE_DECALS: RenderFlags = RenderFlags(1 << 1);
+	pub const VISIBLE: RenderFlags = RenderFlags(1 << 2);
+
+	#[inline]
+	pub const fn contains(self, other: RenderFlags) -> bool {
+		(self.0 & other.0) == other.0
+	}
+}
 
 // --- Inputs that cross the FFI (Unreal -> Rust), all plain data --------------
 

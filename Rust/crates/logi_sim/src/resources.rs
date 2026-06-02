@@ -61,3 +61,18 @@ pub struct UnrealFrameInput {
 	pub cameras: Vec<LogiCameraView>,
 	pub intents: Vec<LogiPlayerIntent>,
 }
+
+/// Per-frame representation budgets (ADR-0003). Fidelity is allocated TOP-DOWN by
+/// significance against these caps — never by raw distance.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct RepresentationBudget {
+	pub high_res_actors: u32,
+	pub low_res_actors: u32,
+	pub instanced_meshes: u32,
+}
+
+impl Default for RepresentationBudget {
+	fn default() -> Self {
+		Self { high_res_actors: 64, low_res_actors: 256, instanced_meshes: 100_000 }
+	}
+}

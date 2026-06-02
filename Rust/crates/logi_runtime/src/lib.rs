@@ -10,9 +10,11 @@ use std::collections::HashMap;
 
 use logi_render_extract::{extract_agents, RenderSnapshot};
 use logi_schema::{
-	LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnCommand, Vec3, LOGI_FLAG_BOUNDED_PARALLEL,
+	LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnCommand, LOGI_FLAG_BOUNDED_PARALLEL,
 };
-use logi_sim::components::{Agent, LogiId, Position, Shipment, Simulated, Velocity};
+use logi_sim::components::{
+	Agent, CullState, Renderable, Representation, Shipment, Simulated, StableId, Transform3d, Velocity3d,
+};
 use logi_sim::resources::{SimClock, SimRng, TerrainResource, UnrealFrameInput};
 use logi_sim::schedules::{LogiSchedulerMode, LogiSchedules};
 
@@ -66,6 +68,7 @@ impl LogiWorld {
 		world.insert_resource(SimRng::new(config.deterministic_seed));
 		world.insert_resource(TerrainResource::default());
 		world.insert_resource(UnrealFrameInput::default());
+		world.init_resource::<logi_sim::resources::RepresentationBudget>();
 
 		Self {
 			world,
@@ -94,14 +97,17 @@ impl LogiWorld {
 			self.allocate_id(cmd.kind)
 		};
 
-		let pos = Vec3::new(cmd.position[0] as f32, cmd.position[1] as f32, cmd.position[2] as f32);
+		let transform = Transform3d { translation_cm: cmd.position, ..Default::default() };
 		let entity = self
 			.world
 			.spawn((
-				LogiId(id),
+				StableId(id),
+				transform,
+				Velocity3d::default(),
+				Renderable::default(),
+				Representation::default(),
+				CullState::default(),
 				Agent::default(),
-				Position(pos),
-				Velocity(Vec3::ZERO),
 				Shipment { id: Default::default(), payload_kg: cmd.payload_kg },
 				Simulated,
 			))
@@ -138,11 +144,9 @@ impl LogiWorld {
 		cameras: &[LogiCameraView],
 		intents: &[LogiPlayerIntent],
 	) -> TickOutcome {
-		// 1. Ingest Unreal input, then run the input phase.
 		self.ingest_input(cameras, intents);
 		self.schedules.input_ingest.run(&mut self.world);
 
-		// 2. Authoritative fixed-step simulation.
 		self.accumulator += f64::from(frame_delta_seconds.max(0.0));
 		let mut steps_run = 0u32;
 		while self.accumulator >= self.fixed_dt && steps_run < max_fixed_steps {
@@ -154,19 +158,16 @@ impl LogiWorld {
 			steps_run += 1;
 		}
 
-		// Drop the whole-step backlog beyond the clamp (avoid spiral-of-death).
 		let mut dropped = 0u32;
 		while self.accumulator >= self.fixed_dt {
 			self.accumulator -= self.fixed_dt;
 			dropped += 1;
 		}
 
-		// 3. Per-frame representation + extract phases.
 		self.schedules.representation_plan.run(&mut self.world);
 		self.schedules.render_extract.run(&mut self.world);
 		self.schedules.maintenance.run(&mut self.world);
 
-		// 4. Build the snapshot result.
 		self.snapshot_counter += 1;
 		extract_agents(&mut self.world, &mut self.snapshot);
 		let tick = self.sim_tick();
@@ -245,13 +246,14 @@ mod tests {
 		let snap = w.snapshot_view(0).expect("latest snapshot");
 		assert_eq!(snap.agents.len(), 1);
 		assert_eq!(snap.agents[0].id, id);
+		assert_eq!(snap.agents[0].translation_cm, [10.0, 0.0, 0.0]);
 	}
 
 	/// Determinism rule 7: the fixed-step result is identical regardless of how
 	/// the same total time is chunked into frames (30 / 60 / 120 fps analogue).
 	#[test]
 	fn snapshot_equal_across_frame_rates() {
-		fn run(delta: f32, frames: u32) -> (u64, Vec<(u64, f32, f32, f32)>) {
+		fn run(delta: f32, frames: u32) -> (u64, Vec<(u64, [f64; 3])>) {
 			let mut w = LogiWorld::new(cfg(123));
 			w.spawn(&LogiSpawnCommand {
 				kind: 1,
@@ -264,11 +266,10 @@ mod tests {
 				w.tick(delta, 64, &[], &[]);
 			}
 			let snap = w.snapshot_view(0).expect("snapshot");
-			let agents = snap.agents.iter().map(|a| (a.id.index, a.x, a.y, a.z)).collect();
+			let agents = snap.agents.iter().map(|a| (a.id.index, a.translation_cm)).collect();
 			(w.sim_tick(), agents)
 		}
 
-		// All sum to exactly 1.0s (exact binary deltas) -> identical fixed steps.
 		let a = run(1.0 / 16.0, 16);
 		let b = run(1.0 / 32.0, 32);
 		let c = run(1.0 / 64.0, 64);

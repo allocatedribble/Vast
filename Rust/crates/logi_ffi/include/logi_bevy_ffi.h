@@ -118,13 +118,14 @@ typedef struct {
  */
 typedef struct {
   LogiEntityId id;
-  float x;
-  float y;
-  float z;
   /**
-   * 0 = High, 1 = Medium, 2 = Low, 3 = Off (significance-driven; ADR-0003).
+   * World translation in cm (f64 for Unreal large-world coordinates).
    */
-  uint8_t sim_lod;
+  double translation_cm[3];
+  /**
+   * `RepresentationTier` as u8 (0=None, 1=ISM, 2=LowRes, 3=HighRes). ADR-0003.
+   */
+  uint8_t tier;
 } LogiAgentInstance;
 
 /**

@@ -143,8 +143,8 @@ void ULogiBevySubsystem::TickSimulation(float DeltaTime)
 			Dst.EntityIndex = static_cast<int64>(Src.id.index);
 			Dst.EntityGeneration = static_cast<int32>(Src.id.generation);
 			Dst.EntityKind = static_cast<int32>(Src.id.kind);
-			Dst.Location = FVector(Src.x, Src.y, Src.z);
-			Dst.SimLOD = Src.sim_lod;
+			Dst.Location = FVector(Src.translation_cm[0], Src.translation_cm[1], Src.translation_cm[2]);
+			Dst.Tier = Src.tier;
 		}
 	}
 #else

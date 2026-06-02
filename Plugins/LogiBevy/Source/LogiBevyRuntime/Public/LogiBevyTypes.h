@@ -27,10 +27,12 @@ struct FLogiAgentInstance
 	UPROPERTY(BlueprintReadOnly, Category = "LogiBevy")
 	int32 EntityKind = 0;
 
+	/** World position in cm (f64 / large-world coordinates). */
 	UPROPERTY(BlueprintReadOnly, Category = "LogiBevy")
 	FVector Location = FVector::ZeroVector;
 
-	/** 0 = High, 1 = Medium, 2 = Low, 3 = Off (ADR-0003). */
+	/** Representation tier — Bevy decides, Unreal executes (ADR-0003):
+	 *  0 = None, 1 = InstancedStaticMesh, 2 = LowResActor, 3 = HighResActor. */
 	UPROPERTY(BlueprintReadOnly, Category = "LogiBevy")
-	uint8 SimLOD = 0;
+	uint8 Tier = 0;
 };

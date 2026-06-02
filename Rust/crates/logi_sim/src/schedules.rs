@@ -1,7 +1,7 @@
 //! The phased schedule model (ADR-0005 scheduling treaty). Unreal owns the
 //! frame; Bevy owns the step. Hard phase boundaries; explicit executor mode.
 
-use crate::systems::integrate_motion;
+use crate::systems::{allocate_representation_budget, compute_significance, integrate_motion};
 use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::{ExecutorKind, ScheduleLabel};
 use bevy_tasks::{ComputeTaskPool, TaskPoolBuilder};
@@ -93,6 +93,8 @@ impl LogiSchedules {
 
 		// Gameplay systems land in their phase (more as the sim grows).
 		fixed_sim.add_systems(integrate_motion);
+		// Bevy computes the representation decision; Unreal executes it (ADR-0003).
+		representation_plan.add_systems((compute_significance, allocate_representation_budget).chain());
 
 		Self {
 			input_ingest,

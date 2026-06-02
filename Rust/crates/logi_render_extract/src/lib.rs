@@ -1,22 +1,22 @@
 //! `logi_render_extract` — per-frame snapshots handed to Unreal. POD, `repr(C)`,
 //! so the whole buffer crosses the FFI by pointer+count with NO per-entity calls
 //! (the batched boundary mandated by ADR-0005). Identity is the stable
-//! `LogiEntityId` — the raw `bevy_ecs::Entity` never leaves Rust.
+//! `LogiEntityId`; the raw `bevy_ecs::Entity` never leaves Rust. Carries the
+//! Bevy-computed representation tier for Unreal to execute (ADR-0003).
 
 use bevy_ecs::prelude::*;
 use logi_schema::LogiEntityId;
-use logi_sim::components::{LogiId, Position};
+use logi_sim::components::{Representation, StableId, Transform3d};
 
 /// One agent's render-relevant state. `repr(C)`: crosses the FFI verbatim.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LogiAgentInstance {
 	pub id: LogiEntityId,
-	pub x: f32,
-	pub y: f32,
-	pub z: f32,
-	/// 0 = High, 1 = Medium, 2 = Low, 3 = Off (significance-driven; ADR-0003).
-	pub sim_lod: u8,
+	/// World translation in cm (f64 for Unreal large-world coordinates).
+	pub translation_cm: [f64; 3],
+	/// `RepresentationTier` as u8 (0=None, 1=ISM, 2=LowRes, 3=HighRes). ADR-0003.
+	pub tier: u8,
 }
 
 /// Owned snapshot buffer. Lives in the world; Unreal borrows a view each frame.
@@ -38,14 +38,12 @@ impl RenderSnapshot {
 /// Leaves `snapshot_id` / `sim_tick` for the caller to stamp.
 pub fn extract_agents(world: &mut World, snapshot: &mut RenderSnapshot) {
 	snapshot.agents.clear();
-	let mut query = world.query::<(&LogiId, &Position)>();
-	for (id, pos) in query.iter(world) {
+	let mut query = world.query::<(&StableId, &Transform3d, &Representation)>();
+	for (id, transform, rep) in query.iter(world) {
 		snapshot.agents.push(LogiAgentInstance {
 			id: id.0,
-			x: pos.0.x,
-			y: pos.0.y,
-			z: pos.0.z,
-			sim_lod: 0,
+			translation_cm: transform.translation_cm,
+			tier: rep.current_tier as u8,
 		});
 	}
 }
