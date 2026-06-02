@@ -625,6 +625,85 @@ dependencies = [
 ]
 
 [[package]]
+name = "logi_terrain_cache"
+version = "0.1.0"
+dependencies = [
+ "logi_terrain_core",
+]
+
+[[package]]
+name = "logi_terrain_core"
+version = "0.1.0"
+dependencies = [
+ "glam",
+]
+
+[[package]]
+name = "logi_terrain_decode"
+version = "0.1.0"
+dependencies = [
+ "logi_terrain_geo",
+ "logi_terrain_pack",
+]
+
+[[package]]
+name = "logi_terrain_ffi"
+version = "0.1.0"
+dependencies = [
+ "logi_terrain_core",
+ "logi_terrain_scene",
+]
+
+[[package]]
+name = "logi_terrain_geo"
+version = "0.1.0"
+
+[[package]]
+name = "logi_terrain_lod"
+version = "0.1.0"
+
+[[package]]
+name = "logi_terrain_pack"
+version = "0.1.0"
+
+[[package]]
+name = "logi_terrain_procgen"
+version = "0.1.0"
+dependencies = [
+ "logi_terrain_pack",
+]
+
+[[package]]
+name = "logi_terrain_scene"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "logi_terrain_core",
+ "logi_terrain_decode",
+ "logi_terrain_geo",
+ "logi_terrain_procgen",
+ "logi_terrain_stream",
+]
+
+[[package]]
+name = "logi_terrain_stream"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "logi_terrain_cache",
+ "logi_terrain_core",
+ "logi_terrain_lod",
+]
+
+[[package]]
+name = "logi_terrain_tools"
+version = "0.1.0"
+dependencies = [
+ "logi_terrain_core",
+ "logi_terrain_stream",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

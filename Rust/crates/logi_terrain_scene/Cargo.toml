@@ -1,0 +1,14 @@
+[package]
+name = "logi_terrain_scene"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+logi_terrain_core = { path = "../logi_terrain_core" }
+logi_terrain_geo = { path = "../logi_terrain_geo" }
+logi_terrain_stream = { path = "../logi_terrain_stream" }
+logi_terrain_procgen = { path = "../logi_terrain_procgen" }
+logi_terrain_decode = { path = "../logi_terrain_decode" }
+glam = { workspace = true }

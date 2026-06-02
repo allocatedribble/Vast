@@ -12,11 +12,24 @@ members = [
 	"crates/logi_sim",
 	"crates/logi_render_extract",
 	"crates/logi_schema",
+	# Terrain kernel (ADR-0007), ported from the prior Unity Logi workspace.
+	"crates/logi_terrain_core",
+	"crates/logi_terrain_geo",
+	"crates/logi_terrain_pack",
+	"crates/logi_terrain_cache",
+	"crates/logi_terrain_decode",
+	"crates/logi_terrain_procgen",
+	"crates/logi_terrain_lod",
+	"crates/logi_terrain_stream",
+	"crates/logi_terrain_scene",
+	"crates/logi_terrain_ffi",
+	"crates/logi_terrain_tools",
 ]
 
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
+license = "Proprietary"
 
 [workspace.dependencies]
 bevy_ecs = "0.18.1"
@@ -25,6 +38,7 @@ bevy_app = "0.18.1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
+glam = "0.30"
 
 [profile.release]
 panic = "abort"

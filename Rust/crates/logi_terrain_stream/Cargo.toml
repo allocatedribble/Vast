@@ -1,0 +1,12 @@
+[package]
+name = "logi_terrain_stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+logi_terrain_core = { path = "../logi_terrain_core" }
+logi_terrain_cache = { path = "../logi_terrain_cache" }
+logi_terrain_lod = { path = "../logi_terrain_lod" }
+glam = { workspace = true }

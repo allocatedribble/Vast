@@ -1,0 +1,10 @@
+[package]
+name = "logi_terrain_decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+logi_terrain_pack = { path = "../logi_terrain_pack" }
+logi_terrain_geo = { path = "../logi_terrain_geo" }

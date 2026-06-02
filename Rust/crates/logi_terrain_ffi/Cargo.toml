@@ -1,0 +1,15 @@
+[package]
+name = "logi_terrain_ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# Output name is `logi_terrain` so the Unity plugin / DllImport name is stable across the restructure.
+name = "logi_terrain"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+logi_terrain_core = { path = "../logi_terrain_core" }
+logi_terrain_scene = { path = "../logi_terrain_scene" }
