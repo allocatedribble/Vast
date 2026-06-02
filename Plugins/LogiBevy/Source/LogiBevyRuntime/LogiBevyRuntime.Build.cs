@@ -22,7 +22,8 @@ public class LogiBevyRuntime : ModuleRules
 			"Core",
 			"CoreUObject",
 			"Engine",
-			"Projects", // IPluginManager (locating the staged DLL at runtime)
+			"Projects",          // IPluginManager (locating the staged DLL at runtime)
+			"DeveloperSettings", // ULogiBevyDeveloperSettings (Project Settings)
 		});
 
 		// Plugins/LogiBevy/Source/LogiBevyRuntime -> .../Plugins/LogiBevy -> <ProjectRoot>

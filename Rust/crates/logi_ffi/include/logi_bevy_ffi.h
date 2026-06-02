@@ -17,7 +17,7 @@ typedef struct LogiWorld LogiWorld;
  * ABI version. Bump on any breaking change to this header. Callers pass their
  * compiled-against version in `LogiInitDesc::abi_version`; mismatches are rejected.
  */
-#define LOGI_ABI_VERSION 5
+#define LOGI_ABI_VERSION 6
 
 #define LOGI_OK 0
 
@@ -51,6 +51,13 @@ typedef struct {
   uint32_t fixed_step_hz;
   uint64_t deterministic_seed;
   uint32_t flags;
+  /**
+   * Representation budgets (ADR-0003): top-N entities by significance per tier.
+   * All three zero => library defaults (64 / 256 / 100000).
+   */
+  uint32_t high_res_actor_budget;
+  uint32_t low_res_actor_budget;
+  uint32_t instanced_mesh_budget;
 } LogiInitDesc;
 
 /**

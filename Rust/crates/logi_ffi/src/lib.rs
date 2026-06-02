@@ -15,7 +15,7 @@ use logi_schema::{LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnComma
 
 /// ABI version. Bump on any breaking change to this header. Callers pass their
 /// compiled-against version in `LogiInitDesc::abi_version`; mismatches are rejected.
-pub const LOGI_ABI_VERSION: u32 = 5;
+pub const LOGI_ABI_VERSION: u32 = 6;
 
 // Status / error codes (returned in `status` fields and `LogiError::code`).
 pub const LOGI_OK: u32 = 0;
@@ -51,6 +51,11 @@ pub struct LogiInitDesc {
 	pub fixed_step_hz: u32,
 	pub deterministic_seed: u64,
 	pub flags: u32,
+	/// Representation budgets (ADR-0003): top-N entities by significance per tier.
+	/// All three zero => library defaults (64 / 256 / 100000).
+	pub high_res_actor_budget: u32,
+	pub low_res_actor_budget: u32,
+	pub instanced_mesh_budget: u32,
 }
 
 /// Per-frame input from Unreal. `cameras`/`player_intents` are borrowed for the
@@ -186,6 +191,9 @@ pub extern "C" fn logi_world_create(desc: *const LogiInitDesc, err: *mut LogiErr
 		deterministic_seed: desc.deterministic_seed,
 		worker_thread_count: desc.worker_thread_count,
 		flags: desc.flags,
+		high_res_actor_budget: desc.high_res_actor_budget,
+		low_res_actor_budget: desc.low_res_actor_budget,
+		instanced_mesh_budget: desc.instanced_mesh_budget,
 	};
 
 	match catch_unwind(AssertUnwindSafe(|| Box::into_raw(Box::new(LogiWorld::new(config))))) {

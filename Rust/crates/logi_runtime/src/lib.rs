@@ -30,6 +30,9 @@ pub struct WorldConfig {
 	pub deterministic_seed: u64,
 	pub worker_thread_count: u32,
 	pub flags: u32,
+	pub high_res_actor_budget: u32,
+	pub low_res_actor_budget: u32,
+	pub instanced_mesh_budget: u32,
 }
 
 impl WorldConfig {
@@ -190,7 +193,20 @@ impl LogiWorld {
 		world.insert_resource(SimRng::new(config.deterministic_seed));
 		world.insert_resource(TerrainResource::default());
 		world.insert_resource(UnrealFrameInput::default());
-		world.init_resource::<RepresentationBudget>();
+		// Representation budgets from config; all-zero => library defaults.
+		let budget = if config.high_res_actor_budget == 0
+			&& config.low_res_actor_budget == 0
+			&& config.instanced_mesh_budget == 0
+		{
+			RepresentationBudget::default()
+		} else {
+			RepresentationBudget {
+				high_res_actors: config.high_res_actor_budget,
+				low_res_actors: config.low_res_actor_budget,
+				instanced_meshes: config.instanced_mesh_budget,
+			}
+		};
+		world.insert_resource(budget);
 		world.insert_resource(RenderSnapshotResource::default());
 
 		let mut schedules = LogiSchedules::new(config.scheduler_mode(), config.worker_thread_count);
@@ -379,6 +395,9 @@ mod tests {
 			deterministic_seed: seed,
 			worker_thread_count: 0,
 			flags: LOGI_FLAG_FORCE_SINGLE_THREADED,
+			high_res_actor_budget: 64,
+			low_res_actor_budget: 256,
+			instanced_mesh_budget: 100_000,
 		}
 	}
 

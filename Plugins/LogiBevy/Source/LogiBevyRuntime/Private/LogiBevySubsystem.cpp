@@ -1,6 +1,7 @@
 // Copyright LogiUE. All Rights Reserved.
 
 #include "LogiBevySubsystem.h"
+#include "LogiBevyDeveloperSettings.h"
 #include "Engine/World.h"
 #include "Engine/Level.h"
 #include "GameFramework/PlayerController.h"
@@ -27,12 +28,17 @@ void ULogiBevySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	Super::Initialize(Collection);
 
 #if LOGI_BEVY_HAVE_RUST
+	const ULogiBevyDeveloperSettings& Settings = *GetDefault<ULogiBevyDeveloperSettings>();
+
 	LogiInitDesc Desc{};
 	Desc.abi_version = LOGI_ABI_VERSION;
-	Desc.worker_thread_count = 0;
-	Desc.fixed_step_hz = 30;
-	Desc.deterministic_seed = 0x4C4F4749ull; // 'LOGI'
-	Desc.flags = 0;
+	Desc.worker_thread_count = static_cast<uint32>(FMath::Max(0, Settings.WorkerThreadCount));
+	Desc.fixed_step_hz = static_cast<uint32>(FMath::Clamp(Settings.FixedStepHz, 1, 240));
+	Desc.deterministic_seed = static_cast<uint64>(Settings.DeterministicSeed);
+	Desc.flags = Settings.bForceSingleThreaded ? LOGI_FLAG_FORCE_SINGLE_THREADED : 0u;
+	Desc.high_res_actor_budget = static_cast<uint32>(FMath::Max(0, Settings.HighResActorBudget));
+	Desc.low_res_actor_budget = static_cast<uint32>(FMath::Max(0, Settings.LowResActorBudget));
+	Desc.instanced_mesh_budget = static_cast<uint32>(FMath::Max(0, Settings.InstancedMeshBudget));
 
 	LogiError Err{};
 	WorldHandle = static_cast<void*>(logi_world_create(&Desc, &Err));
@@ -42,18 +48,28 @@ void ULogiBevySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		return;
 	}
 
-	LogiSpawnCommand Commands[4];
-	FMemory::Memzero(Commands, sizeof(Commands));
-	for (int32 Index = 0; Index < 4; ++Index)
+	const int32 NumDemo = FMath::Max(0, Settings.DemoAgentCount);
+	if (NumDemo > 0)
 	{
-		Commands[Index].kind = 1;
-		Commands[Index].position[0] = static_cast<double>(Index) * 200.0;
-		Commands[Index].route_id = 1;
-		Commands[Index].payload_kg = 10.0;
+		TArray<LogiSpawnCommand> Commands;
+		Commands.SetNumZeroed(NumDemo);
+		for (int32 Index = 0; Index < NumDemo; ++Index)
+		{
+			Commands[Index].kind = 1;
+			Commands[Index].position[0] = static_cast<double>(Index) * 200.0;
+			Commands[Index].route_id = 1;
+			Commands[Index].payload_kg = 10.0;
+		}
+		LogiError SpawnErr{};
+		const uint32 Applied = logi_submit_spawn_commands(
+			static_cast<LogiWorld*>(WorldHandle), Commands.GetData(), static_cast<uint32>(NumDemo), &SpawnErr);
+		UE_LOG(LogLogiBevy, Log, TEXT("Bevy world created; %u demo agents submitted (budgets %u/%u/%u)."),
+			Applied, Desc.high_res_actor_budget, Desc.low_res_actor_budget, Desc.instanced_mesh_budget);
 	}
-	LogiError SpawnErr{};
-	const uint32 Applied = logi_submit_spawn_commands(static_cast<LogiWorld*>(WorldHandle), Commands, 4, &SpawnErr);
-	UE_LOG(LogLogiBevy, Log, TEXT("Bevy world created; %u demo agents submitted."), Applied);
+	else
+	{
+		UE_LOG(LogLogiBevy, Log, TEXT("Bevy world created (no demo agents)."));
+	}
 #endif
 }
 
