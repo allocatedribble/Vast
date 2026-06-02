@@ -40,7 +40,8 @@ public class LogiBevyRuntime : ModuleRules
 			// Editor builds get the editor_inspector feature (logi_editor_* exports);
 			// Game/Shipping stay clean (zero editor cost, ADR-0006).
 			bool bWithEditorInspector = Target.Type == TargetType.Editor;
-			TryBuildRustArtifact(RustDir, bWithEditorInspector);
+			TryBuildCargo(RustDir, "logi_ffi", bWithEditorInspector ? " --features editor_inspector" : "");
+			TryBuildCargo(RustDir, "logi_terrain_ffi", "");
 
 			string ImportLib = Path.Combine(RustOutDir, "logi_ffi.dll.lib");
 			string Dll = Path.Combine(RustOutDir, "logi_ffi.dll");
@@ -60,26 +61,42 @@ public class LogiBevyRuntime : ModuleRules
 
 			PublicDefinitions.Add("LOGI_BEVY_HAVE_RUST=1");
 			PublicDefinitions.Add("LOGI_BEVY_HAVE_EDITOR_INSPECTOR=" + (bWithEditorInspector ? "1" : "0"));
+
+			// Terrain kernel DLL (ADR-0007): a second cdylib, logi_terrain.dll.
+			PublicIncludePaths.Add(Path.Combine(RustDir, "crates", "logi_terrain_ffi", "include"));
+			string TerrainLib = Path.Combine(RustOutDir, "logi_terrain.dll.lib");
+			string TerrainDll = Path.Combine(RustOutDir, "logi_terrain.dll");
+			if (File.Exists(TerrainLib) && File.Exists(TerrainDll))
+			{
+				PublicAdditionalLibraries.Add(TerrainLib);
+				PublicDelayLoadDLLs.Add("logi_terrain.dll");
+				RuntimeDependencies.Add("$(BinaryOutputDir)/logi_terrain.dll", TerrainDll);
+				PublicDefinitions.Add("LOGI_BEVY_HAVE_TERRAIN=1");
+			}
+			else
+			{
+				PublicDefinitions.Add("LOGI_BEVY_HAVE_TERRAIN=0");
+			}
 		}
 		else
 		{
 			// Other platforms: the bridge compiles to no-ops until the Rust target is added.
 			PublicDefinitions.Add("LOGI_BEVY_HAVE_RUST=0");
 			PublicDefinitions.Add("LOGI_BEVY_HAVE_EDITOR_INSPECTOR=0");
+			PublicDefinitions.Add("LOGI_BEVY_HAVE_TERRAIN=0");
 		}
 	}
 
 	// Best-effort: keep the linked artifact fresh. If cargo is unavailable we fall
 	// back to a prebuilt artifact (validated by the File.Exists checks above).
-	private void TryBuildRustArtifact(string RustDir, bool WithEditorInspector)
+	private void TryBuildCargo(string RustDir, string Package, string ExtraArgs)
 	{
 		try
 		{
-			string Features = WithEditorInspector ? " --features editor_inspector" : "";
 			var Psi = new ProcessStartInfo
 			{
 				FileName = "cargo",
-				Arguments = "build --release -p logi_ffi" + Features,
+				Arguments = "build --release -p " + Package + ExtraArgs,
 				WorkingDirectory = RustDir,
 				UseShellExecute = false,
 				CreateNoWindow = true,
@@ -100,7 +117,7 @@ public class LogiBevyRuntime : ModuleRules
 				Proc.WaitForExit();
 				if (Proc.ExitCode != 0)
 				{
-					throw new BuildException("LogiBevy: `cargo build --release -p logi_ffi` failed:\n" + ErrTask.Result);
+					throw new BuildException("LogiBevy: cargo build for " + Package + " failed:\n" + ErrTask.Result);
 				}
 			}
 		}

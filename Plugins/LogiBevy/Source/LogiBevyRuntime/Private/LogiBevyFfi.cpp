@@ -47,6 +47,24 @@ public:
 				static_cast<uint32>(LOGI_ABI_VERSION), LibVersion);
 			UE_CLOG(LibVersion == LOGI_ABI_VERSION, LogLogiBevy, Log, TEXT("logi_ffi ABI version %u OK."), LibVersion);
 		}
+
+#if LOGI_BEVY_HAVE_TERRAIN
+		{
+			// Terrain kernel DLL (ADR-0007), loaded the same way as logi_ffi.dll.
+			FString TerrainPath = TEXT("logi_terrain.dll");
+			if (TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("LogiBevy")))
+			{
+				const FString Staged = FPaths::Combine(Plugin->GetBaseDir(), TEXT("Binaries"), TEXT("Win64"), TEXT("logi_terrain.dll"));
+				if (FPaths::FileExists(Staged))
+				{
+					TerrainPath = Staged;
+				}
+			}
+			TerrainDllHandle = FPlatformProcess::GetDllHandle(*TerrainPath);
+			UE_CLOG(TerrainDllHandle == nullptr, LogLogiBevy, Warning, TEXT("Failed to load logi_terrain.dll ('%s'); terrain unavailable."), *TerrainPath);
+			UE_CLOG(TerrainDllHandle != nullptr, LogLogiBevy, Log, TEXT("Loaded logi_terrain.dll."));
+		}
+#endif
 #endif
 	}
 
@@ -57,10 +75,16 @@ public:
 			FPlatformProcess::FreeDllHandle(DllHandle);
 			DllHandle = nullptr;
 		}
+		if (TerrainDllHandle != nullptr)
+		{
+			FPlatformProcess::FreeDllHandle(TerrainDllHandle);
+			TerrainDllHandle = nullptr;
+		}
 	}
 
 private:
 	void* DllHandle = nullptr;
+	void* TerrainDllHandle = nullptr;
 };
 
 IMPLEMENT_MODULE(FLogiBevyRuntimeModule, LogiBevyRuntime);
