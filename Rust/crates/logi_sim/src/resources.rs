@@ -2,6 +2,7 @@
 
 use crate::terrain::Terrain;
 use bevy_ecs::prelude::*;
+use logi_schema::{LogiCameraView, LogiPlayerIntent};
 
 /// Fixed-step clock. `tick` advances exactly once per fixed step.
 #[derive(Resource, Clone, Copy, Debug)]
@@ -52,3 +53,11 @@ impl SimRng {
 /// The terrain authority, held as a simulation Resource.
 #[derive(Resource, Default)]
 pub struct TerrainResource(pub Terrain);
+
+/// Latest per-frame Unreal input, ingested at the `InputIngest` phase. Read by
+/// significance/representation systems; non-authoritative.
+#[derive(Resource, Default)]
+pub struct UnrealFrameInput {
+	pub cameras: Vec<LogiCameraView>,
+	pub intents: Vec<LogiPlayerIntent>,
+}

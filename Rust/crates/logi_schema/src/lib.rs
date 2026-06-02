@@ -40,6 +40,11 @@ impl LogiEntityId {
 	}
 }
 
+/// `LogiInitDesc::flags` bit: run the sim with the bounded-parallel scheduler
+/// (multi-threaded executor + a sized `ComputeTaskPool`). Default (bit unset) is
+/// the single-threaded deterministic scheduler.
+pub const LOGI_FLAG_BOUNDED_PARALLEL: u32 = 1 << 0;
+
 /// Domain IDs (deterministic, stable). 0 == invalid.
 macro_rules! logi_id {
 	($name:ident) => {

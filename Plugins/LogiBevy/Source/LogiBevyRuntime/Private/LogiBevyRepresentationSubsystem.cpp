@@ -6,6 +6,20 @@
 #include "LogiBevyActorPool.h"
 #include "LogiBevyTelemetry.h"
 #include "Engine/World.h"
+#include "Engine/Level.h"
+
+void FLogiBevyRepresentationTickFunction::ExecuteTick(float DeltaTime, ELevelTick TickType, ENamedThreads::Type /*CurrentThread*/, const FGraphEventRef& /*MyCompletionGraphEvent*/)
+{
+	if (Target != nullptr && TickType != LEVELTICK_ViewportsOnly)
+	{
+		Target->TickRepresentation(DeltaTime);
+	}
+}
+
+FString FLogiBevyRepresentationTickFunction::DiagnosticMessage()
+{
+	return TEXT("FLogiBevyRepresentationTickFunction (LogiBevy PostPhysics representation)");
+}
 
 ULogiBevyRepresentationSubsystem::ULogiBevyRepresentationSubsystem() = default;
 ULogiBevyRepresentationSubsystem::~ULogiBevyRepresentationSubsystem() = default;
@@ -18,8 +32,36 @@ void ULogiBevyRepresentationSubsystem::Initialize(FSubsystemCollectionBase& Coll
 	Telemetry = MakeUnique<FLogiBevyTelemetry>();
 }
 
+void ULogiBevyRepresentationSubsystem::OnWorldBeginPlay(UWorld& InWorld)
+{
+	Super::OnWorldBeginPlay(InWorld);
+
+	if (InWorld.PersistentLevel == nullptr)
+	{
+		return;
+	}
+
+	// Register the representation tick in TG_PostPhysics.
+	RepTickFunction.bCanEverTick = true;
+	RepTickFunction.bStartWithTickEnabled = true;
+	RepTickFunction.bTickEvenWhenPaused = false;
+	RepTickFunction.TickGroup = TG_PostPhysics;
+	RepTickFunction.Target = this;
+	RepTickFunction.RegisterTickFunction(InWorld.PersistentLevel);
+
+	// Explicit prerequisite: always run after the sim's PrePhysics tick.
+	if (ULogiBevySubsystem* Sim = InWorld.GetSubsystem<ULogiBevySubsystem>())
+	{
+		RepTickFunction.AddPrerequisite(Sim, Sim->GetSimTickFunction());
+	}
+}
+
 void ULogiBevyRepresentationSubsystem::Deinitialize()
 {
+	if (RepTickFunction.IsTickFunctionRegistered())
+	{
+		RepTickFunction.UnRegisterTickFunction();
+	}
 	InstancedRenderer.Reset();
 	ActorPool.Reset();
 	Telemetry.Reset();
@@ -39,10 +81,8 @@ bool ULogiBevyRepresentationSubsystem::ShouldCreateSubsystem(UObject* Outer) con
 	return false;
 }
 
-void ULogiBevyRepresentationSubsystem::Tick(float DeltaTime)
+void ULogiBevyRepresentationSubsystem::TickRepresentation(float /*DeltaTime*/)
 {
-	Super::Tick(DeltaTime);
-
 	const UWorld* World = GetWorld();
 	if (World == nullptr)
 	{
@@ -64,9 +104,4 @@ void ULogiBevyRepresentationSubsystem::Tick(float DeltaTime)
 	{
 		Telemetry->RecordFrame(Instances.Num(), Sim->GetSimTick());
 	}
-}
-
-TStatId ULogiBevyRepresentationSubsystem::GetStatId() const
-{
-	RETURN_QUICK_DECLARE_CYCLE_STAT(ULogiBevyRepresentationSubsystem, STATGROUP_Tickables);
 }

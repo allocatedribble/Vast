@@ -2,10 +2,24 @@
 
 #include "LogiBevySubsystem.h"
 #include "Engine/World.h"
+#include "Engine/Level.h"
 
 #if LOGI_BEVY_HAVE_RUST
 #include "logi_bevy_ffi.h"
 #endif
+
+void FLogiBevySimTickFunction::ExecuteTick(float DeltaTime, ELevelTick TickType, ENamedThreads::Type /*CurrentThread*/, const FGraphEventRef& /*MyCompletionGraphEvent*/)
+{
+	if (Target != nullptr && TickType != LEVELTICK_ViewportsOnly)
+	{
+		Target->TickSimulation(DeltaTime);
+	}
+}
+
+FString FLogiBevySimTickFunction::DiagnosticMessage()
+{
+	return TEXT("FLogiBevySimTickFunction (LogiBevy PrePhysics sim)");
+}
 
 void ULogiBevySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -17,7 +31,7 @@ void ULogiBevySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	Desc.worker_thread_count = 0;
 	Desc.fixed_step_hz = 30;
 	Desc.deterministic_seed = 0x4C4F4749ull; // 'LOGI'
-	Desc.flags = 0;
+	Desc.flags = 0;                          // single-threaded deterministic (MVP)
 
 	LogiError Err{};
 	WorldHandle = static_cast<void*>(logi_world_create(&Desc, &Err));
@@ -27,7 +41,6 @@ void ULogiBevySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		return;
 	}
 
-	// Seed a few demo agents through the batched spawn-command path.
 	LogiSpawnCommand Commands[4];
 	FMemory::Memzero(Commands, sizeof(Commands));
 	for (int32 Index = 0; Index < 4; ++Index)
@@ -37,15 +50,37 @@ void ULogiBevySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		Commands[Index].route_id = 1;
 		Commands[Index].payload_kg = 10.0;
 	}
-
 	LogiError SpawnErr{};
 	const uint32 Applied = logi_submit_spawn_commands(static_cast<LogiWorld*>(WorldHandle), Commands, 4, &SpawnErr);
 	UE_LOG(LogLogiBevy, Log, TEXT("Bevy world created; %u demo agents submitted."), Applied);
 #endif
 }
 
+void ULogiBevySubsystem::OnWorldBeginPlay(UWorld& InWorld)
+{
+	Super::OnWorldBeginPlay(InWorld);
+
+	if (WorldHandle == nullptr || InWorld.PersistentLevel == nullptr)
+	{
+		return;
+	}
+
+	// Register the sim tick in TG_PrePhysics.
+	SimTickFunction.bCanEverTick = true;
+	SimTickFunction.bStartWithTickEnabled = true;
+	SimTickFunction.bTickEvenWhenPaused = false;
+	SimTickFunction.TickGroup = TG_PrePhysics;
+	SimTickFunction.Target = this;
+	SimTickFunction.RegisterTickFunction(InWorld.PersistentLevel);
+}
+
 void ULogiBevySubsystem::Deinitialize()
 {
+	if (SimTickFunction.IsTickFunctionRegistered())
+	{
+		SimTickFunction.UnRegisterTickFunction();
+	}
+
 #if LOGI_BEVY_HAVE_RUST
 	if (WorldHandle != nullptr)
 	{
@@ -70,17 +105,14 @@ bool ULogiBevySubsystem::ShouldCreateSubsystem(UObject* Outer) const
 	return false;
 }
 
-void ULogiBevySubsystem::Tick(float DeltaTime)
+void ULogiBevySubsystem::TickSimulation(float DeltaTime)
 {
-	Super::Tick(DeltaTime);
-
 #if LOGI_BEVY_HAVE_RUST
 	if (WorldHandle == nullptr)
 	{
 		return;
 	}
 
-	// Hand the frame delta to Rust; the fixed-step accumulator + clamp live there.
 	LogiFrameInput Input{};
 	Input.unreal_time_seconds = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
 	Input.frame_delta_seconds = DeltaTime;
@@ -99,7 +131,6 @@ void ULogiBevySubsystem::Tick(float DeltaTime)
 	}
 	LastSimTick = static_cast<int64>(Result.sim_tick);
 
-	// Pull the latest batched snapshot (one call, not per-entity).
 	LogiRenderSnapshot Snapshot{};
 	LogiError SnapErr{};
 	if (logi_world_get_render_snapshot(static_cast<LogiWorld*>(WorldHandle), 0 /*latest*/, &Snapshot, &SnapErr) == LOGI_OK)
@@ -116,10 +147,7 @@ void ULogiBevySubsystem::Tick(float DeltaTime)
 			Dst.SimLOD = Src.sim_lod;
 		}
 	}
+#else
+	(void)DeltaTime;
 #endif
-}
-
-TStatId ULogiBevySubsystem::GetStatId() const
-{
-	RETURN_QUICK_DECLARE_CYCLE_STAT(ULogiBevySubsystem, STATGROUP_Tickables);
 }

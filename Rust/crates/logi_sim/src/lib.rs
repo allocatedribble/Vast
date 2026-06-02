@@ -1,6 +1,6 @@
-//! `logi_sim` — gameplay Components, Resources, Systems, the fixed-step Schedule,
-//! and the terrain authority (folded in; ADR-0002, can be re-extracted later).
-//! Depends on `bevy_ecs` as a library — never the full Bevy engine.
+//! `logi_sim` — gameplay Components, Resources, Systems, the phased fixed-step
+//! schedules, and the terrain authority (folded in; ADR-0002, re-extractable).
+//! Depends on `bevy_ecs` + `bevy_tasks` as libraries — never the full Bevy engine.
 
 pub mod components;
 pub mod resources;
@@ -10,4 +10,4 @@ pub mod terrain;
 
 pub use components::*;
 pub use resources::*;
-pub use schedules::{build_fixed_step_schedule, FixedStep};
+pub use schedules::{resolve_worker_thread_count, LogiSchedule, LogiSchedulerMode, LogiSchedules};

@@ -1,16 +1,20 @@
-//! `logi_runtime` — owns the Bevy `World`, the fixed-step `Schedule`, the stable
+//! `logi_runtime` — owns the Bevy `World`, the phased schedules, the stable
 //! identity map, and the reusable render snapshot. The fixed-step accumulator
-//! lives HERE so determinism is owned by Rust (ADR-0001/0005). No Unreal types.
+//! lives HERE; the frame flow follows the scheduling treaty (ADR-0005):
+//! ingest -> [pre/sim/post]* -> representation plan -> render extract.
+//! No Unreal types.
 
 use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 
 use logi_render_extract::{extract_agents, RenderSnapshot};
-use logi_schema::{LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnCommand, Vec3};
+use logi_schema::{
+	LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnCommand, Vec3, LOGI_FLAG_BOUNDED_PARALLEL,
+};
 use logi_sim::components::{Agent, LogiId, Position, Shipment, Simulated, Velocity};
-use logi_sim::resources::{SimClock, SimRng, TerrainResource};
-use logi_sim::schedules::build_fixed_step_schedule;
+use logi_sim::resources::{SimClock, SimRng, TerrainResource, UnrealFrameInput};
+use logi_sim::schedules::{LogiSchedulerMode, LogiSchedules};
 
 /// Captured at creation (from the FFI `LogiInitDesc`).
 #[derive(Clone, Copy, Debug)]
@@ -19,6 +23,16 @@ pub struct WorldConfig {
 	pub deterministic_seed: u64,
 	pub worker_thread_count: u32,
 	pub flags: u32,
+}
+
+impl WorldConfig {
+	fn scheduler_mode(&self) -> LogiSchedulerMode {
+		if self.flags & LOGI_FLAG_BOUNDED_PARALLEL != 0 {
+			LogiSchedulerMode::BoundedParallel
+		} else {
+			LogiSchedulerMode::SingleThreadedDeterministic
+		}
+	}
 }
 
 /// Outcome of a tick (maps to the FFI `LogiTickResult`).
@@ -33,7 +47,7 @@ pub struct TickOutcome {
 /// The whole simulation world for one shard.
 pub struct LogiWorld {
 	world: World,
-	schedule: Schedule,
+	schedules: LogiSchedules,
 	snapshot: RenderSnapshot,
 	id_map: HashMap<LogiEntityId, Entity>,
 	next_index: u64,
@@ -51,10 +65,11 @@ impl LogiWorld {
 		world.insert_resource(SimClock { tick: 0, fixed_hz: hz });
 		world.insert_resource(SimRng::new(config.deterministic_seed));
 		world.insert_resource(TerrainResource::default());
+		world.insert_resource(UnrealFrameInput::default());
 
 		Self {
 			world,
-			schedule: build_fixed_step_schedule(),
+			schedules: LogiSchedules::new(config.scheduler_mode(), config.worker_thread_count),
 			snapshot: RenderSnapshot::default(),
 			id_map: HashMap::new(),
 			next_index: 1,
@@ -72,7 +87,6 @@ impl LogiWorld {
 	}
 
 	/// Spawn one entity from a plain-data command (a controlled mutation phase).
-	/// Returns its durable identity.
 	pub fn spawn(&mut self, cmd: &LogiSpawnCommand) -> LogiEntityId {
 		let id = if cmd.requested_id.is_valid() {
 			cmd.requested_id
@@ -107,33 +121,52 @@ impl LogiWorld {
 		applied
 	}
 
-	/// Advance the deterministic sim using a frame delta. The fixed-step
-	/// accumulator is internal; `max_fixed_steps` clamps catch-up. Re-extracts
-	/// the render snapshot and returns the outcome.
+	fn ingest_input(&mut self, cameras: &[LogiCameraView], intents: &[LogiPlayerIntent]) {
+		let mut input = self.world.resource_mut::<UnrealFrameInput>();
+		input.cameras.clear();
+		input.cameras.extend_from_slice(cameras);
+		input.intents.clear();
+		input.intents.extend_from_slice(intents);
+	}
+
+	/// Advance one frame following the scheduling treaty. The fixed-step
+	/// accumulator is internal; `max_fixed_steps` clamps catch-up.
 	pub fn tick(
 		&mut self,
 		frame_delta_seconds: f32,
 		max_fixed_steps: u32,
-		_cameras: &[LogiCameraView],
-		_intents: &[LogiPlayerIntent],
+		cameras: &[LogiCameraView],
+		intents: &[LogiPlayerIntent],
 	) -> TickOutcome {
-		self.accumulator += f64::from(frame_delta_seconds.max(0.0));
+		// 1. Ingest Unreal input, then run the input phase.
+		self.ingest_input(cameras, intents);
+		self.schedules.input_ingest.run(&mut self.world);
 
+		// 2. Authoritative fixed-step simulation.
+		self.accumulator += f64::from(frame_delta_seconds.max(0.0));
 		let mut steps_run = 0u32;
 		while self.accumulator >= self.fixed_dt && steps_run < max_fixed_steps {
-			self.schedule.run(&mut self.world);
+			self.schedules.fixed_pre_sim.run(&mut self.world);
+			self.schedules.fixed_sim.run(&mut self.world);
+			self.schedules.fixed_post_sim.run(&mut self.world);
+			increment_sim_tick(&mut self.world);
 			self.accumulator -= self.fixed_dt;
 			steps_run += 1;
 		}
 
-		// Drop any remaining whole-step backlog (clamp catch-up; avoid spiral).
+		// Drop the whole-step backlog beyond the clamp (avoid spiral-of-death).
 		let mut dropped = 0u32;
 		while self.accumulator >= self.fixed_dt {
 			self.accumulator -= self.fixed_dt;
 			dropped += 1;
 		}
 
-		// Rebuild the render snapshot and stamp it.
+		// 3. Per-frame representation + extract phases.
+		self.schedules.representation_plan.run(&mut self.world);
+		self.schedules.render_extract.run(&mut self.world);
+		self.schedules.maintenance.run(&mut self.world);
+
+		// 4. Build the snapshot result.
 		self.snapshot_counter += 1;
 		extract_agents(&mut self.world, &mut self.snapshot);
 		let tick = self.sim_tick();
@@ -164,12 +197,17 @@ impl LogiWorld {
 	}
 }
 
+/// Advance the authoritative tick counter (one explicit step between phases).
+fn increment_sim_tick(world: &mut World) {
+	let mut clock = world.resource_mut::<SimClock>();
+	clock.tick = clock.tick.wrapping_add(1);
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	// hz = 16 -> fixed_dt = 0.0625, exactly representable in f32/f64, so the
-	// accumulator math below is exact (no floating-point fragility in asserts).
+	// hz = 16 -> fixed_dt = 0.0625, exactly representable in f32/f64.
 	fn cfg(seed: u64) -> WorldConfig {
 		WorldConfig { fixed_step_hz: 16, deterministic_seed: seed, worker_thread_count: 0, flags: 0 }
 	}
@@ -186,7 +224,6 @@ mod tests {
 	#[test]
 	fn max_fixed_steps_clamps_and_reports_dropped() {
 		let mut w = LogiWorld::new(cfg(7));
-		// 1.0s of delta = 16 whole steps, but only 10 allowed -> 6 dropped.
 		let out = w.tick(1.0, 10, &[], &[]);
 		assert_eq!(out.fixed_steps_run, 10);
 		assert_eq!(out.dropped_steps, 6);
@@ -208,5 +245,37 @@ mod tests {
 		let snap = w.snapshot_view(0).expect("latest snapshot");
 		assert_eq!(snap.agents.len(), 1);
 		assert_eq!(snap.agents[0].id, id);
+	}
+
+	/// Determinism rule 7: the fixed-step result is identical regardless of how
+	/// the same total time is chunked into frames (30 / 60 / 120 fps analogue).
+	#[test]
+	fn snapshot_equal_across_frame_rates() {
+		fn run(delta: f32, frames: u32) -> (u64, Vec<(u64, f32, f32, f32)>) {
+			let mut w = LogiWorld::new(cfg(123));
+			w.spawn(&LogiSpawnCommand {
+				kind: 1,
+				requested_id: LogiEntityId::default(),
+				position: [1.0, 2.0, 3.0],
+				route_id: 1,
+				payload_kg: 1.0,
+			});
+			for _ in 0..frames {
+				w.tick(delta, 64, &[], &[]);
+			}
+			let snap = w.snapshot_view(0).expect("snapshot");
+			let agents = snap.agents.iter().map(|a| (a.id.index, a.x, a.y, a.z)).collect();
+			(w.sim_tick(), agents)
+		}
+
+		// All sum to exactly 1.0s (exact binary deltas) -> identical fixed steps.
+		let a = run(1.0 / 16.0, 16);
+		let b = run(1.0 / 32.0, 32);
+		let c = run(1.0 / 64.0, 64);
+		assert_eq!(a.0, 16);
+		assert_eq!(a.0, b.0);
+		assert_eq!(b.0, c.0);
+		assert_eq!(a.1, b.1);
+		assert_eq!(b.1, c.1);
 	}
 }

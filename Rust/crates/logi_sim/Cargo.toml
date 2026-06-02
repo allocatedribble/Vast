@@ -6,4 +6,5 @@ publish = false
 
 [dependencies]
 bevy_ecs.workspace = true
+bevy_tasks.workspace = true
 logi_schema = { path = "../logi_schema" }
