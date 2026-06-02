@@ -24,6 +24,11 @@ public class LogiBevyEditor : ModuleRules
 			"Slate",
 			"SlateCore",
 			"ToolMenus",
+			"EditorSubsystem",        // UEditorSubsystem (Bevy Entity Outliner)
+			"WorkspaceMenuStructure", // Window-menu group for the nomad tab
+			"PropertyEditor",         // SDetailsView for the selection proxy
+			"InputCore",
+			"Projects",
 			"LogiBevyRuntime",
 		});
 	}

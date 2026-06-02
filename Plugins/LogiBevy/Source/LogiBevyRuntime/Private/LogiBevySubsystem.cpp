@@ -10,6 +10,9 @@
 #if LOGI_BEVY_HAVE_RUST
 #include "logi_bevy_ffi.h"
 #endif
+#if WITH_EDITOR && LOGI_BEVY_HAVE_EDITOR_INSPECTOR
+#include "logi_bevy_editor_ffi.h"
+#endif
 
 void FLogiBevySimTickFunction::ExecuteTick(float DeltaTime, ELevelTick TickType, ENamedThreads::Type /*CurrentThread*/, const FGraphEventRef& /*MyCompletionGraphEvent*/)
 {
@@ -178,3 +181,65 @@ void ULogiBevySubsystem::TickSimulation(float DeltaTime)
 	(void)DeltaTime;
 #endif
 }
+
+#if WITH_EDITOR
+void ULogiBevySubsystem::EditorQueryEntities(int32 Offset, int32 Limit, TArray<FLogiBevyEntityRow>& OutRows, int32& OutTotal) const
+{
+	OutRows.Reset();
+	OutTotal = 0;
+#if LOGI_BEVY_HAVE_RUST && LOGI_BEVY_HAVE_EDITOR_INSPECTOR
+	if (!BevyWorld.IsValid() || !BevyWorld->IsValid())
+	{
+		return;
+	}
+	LogiEntityQueryDesc Query{};
+	Query.offset = static_cast<uint32>(FMath::Max(0, Offset));
+	Query.limit = static_cast<uint32>(FMath::Max(0, Limit));
+	LogiEntityInspectorPacket Packet{};
+	LogiError Err{};
+	if (BevyWorld->EditorQuery(Query, Packet, Err) != LOGI_OK)
+	{
+		return;
+	}
+	OutTotal = static_cast<int32>(Packet.total_count);
+	OutRows.Reserve(static_cast<int32>(Packet.entity_count));
+	for (uint32 Index = 0; Index < Packet.entity_count; ++Index)
+	{
+		const LogiEntitySummary& S = Packet.entities[Index];
+		FLogiBevyEntityRow Row;
+		Row.Index = S.id.index;
+		Row.Generation = S.id.generation;
+		Row.Shard = S.id.shard;
+		Row.Kind = S.id.kind;
+		Row.Position = FVector(S.position_cm[0], S.position_cm[1], S.position_cm[2]);
+		Row.Significance = S.significance;
+		Row.Tier = S.representation_tier;
+		Row.bPinned = S.pinned != 0;
+		OutRows.Add(Row);
+	}
+#else
+	(void)Offset;
+	(void)Limit;
+#endif
+}
+
+void ULogiBevySubsystem::EditorSetPin(const FLogiBevyEntityRow& Row, bool bPinned)
+{
+#if LOGI_BEVY_HAVE_RUST && LOGI_BEVY_HAVE_EDITOR_INSPECTOR
+	if (!BevyWorld.IsValid() || !BevyWorld->IsValid())
+	{
+		return;
+	}
+	LogiEntityId Id{};
+	Id.index = Row.Index;
+	Id.generation = Row.Generation;
+	Id.shard = Row.Shard;
+	Id.kind = Row.Kind;
+	LogiError Err{};
+	BevyWorld->EditorSetPin(Id, bPinned ? 1 : 0, Err);
+#else
+	(void)Row;
+	(void)bPinned;
+#endif
+}
+#endif // WITH_EDITOR

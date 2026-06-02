@@ -33,6 +33,22 @@ struct TStructOpsTypeTraits<FLogiBevySimTickFunction> : public TStructOpsTypeTra
 };
 
 /**
+ * One row of the editor Entity Outliner (mirrors `LogiEntitySummary`; editor-only,
+ * ADR-0006). Plain data so the Public header stays free of the FFI types.
+ */
+struct FLogiBevyEntityRow
+{
+	uint64 Index = 0;
+	uint32 Generation = 0;
+	uint16 Shard = 0;
+	uint16 Kind = 0;
+	FVector Position = FVector::ZeroVector;
+	float Significance = 0.0f;
+	uint8 Tier = 0;
+	bool bPinned = false;
+};
+
+/**
  * Owns the Rust `bevy_ecs` world for a game world. Its PrePhysics tick advances
  * the fixed-step sim (the accumulator is in Rust). The representation subsystem
  * pulls the batched render snapshot from the world handle in PostPhysics (§8).
@@ -62,6 +78,14 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "LogiBevy")
 	int64 GetSimTick() const { return LastSimTick; }
+
+#if WITH_EDITOR
+	/** Editor introspection (ADR-0006): paged entity query. Empty without the DLL
+	 *  `editor_inspector` feature. Sampled by the editor at 5-10 Hz, never per-row. */
+	void EditorQueryEntities(int32 Offset, int32 Limit, TArray<FLogiBevyEntityRow>& OutRows, int32& OutTotal) const;
+	/** Pin/unpin an entity for debug focus (routes to logi_editor_set_debug_pin). */
+	void EditorSetPin(const FLogiBevyEntityRow& Row, bool bPinned);
+#endif
 
 private:
 	UPROPERTY()

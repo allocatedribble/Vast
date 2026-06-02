@@ -7,6 +7,9 @@
 #if LOGI_BEVY_HAVE_RUST
 #include "logi_bevy_ffi.h"
 #endif
+#if WITH_EDITOR && LOGI_BEVY_HAVE_EDITOR_INSPECTOR
+#include "logi_bevy_editor_ffi.h"
+#endif
 
 /**
  * RAII owner of the opaque Rust `LogiWorld*` handle (§11: single mutable owner).
@@ -60,6 +63,18 @@ public:
 	{
 		logi_buffer_release(Handle, SnapshotId);
 	}
+
+#if WITH_EDITOR && LOGI_BEVY_HAVE_EDITOR_INSPECTOR
+	uint32 EditorQuery(const LogiEntityQueryDesc& Query, LogiEntityInspectorPacket& OutPacket, LogiError& OutErr) const
+	{
+		return logi_editor_query_entities(Handle, &Query, &OutPacket, &OutErr);
+	}
+
+	void EditorSetPin(LogiEntityId Id, uint8 Pinned, LogiError& OutErr)
+	{
+		logi_editor_set_debug_pin(Handle, Id, Pinned, &OutErr);
+	}
+#endif
 
 private:
 	LogiWorld* Handle = nullptr;
