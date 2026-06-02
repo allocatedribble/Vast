@@ -11,16 +11,13 @@
 class ULogiBevySubsystem;
 
 /**
- * Tick function that drives the Rust simulation. Placed in TG_PrePhysics so
- * physics/collision proxies can read current sim transforms in the same frame
- * (ADR-0005 scheduling treaty: Unreal owns the frame, Bevy owns the step).
+ * PrePhysics tick that advances the Rust simulation (ADR-0005 scheduling treaty).
  */
 USTRUCT()
 struct FLogiBevySimTickFunction : public FTickFunction
 {
 	GENERATED_BODY()
 
-	/** Owning subsystem (plain pointer; the subsystem owns this tick function). */
 	ULogiBevySubsystem* Target = nullptr;
 
 	virtual void ExecuteTick(float DeltaTime, ELevelTick TickType, ENamedThreads::Type CurrentThread, const FGraphEventRef& MyCompletionGraphEvent) override;
@@ -34,9 +31,10 @@ struct TStructOpsTypeTraits<FLogiBevySimTickFunction> : public TStructOpsTypeTra
 };
 
 /**
- * Owns the Rust `bevy_ecs` world for a game world. Its PrePhysics tick hands the
- * frame delta to `logi_world_tick` (the fixed-step accumulator is in Rust) and
- * pulls the batched render snapshot. The Rust world is the authority; this is a shell.
+ * Owns the Rust `bevy_ecs` world for a game world. Its PrePhysics tick advances
+ * the fixed-step sim (the accumulator is in Rust). The representation subsystem
+ * pulls the batched render snapshot from the world handle in PostPhysics (§8).
+ * This subsystem is a shell; the Rust world is the authority.
  */
 UCLASS()
 class LOGIBEVYRUNTIME_API ULogiBevySubsystem : public UWorldSubsystem
@@ -44,7 +42,6 @@ class LOGIBEVYRUNTIME_API ULogiBevySubsystem : public UWorldSubsystem
 	GENERATED_BODY()
 
 public:
-	// USubsystem / UWorldSubsystem
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void OnWorldBeginPlay(UWorld& InWorld) override;
 	virtual void Deinitialize() override;
@@ -56,8 +53,8 @@ public:
 	/** The sim tick function, so the representation subsystem can depend on it. */
 	FLogiBevySimTickFunction& GetSimTickFunction() { return SimTickFunction; }
 
-	/** Latest agent snapshot, rebuilt each tick. Read-only mirror of Rust state. */
-	const TArray<FLogiAgentInstance>& GetAgentInstances() const { return AgentInstances; }
+	/** Opaque `LogiWorld*` for the representation subsystem to query the snapshot. */
+	void* GetWorldHandle() const { return WorldHandle; }
 
 	bool IsRuntimeValid() const { return WorldHandle != nullptr; }
 
@@ -68,10 +65,6 @@ private:
 	UPROPERTY()
 	FLogiBevySimTickFunction SimTickFunction;
 
-	/** Opaque `LogiWorld*` (a boxed Rust world). */
 	void* WorldHandle = nullptr;
-
 	int64 LastSimTick = 0;
-
-	TArray<FLogiAgentInstance> AgentInstances;
 };

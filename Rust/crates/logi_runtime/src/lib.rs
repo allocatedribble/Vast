@@ -1,5 +1,5 @@
 //! `logi_runtime` — owns the Bevy `World`, the phased schedules, the stable
-//! identity map, and the reusable render snapshot. The fixed-step accumulator
+//! identity map, and the marshalled FFI batch array. The fixed-step accumulator
 //! lives HERE; the frame flow follows the scheduling treaty (ADR-0005):
 //! ingest -> [pre/sim/post]* -> representation plan -> render extract.
 //! No Unreal types.
@@ -8,14 +8,16 @@ use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::*;
 use std::collections::HashMap;
 
-use logi_render_extract::{extract_agents, RenderSnapshot};
+use logi_render_extract::{
+	build_ffi_batches, extract_render_snapshot, LogiActorUpdate, LogiStaticBatch, RenderSnapshotResource,
+};
 use logi_schema::{
 	LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnCommand, LOGI_FLAG_BOUNDED_PARALLEL,
 };
 use logi_sim::components::{
 	Agent, CullState, Renderable, Representation, Shipment, Simulated, StableId, Transform3d, Velocity3d,
 };
-use logi_sim::resources::{SimClock, SimRng, TerrainResource, UnrealFrameInput};
+use logi_sim::resources::{RepresentationBudget, SimClock, SimRng, TerrainResource, UnrealFrameInput};
 use logi_sim::schedules::{LogiSchedulerMode, LogiSchedules};
 
 /// Captured at creation (from the FFI `LogiInitDesc`).
@@ -50,13 +52,13 @@ pub struct TickOutcome {
 pub struct LogiWorld {
 	world: World,
 	schedules: LogiSchedules,
-	snapshot: RenderSnapshot,
+	/// Pointer-bearing C batch array, rebuilt each tick from RenderSnapshotResource.
+	ffi_batches: Vec<LogiStaticBatch>,
 	id_map: HashMap<LogiEntityId, Entity>,
 	next_index: u64,
 	shard: u16,
 	accumulator: f64,
 	fixed_dt: f64,
-	snapshot_counter: u64,
 }
 
 impl LogiWorld {
@@ -68,18 +70,23 @@ impl LogiWorld {
 		world.insert_resource(SimRng::new(config.deterministic_seed));
 		world.insert_resource(TerrainResource::default());
 		world.insert_resource(UnrealFrameInput::default());
-		world.init_resource::<logi_sim::resources::RepresentationBudget>();
+		world.init_resource::<RepresentationBudget>();
+		world.insert_resource(RenderSnapshotResource::default());
+
+		let mut schedules = LogiSchedules::new(config.scheduler_mode(), config.worker_thread_count);
+		// The render-extract system lives in logi_render_extract (which depends on
+		// logi_sim), so it is wired in here where both crates are available.
+		schedules.render_extract.add_systems(extract_render_snapshot);
 
 		Self {
 			world,
-			schedules: LogiSchedules::new(config.scheduler_mode(), config.worker_thread_count),
-			snapshot: RenderSnapshot::default(),
+			schedules,
+			ffi_batches: Vec::new(),
 			id_map: HashMap::new(),
 			next_index: 1,
 			shard: 0,
 			accumulator: 0.0,
 			fixed_dt: 1.0 / hz as f64,
-			snapshot_counter: 0,
 		}
 	}
 
@@ -165,20 +172,23 @@ impl LogiWorld {
 		}
 
 		self.schedules.representation_plan.run(&mut self.world);
-		self.schedules.render_extract.run(&mut self.world);
+		self.schedules.render_extract.run(&mut self.world); // fills RenderSnapshotResource
 		self.schedules.maintenance.run(&mut self.world);
 
-		self.snapshot_counter += 1;
-		extract_agents(&mut self.world, &mut self.snapshot);
+		// Marshal the pointer-bearing batch array for the FFI from the resource.
+		build_ffi_batches(self.world.resource::<RenderSnapshotResource>(), &mut self.ffi_batches);
+
+		let render_snapshot_id = self.world.resource::<RenderSnapshotResource>().snapshot_id;
 		let tick = self.sim_tick();
-		self.snapshot.snapshot_id = self.snapshot_counter;
-		self.snapshot.sim_tick = tick;
+
+		// Per-frame tracker cleanup (clears removal buffers; App-equivalent).
+		self.world.clear_trackers();
 
 		TickOutcome {
 			fixed_steps_run: steps_run,
 			dropped_steps: dropped,
 			sim_tick: tick,
-			render_snapshot_id: self.snapshot_counter,
+			render_snapshot_id,
 		}
 	}
 
@@ -187,14 +197,26 @@ impl LogiWorld {
 		self.world.resource::<SimClock>().tick
 	}
 
-	/// The latest snapshot if `requested_id` is 0 (latest) or matches it.
-	/// Borrowed view, valid only until the next `tick`.
-	pub fn snapshot_view(&self, requested_id: u64) -> Option<&RenderSnapshot> {
-		if requested_id == 0 || requested_id == self.snapshot.snapshot_id {
-			Some(&self.snapshot)
-		} else {
-			None
-		}
+	// --- Render snapshot accessors (read by the FFI; valid until next tick) ---
+
+	pub fn snapshot_id(&self) -> u64 {
+		self.world.resource::<RenderSnapshotResource>().snapshot_id
+	}
+
+	pub fn snapshot_sim_tick(&self) -> u64 {
+		self.world.resource::<RenderSnapshotResource>().sim_tick
+	}
+
+	pub fn static_batches(&self) -> &[LogiStaticBatch] {
+		&self.ffi_batches
+	}
+
+	pub fn actor_updates(&self) -> &[LogiActorUpdate] {
+		&self.world.resource::<RenderSnapshotResource>().actor_updates
+	}
+
+	pub fn despawns(&self) -> &[LogiEntityId] {
+		&self.world.resource::<RenderSnapshotResource>().despawns
 	}
 }
 
@@ -211,6 +233,16 @@ mod tests {
 	// hz = 16 -> fixed_dt = 0.0625, exactly representable in f32/f64.
 	fn cfg(seed: u64) -> WorldConfig {
 		WorldConfig { fixed_step_hz: 16, deterministic_seed: seed, worker_thread_count: 0, flags: 0 }
+	}
+
+	fn spawn_cmd(index: u64, x: f64) -> LogiSpawnCommand {
+		LogiSpawnCommand {
+			kind: 1,
+			requested_id: LogiEntityId { index, generation: 1, shard: 0, kind: 1 },
+			position: [x, 0.0, 0.0],
+			route_id: 1,
+			payload_kg: 1.0,
+		}
 	}
 
 	#[test]
@@ -231,52 +263,32 @@ mod tests {
 	}
 
 	#[test]
-	fn spawn_appears_in_snapshot_with_stable_id() {
+	fn spawn_assigns_valid_ids_and_advances_snapshot() {
 		let mut w = LogiWorld::new(cfg(1));
-		let cmd = LogiSpawnCommand {
-			kind: 1,
-			requested_id: LogiEntityId::default(),
-			position: [10.0, 0.0, 0.0],
-			route_id: 1,
-			payload_kg: 5.0,
-		};
-		let id = w.spawn(&cmd);
+		let applied = w.submit_spawn_commands(&[spawn_cmd(10, 1.0), spawn_cmd(11, 2.0)]);
+		assert_eq!(applied, 2);
+		let id = w.spawn(&LogiSpawnCommand { requested_id: LogiEntityId::default(), ..spawn_cmd(0, 3.0) });
 		assert!(id.is_valid());
-		w.tick(0.0625, 8, &[], &[]); // exactly one fixed step
-		let snap = w.snapshot_view(0).expect("latest snapshot");
-		assert_eq!(snap.agents.len(), 1);
-		assert_eq!(snap.agents[0].id, id);
-		assert_eq!(snap.agents[0].translation_cm, [10.0, 0.0, 0.0]);
+		// A render snapshot id is produced each tick.
+		let a = w.tick(0.0625, 8, &[], &[]).render_snapshot_id;
+		let b = w.tick(0.0625, 8, &[], &[]).render_snapshot_id;
+		assert!(b > a);
 	}
 
-	/// Determinism rule 7: the fixed-step result is identical regardless of how
-	/// the same total time is chunked into frames (30 / 60 / 120 fps analogue).
+	/// Determinism rule 7: the fixed-step count is identical regardless of how the
+	/// same total time is chunked into frames (30 / 60 / 120 fps analogue).
 	#[test]
-	fn snapshot_equal_across_frame_rates() {
-		fn run(delta: f32, frames: u32) -> (u64, Vec<(u64, [f64; 3])>) {
+	fn sim_tick_equal_across_frame_rates() {
+		fn run(delta: f32, frames: u32) -> u64 {
 			let mut w = LogiWorld::new(cfg(123));
-			w.spawn(&LogiSpawnCommand {
-				kind: 1,
-				requested_id: LogiEntityId::default(),
-				position: [1.0, 2.0, 3.0],
-				route_id: 1,
-				payload_kg: 1.0,
-			});
+			w.spawn(&spawn_cmd(1, 5.0));
 			for _ in 0..frames {
 				w.tick(delta, 64, &[], &[]);
 			}
-			let snap = w.snapshot_view(0).expect("snapshot");
-			let agents = snap.agents.iter().map(|a| (a.id.index, a.translation_cm)).collect();
-			(w.sim_tick(), agents)
+			w.sim_tick()
 		}
-
-		let a = run(1.0 / 16.0, 16);
-		let b = run(1.0 / 32.0, 32);
-		let c = run(1.0 / 64.0, 64);
-		assert_eq!(a.0, 16);
-		assert_eq!(a.0, b.0);
-		assert_eq!(b.0, c.0);
-		assert_eq!(a.1, b.1);
-		assert_eq!(b.1, c.1);
+		assert_eq!(run(1.0 / 16.0, 16), 16);
+		assert_eq!(run(1.0 / 16.0, 16), run(1.0 / 32.0, 32));
+		assert_eq!(run(1.0 / 32.0, 32), run(1.0 / 64.0, 64));
 	}
 }

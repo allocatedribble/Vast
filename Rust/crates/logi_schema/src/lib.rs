@@ -75,14 +75,38 @@ logi_id!(LogiShipmentId);
 /// 0 == none.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AssetHandle(pub u64);
+pub struct LogiAssetHandle(pub u64);
 
-impl AssetHandle {
-	pub const NONE: AssetHandle = AssetHandle(0);
+impl LogiAssetHandle {
+	pub const NONE: LogiAssetHandle = LogiAssetHandle(0);
 	#[inline]
 	pub const fn is_valid(self) -> bool {
 		self.0 != 0
 	}
+}
+
+/// Opaque handle to an Unreal Actor class (for pooled high/low-res actors).
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LogiActorClassHandle(pub u64);
+
+impl LogiActorClassHandle {
+	pub const NONE: LogiActorClassHandle = LogiActorClassHandle(0);
+	#[inline]
+	pub const fn is_valid(self) -> bool {
+		self.0 != 0
+	}
+}
+
+/// Animation parameters Unreal feeds to an AnimInstance for a represented agent.
+/// Bevy computes these; Unreal presents them. `repr(C)`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LogiAnimationParams {
+	pub locomotion_state: u16,
+	pub speed_cm_s: f32,
+	pub turn_rate: f32,
+	pub aim_yaw_pitch: [f32; 2],
 }
 
 /// Representation tier (ADR-0003). **Bevy decides; Unreal executes.** `repr(u8)`

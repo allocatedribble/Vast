@@ -9,13 +9,13 @@
 use core::slice;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use logi_render_extract::LogiAgentInstance;
+use logi_render_extract::{LogiActorUpdate, LogiStaticBatch};
 use logi_runtime::{LogiWorld, WorldConfig};
-use logi_schema::{LogiCameraView, LogiPlayerIntent, LogiSpawnCommand};
+use logi_schema::{LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnCommand};
 
 /// ABI version. Bump on any breaking change to this header. Callers pass their
 /// compiled-against version in `LogiInitDesc::abi_version`; mismatches are rejected.
-pub const LOGI_ABI_VERSION: u32 = 1;
+pub const LOGI_ABI_VERSION: u32 = 2;
 
 // Status / error codes (returned in `status` fields and `LogiError::code`).
 pub const LOGI_OK: u32 = 0;
@@ -80,14 +80,19 @@ impl LogiTickResult {
 	}
 }
 
-/// Borrowed view over a render snapshot. `agents` is valid only until the next
+/// Borrowed view over a render snapshot (§8): instanced-mesh batches, per-actor
+/// updates, and despawns. All pointers are valid only until the next
 /// `logi_world_tick` on the same world.
 #[repr(C)]
 pub struct LogiRenderSnapshot {
 	pub snapshot_id: u64,
 	pub sim_tick: u64,
-	pub agents: *const LogiAgentInstance,
-	pub agent_count: u32,
+	pub static_batch_count: u32,
+	pub static_batches: *const LogiStaticBatch,
+	pub actor_update_count: u32,
+	pub actor_updates: *const LogiActorUpdate,
+	pub despawn_count: u32,
+	pub despawns: *const LogiEntityId,
 }
 
 /// Opaque owned buffer. Reserved for owned out-buffers; release with
@@ -261,16 +266,36 @@ pub extern "C" fn logi_world_get_render_snapshot(
 	// Default the out-param to empty.
 	// SAFETY: non-null, checked above.
 	unsafe {
-		*out_snapshot = LogiRenderSnapshot { snapshot_id: 0, sim_tick: 0, agents: std::ptr::null(), agent_count: 0 };
+		*out_snapshot = LogiRenderSnapshot {
+			snapshot_id: 0,
+			sim_tick: 0,
+			static_batch_count: 0,
+			static_batches: std::ptr::null(),
+			actor_update_count: 0,
+			actor_updates: std::ptr::null(),
+			despawn_count: 0,
+			despawns: std::ptr::null(),
+		};
 	}
 
 	let result = catch_unwind(AssertUnwindSafe(|| {
 		let world = unsafe { &*world };
-		world.snapshot_view(snapshot_id).map(|s| LogiRenderSnapshot {
-			snapshot_id: s.snapshot_id,
-			sim_tick: s.sim_tick,
-			agents: s.agents.as_ptr(),
-			agent_count: s.agents.len() as u32,
+		// `snapshot_id == 0` means "latest"; otherwise it must match.
+		if snapshot_id != 0 && snapshot_id != world.snapshot_id() {
+			return None;
+		}
+		let batches = world.static_batches();
+		let actors = world.actor_updates();
+		let despawns = world.despawns();
+		Some(LogiRenderSnapshot {
+			snapshot_id: world.snapshot_id(),
+			sim_tick: world.snapshot_sim_tick(),
+			static_batch_count: batches.len() as u32,
+			static_batches: batches.as_ptr(),
+			actor_update_count: actors.len() as u32,
+			actor_updates: actors.as_ptr(),
+			despawn_count: despawns.len() as u32,
+			despawns: despawns.as_ptr(),
 		})
 	}));
 

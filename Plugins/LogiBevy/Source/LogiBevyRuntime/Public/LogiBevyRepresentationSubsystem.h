@@ -5,17 +5,18 @@
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
 #include "Engine/EngineBaseTypes.h"
+#include "Templates/PimplPtr.h"
 #include "LogiBevyRepresentationSubsystem.generated.h"
 
 class ULogiBevyRepresentationSubsystem;
-class FLogiBevyInstancedRenderer;
-class FLogiBevyActorPool;
+class FLogiInstancedRenderer;
+class FLogiActorPool;
+class FLogiAnimationBridge;
 class FLogiBevyTelemetry;
 
 /**
- * Tick function that drives representation. Placed in TG_PostPhysics with an
- * explicit prerequisite on the sim's PrePhysics tick, so it always consumes a
- * snapshot produced earlier in the same frame (ADR-0005 scheduling treaty).
+ * PostPhysics tick that applies the batched render snapshot, with an explicit
+ * prerequisite on the sim's PrePhysics tick (ADR-0005 scheduling treaty).
  */
 USTRUCT()
 struct FLogiBevyRepresentationTickFunction : public FTickFunction
@@ -35,9 +36,11 @@ struct TStructOpsTypeTraits<FLogiBevyRepresentationTickFunction> : public TStruc
 };
 
 /**
- * Consumes the per-frame agent snapshot from ULogiBevySubsystem and drives the
- * Unreal representation: ISM/HISM for the many, pooled actors for the
- * significant few (ADR-0003/0005). Non-authoritative — pure presentation.
+ * Consumes the per-frame batched snapshot from the Rust world (§8) and applies
+ * deltas to retained Unreal representation: instanced meshes for the many
+ * (FLogiInstancedRenderer), pooled actors for the significant few (FLogiActorPool),
+ * and animation params fed to the budget allocator (FLogiAnimationBridge).
+ * Non-authoritative -- pure presentation.
  */
 UCLASS()
 class LOGIBEVYRUNTIME_API ULogiBevyRepresentationSubsystem : public UWorldSubsystem
@@ -45,11 +48,6 @@ class LOGIBEVYRUNTIME_API ULogiBevyRepresentationSubsystem : public UWorldSubsys
 	GENERATED_BODY()
 
 public:
-	ULogiBevyRepresentationSubsystem();
-	// Defined in the .cpp so TUniquePtr<incomplete-type> members destruct where complete.
-	virtual ~ULogiBevyRepresentationSubsystem() override;
-
-	// USubsystem / UWorldSubsystem
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void OnWorldBeginPlay(UWorld& InWorld) override;
 	virtual void Deinitialize() override;
@@ -62,7 +60,8 @@ private:
 	UPROPERTY()
 	FLogiBevyRepresentationTickFunction RepTickFunction;
 
-	TUniquePtr<FLogiBevyInstancedRenderer> InstancedRenderer;
-	TUniquePtr<FLogiBevyActorPool> ActorPool;
-	TUniquePtr<FLogiBevyTelemetry> Telemetry;
+	TPimplPtr<FLogiInstancedRenderer> InstancedRenderer;
+	TPimplPtr<FLogiActorPool> ActorPool;
+	TPimplPtr<FLogiAnimationBridge> AnimationBridge;
+	TPimplPtr<FLogiBevyTelemetry> Telemetry;
 };

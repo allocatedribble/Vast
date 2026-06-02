@@ -5,13 +5,14 @@
 #include "CoreMinimal.h"
 
 /**
- * Lightweight bridge telemetry: agent counts, sim tick, and (later) FFI snapshot
- * timings — the budgeted line item from Docs/Performance/Budgets.md. Plain C++ helper.
+ * Lightweight bridge telemetry: instanced + pooled-actor counts and the sim tick
+ * (and, later, FFI snapshot timings). The budgeted line item from
+ * Docs/Performance/Budgets.md. Plain C++ helper.
  */
 class FLogiBevyTelemetry
 {
 public:
-	void RecordFrame(int32 AgentCount, int64 SimTick);
+	void RecordFrame(int32 InstanceCount, int32 ActorCount, int64 SimTick);
 
 private:
 	int64 FramesRecorded = 0;

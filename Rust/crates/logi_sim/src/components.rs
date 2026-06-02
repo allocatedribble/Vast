@@ -2,7 +2,7 @@
 
 use bevy_ecs::prelude::*;
 use logi_schema::{
-	AssetHandle, LogiAgentId, LogiEntityId, LogiRouteId, LogiShipmentId, LogiTileId, RenderFlags,
+	LogiAssetHandle, LogiAgentId, LogiEntityId, LogiRouteId, LogiShipmentId, LogiTileId, RenderFlags,
 	RepresentationTier,
 };
 
@@ -40,9 +40,9 @@ pub struct Velocity3d {
 /// Render asset references + flags. Handles are resolved Unreal-side.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Renderable {
-	pub mesh: AssetHandle,
-	pub material: AssetHandle,
-	pub skeleton: AssetHandle,
+	pub mesh: LogiAssetHandle,
+	pub material: LogiAssetHandle,
+	pub skeleton: LogiAssetHandle,
 	pub flags: RenderFlags,
 }
 
@@ -60,7 +60,7 @@ pub struct Representation {
 /// Inputs that drive an Unreal animation graph for a represented agent.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct AnimationDrive {
-	pub anim_graph: AssetHandle,
+	pub anim_graph: LogiAssetHandle,
 	pub locomotion_state: u16,
 	pub speed_cm_s: f32,
 	pub turn_rate: f32,

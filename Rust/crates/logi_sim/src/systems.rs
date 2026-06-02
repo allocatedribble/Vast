@@ -13,6 +13,11 @@ use std::collections::HashMap;
 pub fn integrate_motion(clock: Res<SimClock>, mut query: Query<(&mut Transform3d, &Velocity3d)>) {
 	let dt = f64::from(clock.seconds_per_tick());
 	for (mut transform, vel) in &mut query {
+		// Skip stationary entities so we don't mark Transform3d changed (keeps the
+		// render-extract delta minimal -- §8 change detection).
+		if vel.linear_cm_s == [0.0, 0.0, 0.0] {
+			continue;
+		}
 		transform.translation_cm[0] += f64::from(vel.linear_cm_s[0]) * dt;
 		transform.translation_cm[1] += f64::from(vel.linear_cm_s[1]) * dt;
 		transform.translation_cm[2] += f64::from(vel.linear_cm_s[2]) * dt;
@@ -44,7 +49,11 @@ pub fn compute_significance(
 		};
 		let area_term = cull.projected_screen_area.max(0.0);
 		let visible = if cull.visible_to_any_camera { 1.0 } else { 0.0 };
-		rep.significance = visible * (area_term + distance_term);
+		let significance = visible * (area_term + distance_term);
+		// Conditional write: only mark Changed when it actually changes (§8).
+		if rep.significance != significance {
+			rep.significance = significance;
+		}
 	}
 }
 
@@ -83,8 +92,15 @@ pub fn allocate_representation_budget(
 
 	for (id, mut rep) in &mut query {
 		if let Some(&tier) = tier_for.get(&id.0.index) {
-			rep.desired_tier = tier;
-			rep.current_tier = step_tier(rep.current_tier, tier);
+			// Conditional writes preserve change detection (§8): unchanged
+			// representation does not re-enter the render-extract delta.
+			if rep.desired_tier != tier {
+				rep.desired_tier = tier;
+			}
+			let next = step_tier(rep.current_tier, tier);
+			if rep.current_tier != next {
+				rep.current_tier = next;
+			}
 		}
 	}
 }

@@ -3,20 +3,34 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "logi_bevy_ffi.h"
 
 /**
- * Pool of high-resolution representation actors for the significant few
- * (ADR-0003 significance budget). Actors are pooled shells that mirror Rust
- * state; they never own gameplay truth. Plain C++ helper.
+ * Pools high/low-res representation actors for the significant few (§8 / ADR-0003).
+ * Maintains an entity->actor-slot assignment with a free-list; releases on
+ * explicit despawn or cross-representation move. Actors are shells -- no gameplay
+ * writes back to Rust. (AActor spawn/return + asset resolution are TODOs.)
  */
-class FLogiBevyActorPool
+class FLogiActorPool
 {
 public:
-	/** Reserve capacity for the pool. (Stub: records the budget.) */
-	void Reserve(int32 Count) { Capacity = Count; }
+	void ApplyActorUpdate(const LogiActorUpdate& Update);
+	void ReleaseEntity(uint64 EntityIndex);
+	void Reset();
 
-	int32 GetCapacity() const { return Capacity; }
+	int32 AssignedCount() const { return EntityToActor.Num(); }
 
 private:
-	int32 Capacity = 0;
+	struct FAssignment
+	{
+		int32 ActorSlot = INDEX_NONE;
+		float Significance = 0.0f;
+	};
+
+	TMap<uint64 /*entity index*/, FAssignment> EntityToActor;
+	TArray<int32> FreeActorSlots;
+	int32 HighWater = 0;
+
+	int32 Acquire() { return FreeActorSlots.Num() > 0 ? FreeActorSlots.Pop() : HighWater++; }
+	void Release(int32 Slot) { FreeActorSlots.Add(Slot); }
 };

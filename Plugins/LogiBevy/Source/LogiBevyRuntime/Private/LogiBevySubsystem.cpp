@@ -31,7 +31,7 @@ void ULogiBevySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	Desc.worker_thread_count = 0;
 	Desc.fixed_step_hz = 30;
 	Desc.deterministic_seed = 0x4C4F4749ull; // 'LOGI'
-	Desc.flags = 0;                          // single-threaded deterministic (MVP)
+	Desc.flags = 0;
 
 	LogiError Err{};
 	WorldHandle = static_cast<void*>(logi_world_create(&Desc, &Err));
@@ -65,7 +65,6 @@ void ULogiBevySubsystem::OnWorldBeginPlay(UWorld& InWorld)
 		return;
 	}
 
-	// Register the sim tick in TG_PrePhysics.
 	SimTickFunction.bCanEverTick = true;
 	SimTickFunction.bStartWithTickEnabled = true;
 	SimTickFunction.bTickEvenWhenPaused = false;
@@ -88,7 +87,6 @@ void ULogiBevySubsystem::Deinitialize()
 		WorldHandle = nullptr;
 	}
 #endif
-	AgentInstances.Reset();
 	Super::Deinitialize();
 }
 
@@ -130,23 +128,6 @@ void ULogiBevySubsystem::TickSimulation(float DeltaTime)
 		return;
 	}
 	LastSimTick = static_cast<int64>(Result.sim_tick);
-
-	LogiRenderSnapshot Snapshot{};
-	LogiError SnapErr{};
-	if (logi_world_get_render_snapshot(static_cast<LogiWorld*>(WorldHandle), 0 /*latest*/, &Snapshot, &SnapErr) == LOGI_OK)
-	{
-		AgentInstances.Reset(static_cast<int32>(Snapshot.agent_count));
-		for (uint32 Index = 0; Index < Snapshot.agent_count; ++Index)
-		{
-			const LogiAgentInstance& Src = Snapshot.agents[Index];
-			FLogiAgentInstance& Dst = AgentInstances.AddDefaulted_GetRef();
-			Dst.EntityIndex = static_cast<int64>(Src.id.index);
-			Dst.EntityGeneration = static_cast<int32>(Src.id.generation);
-			Dst.EntityKind = static_cast<int32>(Src.id.kind);
-			Dst.Location = FVector(Src.translation_cm[0], Src.translation_cm[1], Src.translation_cm[2]);
-			Dst.Tier = Src.tier;
-		}
-	}
 #else
 	(void)DeltaTime;
 #endif

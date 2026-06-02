@@ -18,7 +18,7 @@ typedef struct LogiBuffer LogiBuffer;
  * ABI version. Bump on any breaking change to this header. Callers pass their
  * compiled-against version in `LogiInitDesc::abi_version`; mismatches are rejected.
  */
-#define LOGI_ABI_VERSION 1
+#define LOGI_ABI_VERSION 2
 
 #define LOGI_OK 0
 
@@ -114,29 +114,85 @@ typedef struct {
 } LogiFrameInput;
 
 /**
- * One agent's render-relevant state. `repr(C)`: crosses the FFI verbatim.
+ * Opaque handle to an Unreal-side asset (mesh, material, skeleton, anim graph).
+ * Unreal resolves it via its asset registry; Rust treats it as an opaque key.
+ * 0 == none.
  */
-typedef struct {
-  LogiEntityId id;
-  /**
-   * World translation in cm (f64 for Unreal large-world coordinates).
-   */
-  double translation_cm[3];
-  /**
-   * `RepresentationTier` as u8 (0=None, 1=ISM, 2=LowRes, 3=HighRes). ADR-0003.
-   */
-  uint8_t tier;
-} LogiAgentInstance;
+typedef uint64_t LogiAssetHandle;
+#define LogiAssetHandle_NONE 0
 
 /**
- * Borrowed view over a render snapshot. `agents` is valid only until the next
+ * One instanced-static-mesh instance delta. `stable_instance_slot` is assigned
+ * and retained by Unreal (Rust sends `u32::MAX` to mean "assign/keep").
+ */
+typedef struct {
+  LogiEntityId entity;
+  uint32_t stable_instance_slot;
+  /**
+   * Row-major 3x4 affine (cols 0-2 = rotation*scale, col 3 = translation).
+   */
+  float transform_3x4[12];
+  float custom_data[8];
+  uint32_t flags;
+} LogiInstanceUpdate;
+
+/**
+ * A batch of instances sharing mesh/material/LOD. `instances` points into the
+ * snapshot's instance buffer (valid until the next tick). Built at the FFI
+ * boundary — NOT stored in the (Send+Sync) resource.
+ */
+typedef struct {
+  LogiAssetHandle mesh;
+  LogiAssetHandle material;
+  uint32_t lod;
+  uint32_t instance_count;
+  const LogiInstanceUpdate *instances;
+} LogiStaticBatch;
+
+/**
+ * Opaque handle to an Unreal Actor class (for pooled high/low-res actors).
+ */
+typedef uint64_t LogiActorClassHandle;
+#define LogiActorClassHandle_NONE 0
+
+/**
+ * Animation parameters Unreal feeds to an AnimInstance for a represented agent.
+ * Bevy computes these; Unreal presents them. `repr(C)`.
+ */
+typedef struct {
+  uint16_t locomotion_state;
+  float speed_cm_s;
+  float turn_rate;
+  float aim_yaw_pitch[2];
+} LogiAnimationParams;
+
+/**
+ * A per-actor update (low/high-res actor tiers). Skeletal mesh + anim + transform.
+ */
+typedef struct {
+  LogiEntityId entity;
+  LogiActorClassHandle actor_class;
+  LogiAssetHandle skeletal_mesh;
+  LogiAssetHandle anim_blueprint;
+  float transform_3x4[12];
+  float significance;
+  LogiAnimationParams animation;
+} LogiActorUpdate;
+
+/**
+ * Borrowed view over a render snapshot (§8): instanced-mesh batches, per-actor
+ * updates, and despawns. All pointers are valid only until the next
  * `logi_world_tick` on the same world.
  */
 typedef struct {
   uint64_t snapshot_id;
   uint64_t sim_tick;
-  const LogiAgentInstance *agents;
-  uint32_t agent_count;
+  uint32_t static_batch_count;
+  const LogiStaticBatch *static_batches;
+  uint32_t actor_update_count;
+  const LogiActorUpdate *actor_updates;
+  uint32_t despawn_count;
+  const LogiEntityId *despawns;
 } LogiRenderSnapshot;
 
 /**

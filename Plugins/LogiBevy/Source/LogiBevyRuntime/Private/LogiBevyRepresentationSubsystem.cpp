@@ -4,9 +4,15 @@
 #include "LogiBevySubsystem.h"
 #include "LogiBevyInstancedRenderer.h"
 #include "LogiBevyActorPool.h"
+#include "LogiBevyAnimationBridge.h"
 #include "LogiBevyTelemetry.h"
+#include "LogiBevyTypes.h"
 #include "Engine/World.h"
 #include "Engine/Level.h"
+
+#if LOGI_BEVY_HAVE_RUST
+#include "logi_bevy_ffi.h"
+#endif
 
 void FLogiBevyRepresentationTickFunction::ExecuteTick(float DeltaTime, ELevelTick TickType, ENamedThreads::Type /*CurrentThread*/, const FGraphEventRef& /*MyCompletionGraphEvent*/)
 {
@@ -21,15 +27,13 @@ FString FLogiBevyRepresentationTickFunction::DiagnosticMessage()
 	return TEXT("FLogiBevyRepresentationTickFunction (LogiBevy PostPhysics representation)");
 }
 
-ULogiBevyRepresentationSubsystem::ULogiBevyRepresentationSubsystem() = default;
-ULogiBevyRepresentationSubsystem::~ULogiBevyRepresentationSubsystem() = default;
-
 void ULogiBevyRepresentationSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
-	InstancedRenderer = MakeUnique<FLogiBevyInstancedRenderer>();
-	ActorPool = MakeUnique<FLogiBevyActorPool>();
-	Telemetry = MakeUnique<FLogiBevyTelemetry>();
+	InstancedRenderer = MakePimpl<FLogiInstancedRenderer>();
+	ActorPool = MakePimpl<FLogiActorPool>();
+	AnimationBridge = MakePimpl<FLogiAnimationBridge>();
+	Telemetry = MakePimpl<FLogiBevyTelemetry>();
 }
 
 void ULogiBevyRepresentationSubsystem::OnWorldBeginPlay(UWorld& InWorld)
@@ -41,7 +45,6 @@ void ULogiBevyRepresentationSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 		return;
 	}
 
-	// Register the representation tick in TG_PostPhysics.
 	RepTickFunction.bCanEverTick = true;
 	RepTickFunction.bStartWithTickEnabled = true;
 	RepTickFunction.bTickEvenWhenPaused = false;
@@ -62,9 +65,6 @@ void ULogiBevyRepresentationSubsystem::Deinitialize()
 	{
 		RepTickFunction.UnRegisterTickFunction();
 	}
-	InstancedRenderer.Reset();
-	ActorPool.Reset();
-	Telemetry.Reset();
 	Super::Deinitialize();
 }
 
@@ -81,27 +81,61 @@ bool ULogiBevyRepresentationSubsystem::ShouldCreateSubsystem(UObject* Outer) con
 	return false;
 }
 
-void ULogiBevyRepresentationSubsystem::TickRepresentation(float /*DeltaTime*/)
+void ULogiBevyRepresentationSubsystem::TickRepresentation(float DeltaTime)
 {
-	const UWorld* World = GetWorld();
+	UWorld* World = GetWorld();
 	if (World == nullptr)
 	{
 		return;
 	}
 
-	const ULogiBevySubsystem* Sim = World->GetSubsystem<ULogiBevySubsystem>();
+	ULogiBevySubsystem* Sim = World->GetSubsystem<ULogiBevySubsystem>();
 	if (Sim == nullptr || !Sim->IsRuntimeValid())
 	{
 		return;
 	}
 
-	const TArray<FLogiAgentInstance>& Instances = Sim->GetAgentInstances();
-	if (InstancedRenderer.IsValid())
+#if LOGI_BEVY_HAVE_RUST
+	LogiRenderSnapshot Snapshot{};
+	LogiError Err{};
+	if (logi_world_get_render_snapshot(static_cast<LogiWorld*>(Sim->GetWorldHandle()), 0 /*latest*/, &Snapshot, &Err) != LOGI_OK)
 	{
-		InstancedRenderer->SyncInstances(Instances);
+		return;
 	}
-	if (Telemetry.IsValid())
+
+	// Despawns: drop the entity from every representation.
+	for (uint32 D = 0; D < Snapshot.despawn_count; ++D)
 	{
-		Telemetry->RecordFrame(Instances.Num(), Sim->GetSimTick());
+		const uint64 Entity = Snapshot.despawns[D].index;
+		InstancedRenderer->ApplyDespawn(Entity);
+		ActorPool->ReleaseEntity(Entity);
+		AnimationBridge->ReleaseEntity(Entity);
 	}
+
+	// ISM batches: move entities out of the actor representation, then apply.
+	for (uint32 B = 0; B < Snapshot.static_batch_count; ++B)
+	{
+		const LogiStaticBatch& Batch = Snapshot.static_batches[B];
+		for (uint32 I = 0; I < Batch.instance_count; ++I)
+		{
+			const uint64 Entity = Batch.instances[I].entity.index;
+			ActorPool->ReleaseEntity(Entity);
+			AnimationBridge->ReleaseEntity(Entity);
+		}
+		InstancedRenderer->ApplyBatch(Batch);
+	}
+
+	// Actor updates: move entities out of ISM, then apply actor + animation.
+	for (uint32 A = 0; A < Snapshot.actor_update_count; ++A)
+	{
+		const LogiActorUpdate& Update = Snapshot.actor_updates[A];
+		InstancedRenderer->ApplyDespawn(Update.entity.index);
+		ActorPool->ApplyActorUpdate(Update);
+		AnimationBridge->ApplyActorUpdate(Update);
+	}
+
+	Telemetry->RecordFrame(InstancedRenderer->LiveInstanceCount(), ActorPool->AssignedCount(), Sim->GetSimTick());
+#else
+	(void)DeltaTime;
+#endif
 }
