@@ -161,6 +161,10 @@ void ULogiTerrainSubsystem::EnsureRenderTarget()
 	{
 		return;
 	}
+#if WITH_EDITOR
+	Host->SetActorLabel(TEXT("LogiTerrain"));
+#endif
+	Host->Tags.Add(TEXT("LogiTerrain"));
 	UProceduralMeshComponent* Mesh = NewObject<UProceduralMeshComponent>(Host, TEXT("LogiTerrainMesh"));
 	Host->SetRootComponent(Mesh);
 	Mesh->SetMobility(EComponentMobility::Movable);
@@ -283,9 +287,44 @@ void ULogiTerrainSubsystem::Tick(float DeltaTime)
 		}
 
 		EvictIfOverBudget();
+
+#if WITH_EDITOR
+		// Mirror telemetry + resident tiles for the editor Logi Terrain panel.
+		EditorStats.FrameId = Packet.frame_id;
+		EditorStats.ResidentTiles = static_cast<int32>(Packet.telemetry.resident_tiles);
+		EditorStats.InFlight = static_cast<int32>(Packet.telemetry.in_flight);
+		EditorStats.BytesResident = static_cast<int64>(Packet.telemetry.bytes_resident);
+		EditorStats.PeakBytesResident = static_cast<int64>(Packet.telemetry.peak_bytes_resident);
+		EditorStats.Evictions = static_cast<int64>(Packet.telemetry.evictions);
+		EditorStats.Fallbacks = static_cast<int64>(Packet.telemetry.fallbacks_used);
+		EditorStats.RequestsCompleted = static_cast<int64>(Packet.telemetry.requests_completed);
+		EditorTiles.Reset(Packet.terrain_patch_count);
+		const LogiDVec3 TO = Packet.local_frame.origin;
+		for (uint32 t = 0; t < Packet.terrain_patch_count; ++t)
+		{
+			const LogiTerrainPatchDraw& TP = Packet.terrain_patches[t];
+			FLogiTerrainTileRow Row;
+			Row.Key = TP.patch_handle;
+			Row.Lod = TP.lod;
+			Row.Center = FVector(
+				(TO.x + static_cast<double>(TP.bounds.center.x)) * LogiTerrainToUnreal,
+				(TO.z + static_cast<double>(TP.bounds.center.z)) * LogiTerrainToUnreal,
+				(TO.y + static_cast<double>(TP.bounds.center.y)) * LogiTerrainToUnreal);
+			Row.Radius = TP.bounds.radius * static_cast<float>(LogiTerrainToUnreal);
+			EditorTiles.Add(Row);
+		}
+#endif
 	}
 	TerrainWorld->ReleaseFrame(Frame);
 #else
 	(void)DeltaTime;
 #endif
 }
+
+#if WITH_EDITOR
+void ULogiTerrainSubsystem::GetEditorTerrainState(FLogiTerrainStats& OutStats, TArray<FLogiTerrainTileRow>& OutTiles) const
+{
+	OutStats = EditorStats;
+	OutTiles = EditorTiles;
+}
+#endif
