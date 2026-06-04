@@ -5,7 +5,9 @@
 #include "LogiBevyWorld.h"
 #include "Engine/World.h"
 #include "Engine/Level.h"
+#include "Engine/GameViewportClient.h"
 #include "GameFramework/PlayerController.h"
+#include "Camera/PlayerCameraManager.h"
 
 #if LOGI_BEVY_HAVE_RUST
 #include "logi_bevy_ffi.h"
@@ -159,8 +161,34 @@ void ULogiBevySubsystem::TickSimulation(float DeltaTime)
 			Camera.forward[0] = Forward.X;
 			Camera.forward[1] = Forward.Y;
 			Camera.forward[2] = Forward.Z;
-			Camera.fov_degrees = 90.0f;
-			Camera.screen_height_px = 1080.0f;
+
+			// FOV from the live camera manager (falls back to 90 if unavailable, e.g.
+			// before the view target is set). GetFOVAngle() is horizontal FOV in degrees.
+			float FovDegrees = 90.0f;
+			if (const APlayerCameraManager* CamMgr = PC->PlayerCameraManager)
+			{
+				const float ActiveFov = CamMgr->GetFOVAngle();
+				if (ActiveFov > 0.0f)
+				{
+					FovDegrees = ActiveFov;
+				}
+			}
+			Camera.fov_degrees = FovDegrees;
+
+			// Screen height from the game viewport (drives screen-space significance);
+			// fall back to 1080 when there is no viewport (dedicated server / headless).
+			float ScreenHeightPx = 1080.0f;
+			if (UGameViewportClient* Viewport = W->GetGameViewport())
+			{
+				FVector2D ViewportSize = FVector2D::ZeroVector;
+				Viewport->GetViewportSize(ViewportSize);
+				if (ViewportSize.Y > 0.0)
+				{
+					ScreenHeightPx = static_cast<float>(ViewportSize.Y);
+				}
+			}
+			Camera.screen_height_px = ScreenHeightPx;
+
 			CameraCount = 1;
 		}
 	}

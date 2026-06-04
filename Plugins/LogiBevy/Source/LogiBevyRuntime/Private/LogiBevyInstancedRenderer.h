@@ -50,6 +50,8 @@ public:
 	void SetFrameOrigin(const FVector& InOrigin) { FrameOrigin = InOrigin; }
 
 	/// Registry resolving bucket handles -> UStaticMesh / UMaterial (cube fallback).
+	/// Borrowed: the owning subsystem GC-roots it (audit H4), so a raw pointer is
+	/// safe for this pimpl's lifetime -- no weak ptr (which would NOT keep it alive).
 	void SetAssetRegistry(ULogiBevyAssetRegistry* InRegistry) { AssetRegistry = InRegistry; }
 
 	void ApplyBatch(const LogiStaticBatch& Batch);
@@ -85,7 +87,7 @@ private:
 
 	TWeakObjectPtr<UWorld> World;
 	TWeakObjectPtr<AActor> HostActor;
-	TWeakObjectPtr<ULogiBevyAssetRegistry> AssetRegistry;
+	ULogiBevyAssetRegistry* AssetRegistry = nullptr; // borrowed; subsystem GC-roots it (H4)
 	FVector FrameOrigin = FVector::ZeroVector;
 	TMap<FLogiBucketKey, FBucket> Buckets;
 	TMap<uint64 /*entity index*/, FSlotRef> EntityToSlot;

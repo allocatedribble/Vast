@@ -53,7 +53,7 @@ pub extern "C" fn logi_terrain_world_create(info: *const LogiWorldCreateInfo) ->
         let info = if info.is_null() {
             LogiWorldCreateInfo::defaults()
         } else {
-            unsafe { *info }
+            unsafe { info.read_unaligned() } // caller ptr alignment not guaranteed by the ABI
         };
         Box::into_raw(Box::new(LogiTerrainWorld::new(info)))
     }));
@@ -85,7 +85,7 @@ pub extern "C" fn logi_terrain_world_set_camera(
         if camera.is_null() {
             return LogiStatus::NullArg;
         }
-        world.set_camera(unsafe { *camera });
+        world.set_camera(unsafe { camera.read_unaligned() }); // caller ptr alignment not guaranteed
         LogiStatus::Ok
     })
 }
@@ -104,7 +104,7 @@ pub extern "C" fn logi_terrain_world_set_budget(
         if budget.is_null() {
             return LogiStatus::NullArg;
         }
-        world.set_budget(unsafe { *budget });
+        world.set_budget(unsafe { budget.read_unaligned() }); // caller ptr alignment not guaranteed
         LogiStatus::Ok
     })
 }
@@ -125,7 +125,7 @@ pub extern "C" fn logi_terrain_world_step(
             return LogiStatus::NullArg;
         }
         let frame_id = world.step(delta_seconds);
-        unsafe { *out_frame_id = frame_id };
+        unsafe { out_frame_id.write_unaligned(frame_id) }; // caller ptr alignment not guaranteed
         LogiStatus::Ok
     })
 }
@@ -147,7 +147,7 @@ pub extern "C" fn logi_terrain_world_get_frame_packet(
         }
         match world.frame_packet(frame_id) {
             Some(packet) => {
-                unsafe { *out_packet = packet };
+                unsafe { out_packet.write_unaligned(packet) }; // caller ptr alignment not guaranteed
                 LogiStatus::Ok
             }
             None => {
@@ -175,7 +175,7 @@ pub extern "C" fn logi_terrain_world_acquire_buffer_view(
         }
         match world.buffer_view(handle) {
             Some(view) => {
-                unsafe { *out_view = view };
+                unsafe { out_view.write_unaligned(view) }; // caller ptr alignment not guaranteed
                 LogiStatus::Ok
             }
             None => {
@@ -208,7 +208,11 @@ pub extern "C" fn logi_terrain_last_error_message(buf: *mut u8, buf_len: usize) 
     LAST_ERROR.with(|e| {
         let msg = e.borrow();
         let bytes = msg.as_bytes();
-        let n = bytes.len().min(buf_len);
+        let mut n = bytes.len().min(buf_len);
+        // Back off to a UTF-8 char boundary so we never copy a split codepoint.
+        while n > 0 && !msg.is_char_boundary(n) {
+            n -= 1;
+        }
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n) };
         n
     })

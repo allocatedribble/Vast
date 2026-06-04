@@ -23,6 +23,9 @@ impl HeightPage {
     pub fn from_heights(width: u16, height: u16, heights: &[f32], holes: &[bool]) -> Self {
         let n = width as usize * height as usize;
         assert_eq!(heights.len(), n, "heights length must be width*height");
+        // FIX N-c: symmetrize the precondition — `holes` is read per-sample (`.get(i)`) alongside
+        // `heights`, so a mismatched mask silently mislabels samples. Require it to match heights.
+        assert_eq!(holes.len(), heights.len(), "holes length must match heights length");
 
         let mut min_e = f32::INFINITY;
         let mut max_e = f32::NEG_INFINITY;
@@ -53,12 +56,15 @@ impl HeightPage {
             }
         }
 
+        // FIX 13: a perfectly flat page has no quantization error — report exactly 0, not EPSILON/65535.
+        let error_metric = if max_e > min_e { range / 65535.0 } else { 0.0 };
+
         Self {
             width,
             height,
             min_elevation: min_e,
             max_elevation: max_e,
-            error_metric: range / 65535.0,
+            error_metric,
             hole_mask,
             samples,
         }
@@ -72,7 +78,15 @@ impl HeightPage {
 
     /// Reconstruct elevation at a sample index (lossy by up to `error_metric`).
     pub fn elevation(&self, index: usize) -> f32 {
-        let range = self.max_elevation - self.min_elevation;
+        // FIX 14: indexing is unchecked at the FFI boundary — make an OOB read loud in debug builds.
+        debug_assert!(
+            index < self.samples.len(),
+            "HeightPage::elevation index {} out of bounds (len {})",
+            index,
+            self.samples.len()
+        );
+        // FIX 13: use the SAME EPSILON-floored range as from_heights so dequant matches quant exactly.
+        let range = (self.max_elevation - self.min_elevation).max(f32::EPSILON);
         self.min_elevation + (self.samples[index] as f32 / 65535.0) * range
     }
 

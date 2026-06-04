@@ -23,6 +23,7 @@ use logi_sim::components::{
 	Agent, CullState, Renderable, Representation, Shipment, Simulated, StableId, Transform3d, Velocity3d,
 };
 use logi_sim::resources::{RepresentationBudget, SimClock, SimRng, TerrainResource, UnrealFrameInput};
+use logi_sim::terrain::Terrain;
 use logi_sim::schedules::{LogiSchedulerMode, LogiSchedules};
 
 /// Captured at creation (from the FFI `LogiInitDesc`).
@@ -180,6 +181,11 @@ pub struct LogiWorld {
 	schedules: LogiSchedules,
 	ring: SnapshotRing,
 	id_map: HashMap<LogiEntityId, Entity>,
+	/// Every `LogiEntityId.index` currently live (both auto-allocated and
+	/// externally-requested). `allocate_id` skips occupied indices so an auto id
+	/// can never collide with a hand-authored one (audit M3); maintained in lockstep
+	/// with `id_map` on spawn/despawn.
+	used_indices: std::collections::HashSet<u64>,
 	next_index: u64,
 	shard: u16,
 	accumulator: f64,
@@ -197,7 +203,9 @@ impl LogiWorld {
 		let mut world = World::new();
 		world.insert_resource(SimClock { tick: 0, fixed_hz: hz });
 		world.insert_resource(SimRng::new(config.deterministic_seed));
-		world.insert_resource(TerrainResource::default());
+		// Terrain honours the configured seed like SimRng (audit M1): a hardcoded
+		// seed-0 field would desync gameplay placement/route-cost from the sim's RNG.
+		world.insert_resource(TerrainResource(Terrain::with_seed(config.deterministic_seed)));
 		world.insert_resource(UnrealFrameInput::default());
 		// Representation budgets from config; all-zero => library defaults.
 		let budget = if config.high_res_actor_budget == 0
@@ -224,6 +232,7 @@ impl LogiWorld {
 			schedules,
 			ring: SnapshotRing::new(),
 			id_map: HashMap::new(),
+			used_indices: std::collections::HashSet::new(),
 			next_index: 1,
 			shard: 0,
 			accumulator: 0.0,
@@ -240,15 +249,35 @@ impl LogiWorld {
 		std::thread::current().id() == self.owner_thread
 	}
 
+	/// Allocate the next auto id, SKIPPING any index already live (audit M3) so an
+	/// auto-allocated id can never collide with an externally-supplied `requested_id`
+	/// (which would orphan the prior entity). Deterministic: the live-index set is a
+	/// pure function of the spawn sequence, so the same sequence yields the same ids.
 	fn allocate_id(&mut self, kind: u16) -> LogiEntityId {
+		while self.used_indices.contains(&self.next_index) {
+			self.next_index += 1;
+		}
 		let id = LogiEntityId { index: self.next_index, generation: 1, shard: self.shard, kind };
 		self.next_index += 1;
 		id
 	}
 
 	/// Spawn one entity from a plain-data command (a controlled mutation phase).
+	/// A `requested_id` that is already live is rejected as a no-op (audit M3):
+	/// the existing id is returned and the live entity is left untouched, rather than
+	/// inserting a second `id_map` entry that orphans the first.
 	pub fn spawn(&mut self, cmd: &LogiSpawnCommand) -> LogiEntityId {
+		self.spawn_inner(cmd).0
+	}
+
+	/// Spawn worker. Returns `(id, created)` where `created` is false when a valid
+	/// `requested_id` was already present (de-duplicated, no entity spawned).
+	fn spawn_inner(&mut self, cmd: &LogiSpawnCommand) -> (LogiEntityId, bool) {
 		let id = if cmd.requested_id.is_valid() {
+			// Reject a duplicate: return the live id without overwriting it.
+			if self.id_map.contains_key(&cmd.requested_id) {
+				return (cmd.requested_id, false);
+			}
 			cmd.requested_id
 		} else {
 			self.allocate_id(cmd.kind)
@@ -271,15 +300,34 @@ impl LogiWorld {
 			.id();
 
 		self.id_map.insert(id, entity);
-		id
+		self.used_indices.insert(id.index);
+		(id, true)
 	}
 
-	/// Submit a batch of spawn commands. Returns how many were applied.
+	/// Despawn a live entity by stable id (a controlled mutation phase). Removes it
+	/// from the Bevy world AND from `id_map` / `used_indices` (audit M3 / H1): leaving
+	/// stale id-map entries would leak identity and freeing the index for reuse keeps
+	/// auto-allocation tight. The render-extract retirement diff (H1) emits the
+	/// despawn to Unreal on the next extract because the id drops out of the query.
+	/// Returns true if an entity was removed.
+	pub fn despawn(&mut self, id: LogiEntityId) -> bool {
+		if let Some(entity) = self.id_map.remove(&id) {
+			self.used_indices.remove(&id.index);
+			self.world.despawn(entity);
+			true
+		} else {
+			false
+		}
+	}
+
+	/// Submit a batch of spawn commands. Returns how many entities were actually
+	/// spawned (duplicates that hit an existing `requested_id` are not counted).
 	pub fn submit_spawn_commands(&mut self, commands: &[LogiSpawnCommand]) -> u32 {
 		let mut applied = 0u32;
 		for cmd in commands {
-			self.spawn(cmd);
-			applied += 1;
+			if self.spawn_inner(cmd).1 {
+				applied += 1;
+			}
 		}
 		applied
 	}
@@ -294,6 +342,12 @@ impl LogiWorld {
 
 	/// Advance one frame following the scheduling treaty. Publishes a new snapshot
 	/// ring slot. Caller must be the owner thread (checked at the FFI boundary).
+	///
+	/// `frame_delta_seconds` is wall-clock frame time and stays `f32` (L5): it only
+	/// feeds the variable-rate accumulator that decides HOW MANY fixed steps to run.
+	/// Per-step determinism is unaffected because every fixed step integrates with
+	/// the constant tick dt (`self.fixed_dt`, derived from `fixed_step_hz`), never
+	/// the frame delta — so 30/60/120 fps produce identical step counts and state.
 	pub fn tick(
 		&mut self,
 		frame_delta_seconds: f32,
@@ -304,6 +358,8 @@ impl LogiWorld {
 		self.ingest_input(cameras, intents);
 		self.schedules.input_ingest.run(&mut self.world);
 
+		// f64 accumulator; the f32 frame delta is widened once here. Determinism
+		// comes from the constant `fixed_dt` per step, not this wall-clock input.
 		self.accumulator += f64::from(frame_delta_seconds.max(0.0));
 		let mut steps_run = 0u32;
 		while self.accumulator >= self.fixed_dt && steps_run < max_fixed_steps {
@@ -327,12 +383,24 @@ impl LogiWorld {
 
 		// Publish the scratch into a fresh ring slot (ABI-stable copy).
 		let scratch_id = self.world.resource::<RenderSnapshotResource>().snapshot_id;
-		self.ring.publish(scratch_id, self.world.resource::<RenderSnapshotResource>());
+		let published = self.ring.publish(scratch_id, self.world.resource::<RenderSnapshotResource>());
 		// Report the actually-published id (the prior one if the fence dropped this frame).
 		let render_snapshot_id = self.snapshot_id();
 
 		let tick = self.sim_tick();
-		self.world.clear_trackers();
+		// Only retire change-detection trackers and advance the extract's cross-frame
+		// bookkeeping when the snapshot actually published (audit H2). On a dropped
+		// frame we keep the prior committed rendered-set / origin so the same
+		// retirements + origin re-bake retry next tick, and we flag the extract to do
+		// a FULL re-emit next frame to recover the lost instance/actor delta (Bevy's
+		// per-system change detection has already consumed the Changed flags, so they
+		// will NOT fire again — the full re-emit is what actually recovers the delta).
+		if published {
+			self.world.resource_mut::<RenderSnapshotResource>().commit();
+			self.world.clear_trackers();
+		} else {
+			self.world.resource_mut::<RenderSnapshotResource>().mark_publish_dropped();
+		}
 
 		TickOutcome {
 			fixed_steps_run: steps_run,
@@ -549,5 +617,124 @@ mod tests {
 		assert_eq!(run(1.0 / 16.0, 16), 16);
 		assert_eq!(run(1.0 / 16.0, 16), run(1.0 / 32.0, 32));
 		assert_eq!(run(1.0 / 32.0, 32), run(1.0 / 64.0, 64));
+	}
+
+	/// A camera looking at the world origin, so an entity there earns positive
+	/// significance and the representation plan promotes it to a rendered tier.
+	fn cam_at_origin() -> LogiCameraView {
+		LogiCameraView {
+			position: [0.0, 0.0, 0.0],
+			forward: [1.0, 0.0, 0.0],
+			fov_degrees: 90.0,
+			screen_height_px: 1080.0,
+		}
+	}
+
+	/// H2: when the snapshot fence drops a frame, the render delta for an entity that
+	/// changed during the drop is NOT lost — it is carried by the next published
+	/// snapshot (because change-detection trackers are only cleared on a successful
+	/// publish). We use the actor lane: a camera keeps the entity at a rendered tier
+	/// across the whole test (the representation plan re-derives tiers every tick).
+	#[test]
+	fn dropped_publish_retries_render_delta() {
+		let mut w = LogiWorld::new(cfg(7));
+		let id = LogiEntityId { index: 50, generation: 1, shard: 0, kind: 1 };
+		w.spawn(&spawn_cmd(50, 0.0));
+		let cams = [cam_at_origin()];
+
+		// Warm up (releasing every snapshot) until the hysteresis ramp settles the
+		// entity at HighResActor and significance stabilizes — so later ticks produce
+		// EMPTY deltas unless we deliberately mutate the entity.
+		for _ in 0..8 {
+			let sid = w.tick(0.0625, 8, &cams, &[]).render_snapshot_id;
+			w.release_snapshot(sid);
+		}
+		assert_eq!(w.actor_updates().len(), 0, "warm-up should have reached a stable empty delta");
+
+		// Fill the 3-slot ring WITHOUT releasing: A, B, C. (Stable -> empty deltas.)
+		let a = w.tick(0.0625, 8, &cams, &[]).render_snapshot_id;
+		let _b = w.tick(0.0625, 8, &cams, &[]).render_snapshot_id;
+		let _c = w.tick(0.0625, 8, &cams, &[]).render_snapshot_id; // ring now full
+
+		// Mutate the entity (nudge its transform), then tick: no free slot -> DROP.
+		let entity = w.id_map[&id];
+		w.world.get_mut::<Transform3d>(entity).unwrap().translation_cm[2] += 10.0;
+		let dropped_before = w.dropped_snapshot_frames();
+		w.tick(0.0625, 8, &cams, &[]);
+		assert_eq!(w.dropped_snapshot_frames(), dropped_before + 1, "this frame must drop");
+
+		// Free a non-published slot (release A) and tick again: the delta must survive
+		// the drop and appear now. Without the H2 fix, trackers would have been cleared
+		// on the dropped frame and this snapshot would be empty.
+		assert!(w.release_snapshot(a));
+		w.tick(0.0625, 8, &cams, &[]);
+		let published = w.ring.published().unwrap();
+		assert_eq!(published.actor_updates.len(), 1, "changed entity must be re-emitted after the drop");
+		assert_eq!(published.actor_updates[0].entity.index, 50);
+	}
+
+	/// M1: the terrain field honours the configured deterministic seed (it is no
+	/// longer hardcoded to 0). Two worlds with different seeds sample different
+	/// ground; the same seed samples identically.
+	#[test]
+	fn terrain_honours_configured_seed() {
+		use logi_schema::LogiTileId;
+		let sample = |seed: u64| -> f64 {
+			let w = LogiWorld::new(cfg(seed));
+			w.world
+				.resource::<TerrainResource>()
+				.0
+				.sample_surface(LogiTileId::new(1), 1234.0, 5678.0)
+				.height_cm
+		};
+		assert_ne!(sample(1), sample(2), "different seeds must yield different terrain");
+		assert_eq!(sample(7), sample(7), "same seed must be deterministic");
+	}
+
+	/// M3: a duplicate `requested_id` is de-duplicated — the live entity is left
+	/// intact, no second id_map entry is created, and the submit count excludes it.
+	#[test]
+	fn duplicate_requested_id_is_deduped() {
+		let mut w = LogiWorld::new(cfg(1));
+		let applied = w.submit_spawn_commands(&[spawn_cmd(30, 1.0), spawn_cmd(30, 9.0)]);
+		assert_eq!(applied, 1, "the duplicate must not count as applied");
+		assert_eq!(w.id_map.len(), 1, "no orphaned id_map entry");
+		// The original entity (position x=1.0) is untouched by the duplicate (x=9.0).
+		let entity = w.id_map[&LogiEntityId { index: 30, generation: 1, shard: 0, kind: 1 }];
+		assert_eq!(w.world.get::<Transform3d>(entity).unwrap().translation_cm[0], 1.0);
+	}
+
+	/// M3: auto-allocated ids never collide with an externally-supplied index — the
+	/// allocator skips occupied indices.
+	#[test]
+	fn auto_allocation_skips_occupied_indices() {
+		let mut w = LogiWorld::new(cfg(1));
+		// Externally claim index 1 (the value `next_index` starts at).
+		let claimed = w.spawn(&spawn_cmd(1, 0.0));
+		// Auto-allocate (invalid requested_id) -> must NOT reuse index 1.
+		let auto = w.spawn(&LogiSpawnCommand {
+			kind: 1,
+			requested_id: LogiEntityId::default(), // invalid => auto
+			position: [0.0; 3],
+			route_id: 0,
+			payload_kg: 0.0,
+		});
+		assert_ne!(auto.index, claimed.index, "auto id must skip the occupied index");
+		assert_eq!(w.id_map.len(), 2, "both entities live, none orphaned");
+	}
+
+	/// M3 / H1: despawn removes the entity from id_map AND frees its index for reuse.
+	#[test]
+	fn despawn_clears_id_map_and_frees_index() {
+		let mut w = LogiWorld::new(cfg(1));
+		let id = w.spawn(&spawn_cmd(40, 1.0));
+		assert_eq!(w.id_map.len(), 1);
+		assert!(w.despawn(id), "despawn of a live id returns true");
+		assert!(w.id_map.is_empty(), "id_map entry removed");
+		assert!(!w.despawn(id), "despawning again is a no-op");
+		// The index is free again: re-spawning the same requested id now succeeds.
+		let again = w.spawn(&spawn_cmd(40, 2.0));
+		assert_eq!(again.index, 40);
+		assert_eq!(w.id_map.len(), 1);
 	}
 }

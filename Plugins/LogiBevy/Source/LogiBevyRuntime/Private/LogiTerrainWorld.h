@@ -3,9 +3,16 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "LogiBevyTypes.h" // LogLogiBevy (warn-once on non-OK kernel status)
 
 #if LOGI_BEVY_HAVE_TERRAIN
 #include "logi_terrain_ffi.h"
+
+// Defined in LogiBevyFfi.cpp (the module owns the terrain DLL load + ABI check). Returns false
+// once a terrain ABI mismatch has been detected at startup; because the terrain exports are
+// delay-loaded, the bridge MUST consult this before any terrain call (freeing the DLL handle on
+// mismatch does not stop the loader from re-resolving + re-loading the mismatched DLL on first use).
+bool LogiBevy_IsTerrainAbiOk();
 #endif
 
 /**
@@ -27,6 +34,18 @@ public:
 	bool Create()
 	{
 		Destroy();
+		// Refuse to enter the terrain DLL if its ABI did not match the header at load time. The
+		// exports are delay-loaded, so calling anyway would re-load the mismatched DLL and crash.
+		if (!LogiBevy_IsTerrainAbiOk())
+		{
+			if (!bAbiRefusalWarned)
+			{
+				bAbiRefusalWarned = true;
+				UE_LOG(LogLogiBevy, Warning,
+					TEXT("Skipping terrain kernel creation: logi_terrain ABI mismatch detected at load (see startup log)."));
+			}
+			return false;
+		}
 		Handle = logi_terrain_world_create(nullptr); // null => library defaults
 		return Handle != nullptr;
 	}
@@ -46,7 +65,9 @@ public:
 	{
 		if (Handle != nullptr)
 		{
-			logi_terrain_world_set_camera(Handle, &Camera);
+			// Surface a panicking/erroring kernel once instead of swallowing the status.
+			const LogiStatus Status = logi_terrain_world_set_camera(Handle, &Camera);
+			WarnOnce(Status, bSetCameraWarned, TEXT("logi_terrain_world_set_camera"));
 		}
 	}
 
@@ -55,7 +76,9 @@ public:
 		LogiFrameId Frame = 0;
 		if (Handle != nullptr)
 		{
-			logi_terrain_world_step(Handle, DeltaSeconds, &Frame);
+			// Surface a panicking/erroring kernel once instead of swallowing the status.
+			const LogiStatus Status = logi_terrain_world_step(Handle, DeltaSeconds, &Frame);
+			WarnOnce(Status, bStepWarned, TEXT("logi_terrain_world_step"));
 		}
 		return Frame;
 	}
@@ -70,6 +93,7 @@ public:
 	{
 		if (Handle != nullptr)
 		{
+			// logi_terrain_world_release_frame returns void (no LogiStatus to capture).
 			logi_terrain_world_release_frame(Handle, Frame);
 		}
 	}
@@ -81,7 +105,21 @@ public:
 	}
 
 private:
+	// Logs once (per call site) when the kernel returns a non-OK status, to avoid per-frame spam.
+	static void WarnOnce(LogiStatus Status, bool& bWarnedFlag, const TCHAR* What)
+	{
+		if (Status != LOGI_TERRAIN_OK && !bWarnedFlag)
+		{
+			bWarnedFlag = true;
+			UE_LOG(LogLogiBevy, Warning, TEXT("%s returned non-OK terrain status %d; the kernel may be panicking."),
+				What, static_cast<int32>(Status));
+		}
+	}
+
 	LogiTerrainWorld* Handle = nullptr;
+	bool bSetCameraWarned = false;
+	bool bStepWarned = false;
+	bool bAbiRefusalWarned = false; // log the ABI-mismatch refusal once, not per Create() attempt
 #else
 public:
 	void Destroy() {}

@@ -43,6 +43,10 @@ pub const QUEUE_COUNT: usize = 6;
 /// Budgets Rust owns (§6.4). Unity passes device class + frame timing; Rust decides.
 #[derive(Clone, Copy, Debug)]
 pub struct StreamingBudgets {
+    /// FIX L3: the EXACT cache byte budget this set was derived from. `total_cpu_cache_mb` is the
+    /// MB-rounded view for display/derived sub-budgets; this keeps `set_budgets(budgets())` idempotent
+    /// (re-deriving the cache size from the rounded MB field would floor a sub-MB budget to 0/1 MB).
+    pub total_cpu_cache_bytes: u64,
     pub total_cpu_cache_mb: u32,
     pub compressed_cache_mb: u32,
     pub decoded_cache_mb: u32,
@@ -64,6 +68,7 @@ impl StreamingBudgets {
     pub fn from_cache(total_cpu_cache_bytes: usize, max_inflight: u32) -> Self {
         let mb = (total_cpu_cache_bytes / (1024 * 1024)).max(1) as u32;
         Self {
+            total_cpu_cache_bytes: total_cpu_cache_bytes as u64, // FIX L3: keep exact bytes for idempotent re-apply
             total_cpu_cache_mb: mb,
             compressed_cache_mb: mb / 2,
             decoded_cache_mb: mb,
@@ -139,7 +144,9 @@ pub fn evaluate(
 
     let visibility_score = (4000.0 / (dist + 1.0)) as f32;
 
-    let ge = ctx.base_geometric_error / (1u64 << candidate.level) as f64;
+    // FIX L1: overflow-safe geometric-error halving (matches logi_terrain_lod FIX 5) — `1u64 << level`
+    // would overflow past level 63; `0.5^level` cannot.
+    let ge = ctx.base_geometric_error * 0.5f64.powi(candidate.level as i32);
     let screen_error_score =
         screen_space_error(ge, dist, ctx.fov_y_radians, ctx.viewport_height).min(64.0) as f32;
 

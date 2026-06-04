@@ -28,8 +28,10 @@ fn promote_budget_caps_requests_per_frame() {
     assert!(issued > 0, "some requests should issue");
     assert!(issued <= 4, "promote budget must cap per-frame requests, got {issued}");
 
-    // A camera window over a fresh area must have produced many queued candidates beyond the 4 promoted.
+    // queue_counts reflects requests *issued* (counted after the budget gate), so it sums to the
+    // promoted count and stays within the per-frame cap — never the larger desired-candidate set.
     let counts = engine.queue_counts();
-    let total_queued: u32 = counts.iter().sum();
-    assert!(total_queued > 4, "candidates exceed the promote cap (queued {total_queued})");
+    let total_issued: u32 = counts.iter().sum();
+    assert_eq!(u64::from(total_issued), issued, "queue_counts must sum to issued requests");
+    assert!(total_issued <= 4, "queue_counts must respect the promote cap (got {total_issued})");
 }

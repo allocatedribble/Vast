@@ -87,7 +87,7 @@ impl Provider for SyntheticProvider {
             let ids = self.pending.remove(&key).unwrap();
             for id in ids {
                 out.push((id, Self::page_size_for(id)));
-                self.in_flight -= 1;
+                self.in_flight = self.in_flight.saturating_sub(1); // FIX 5: avoid usize underflow
             }
         }
     }
@@ -155,6 +155,8 @@ impl World {
 
     #[inline]
     fn side(&self, level: u8) -> u32 {
+        // FIX L2: guard the `1u32 << level` shift (sibling of TileId::side) — `level >= 32` overflows.
+        debug_assert!(level < 32, "World::side at level {} overflows the 32-bit `1u32 << level` shift", level);
         1u32 << level
     }
     #[inline]
@@ -295,7 +297,9 @@ impl<P: Provider> StreamEngine<P> {
     }
     pub fn set_budgets(&mut self, budgets: StreamingBudgets) {
         self.budgets = budgets;
-        self.cache.set_budget((budgets.total_cpu_cache_mb as usize) * 1024 * 1024);
+        // FIX L3: apply the EXACT byte budget, not the MB-rounded field — otherwise
+        // `set_budgets(budgets())` would floor a sub-MB / non-MB-aligned cache budget on every round-trip.
+        self.cache.set_budget(budgets.total_cpu_cache_bytes as usize);
         self.cfg.max_in_flight = budgets.max_inflight_requests as usize;
     }
     /// Per-frame request counts by [`QueueClass`] (index = `queue as usize`).
@@ -346,6 +350,16 @@ impl<P: Provider> StreamEngine<P> {
         if sse_target_pixels > 0.0 {
             self.view_sse_target_pixels = sse_target_pixels;
         }
+        // FIX 6: guard against a zero/negative viewport or FOV so aspect/SSE math never divides by zero.
+        if !(self.view_viewport_height > 0.0) {
+            self.view_viewport_height = 1080.0;
+        }
+        if !(self.view_viewport_width > 0.0) {
+            self.view_viewport_width = self.view_viewport_height;
+        }
+        if !(self.view_fov_y_radians > 0.0) {
+            self.view_fov_y_radians = 1.0;
+        }
     }
 
     /// The current desired set (visible, SSE-appropriate tiles). For tests/inspection.
@@ -387,7 +401,9 @@ impl<P: Provider> StreamEngine<P> {
                 continue;
             }
             let refine = node.level < world.max_level && {
-                let ge = world.base_geometric_error / (1u64 << node.level) as f64;
+                // FIX L1: overflow-safe geometric-error halving (matches logi_terrain_lod FIX 5) —
+                // `1u64 << level` would overflow past level 63; `0.5^level` cannot.
+                let ge = world.base_geometric_error * 0.5f64.powi(node.level as i32);
                 let dist = camera.distance(center).max(1.0);
                 logi_terrain_lod::screen_space_error(
                     ge,
@@ -410,6 +426,8 @@ impl<P: Provider> StreamEngine<P> {
         }
     }
 
+    /// HARNESS-ONLY (the `!has_view()` stress path): uses `camera.y.abs()` as the viewing distance.
+    /// Do not change this math — the deterministic stress tests depend on its byte-for-byte behavior.
     fn pick_level(&self, world: &World, camera: DVec3) -> u8 {
         let altitude = camera.y.abs().max(1.0);
         desired_level(
@@ -422,6 +440,8 @@ impl<P: Provider> StreamEngine<P> {
         )
     }
 
+    /// HARNESS-ONLY (the `!has_view()` stress path): the omnidirectional window used when no live camera
+    /// basis is present. Do not change its math — the deterministic stress tests depend on it.
     fn add_desired_window(&mut self, world: &World, x: f64, z: f64, level: u8) {
         world.window(x, z, level, self.cfg.window_radius, &mut self.window_buf);
         for &id in &self.window_buf {
@@ -463,6 +483,11 @@ impl<P: Provider> StreamEngine<P> {
             };
             // Flat local world: near a small constant, far generous (SSE caps far detail, not the far
             // plane); horizon culling opts out until the globe endpoint. World is flat → y=0 plane.
+            // FIX 4: far is camera-relative (origin-centered world) so an outside/orbital camera still
+            // encloses the whole world; falls back to the old 2*size floor when the camera is inside.
+            let world_center = DVec3::ZERO; // origin-centered world: center is the origin
+            let world_diagonal = world.world_size * 1.5;
+            let far = (camera.distance(world_center) + world_diagonal).max(world.world_size * 2.0);
             let frustum = Frustum::from_camera(
                 camera,
                 self.view_forward,
@@ -470,7 +495,7 @@ impl<P: Provider> StreamEngine<P> {
                 self.view_fov_y_radians,
                 aspect,
                 0.5,
-                (world.world_size * 2.0).max(1000.0),
+                far,
             );
             let horizon = HorizonCuller::flat();
             self.select_hierarchical(world, camera, &frustum, &horizon);
@@ -502,7 +527,7 @@ impl<P: Provider> StreamEngine<P> {
             for lvl in 0..=leaf.level {
                 let anc = leaf.ancestor_at(lvl);
                 if self.cache.contains(&anc) {
-                    self.cache.promote(&anc);
+                    // FIX 2: don't promote here — promoting every resident ancestor pins coarse tiles MRU.
                     finest_resident = Some(anc);
                 } else if !self.in_flight.contains(&anc) && self.candidate_seen.insert(anc) {
                     let is_fallback = finest_resident.is_none();
@@ -511,6 +536,11 @@ impl<P: Provider> StreamEngine<P> {
                     let queue = scheduler::classify_queue(&terms, is_fallback);
                     self.candidates.push((anc, terms, queue));
                 }
+            }
+
+            // FIX 2: promote only the finest resident tile so coarse ancestors stay evictable.
+            if let Some(f) = finest_resident {
+                self.cache.promote(&f);
             }
 
             if let Some(chosen) = finest_resident {
@@ -525,8 +555,13 @@ impl<P: Provider> StreamEngine<P> {
         }
 
         // 3b. Issue requests in priority order, gated by in-flight + per-frame promote budgets (§6.4).
-        self.candidates
-            .sort_by(|a, b| b.1.total().partial_cmp(&a.1.total()).unwrap_or(std::cmp::Ordering::Equal));
+        // FIX 1: sort by queue class first (rank = `queue as usize`, CriticalNow=0 is most urgent), then
+        // by descending score within a class, so critical fallbacks always issue before Speculative.
+        self.candidates.sort_by(|a, b| {
+            (a.2 as usize).cmp(&(b.2 as usize)).then_with(|| {
+                b.1.total().partial_cmp(&a.1.total()).unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
         if let Some(top) = self.candidates.first() {
             self.last_top_terms = top.1;
         }
@@ -534,7 +569,6 @@ impl<P: Provider> StreamEngine<P> {
         let mut promoted = 0u32;
         for k in 0..self.candidates.len() {
             let (tile, _terms, queue) = self.candidates[k];
-            self.queue_counts[queue as usize] += 1;
             if self.in_flight.len() >= self.budgets.max_inflight_requests as usize
                 || promoted >= self.budgets.max_pages_promoted_per_frame
             {
@@ -543,6 +577,7 @@ impl<P: Provider> StreamEngine<P> {
             self.provider.request(tile, self.tick);
             self.in_flight.insert(tile);
             self.states.insert(tile, PageState::Requesting);
+            self.queue_counts[queue as usize] += 1; // FIX 3: count after the budget gate = requests issued
             self.telemetry.requests_issued += 1;
             promoted += 1;
         }
@@ -613,6 +648,30 @@ mod view_tests {
         let any_plus = desired.iter().any(|&t| world.tile_bounds(t).0.x > camera.x);
         let any_minus = desired.iter().any(|&t| world.tile_bounds(t).0.x < camera.x);
         assert!(any_plus && any_minus, "window should surround the camera on all sides");
+    }
+
+    #[test]
+    fn set_budgets_round_trip_is_idempotent() {
+        // FIX L3: `set_budgets(budgets())` must not shrink the cache byte budget. A non-MB-aligned
+        // budget previously got floored to a whole MB on every round-trip (re-derived from the rounded
+        // `total_cpu_cache_mb`); the exact-bytes field keeps it stable.
+        let bytes = 64 * 1024 * 1024 + 500 * 1024; // not a whole number of MB
+        let cfg = StreamConfig {
+            budget_bytes: bytes,
+            max_in_flight: 64,
+            window_radius: 6,
+            sse_target_pixels: 2.0,
+            fov_y_radians: 1.0,
+            viewport_height: 1080.0,
+            prefetch_lead: 8.0,
+        };
+        let mut eng = StreamEngine::new(cfg, SyntheticProvider::new(2, 8));
+        assert_eq!(eng.cache().budget(), bytes, "engine starts at the exact byte budget");
+        eng.set_budgets(eng.budgets());
+        assert_eq!(eng.cache().budget(), bytes, "round-tripping budgets must not floor the byte budget");
+        // Idempotent under repetition.
+        eng.set_budgets(eng.budgets());
+        assert_eq!(eng.cache().budget(), bytes);
     }
 
     #[test]

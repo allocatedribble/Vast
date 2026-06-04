@@ -12,12 +12,15 @@ pub fn screen_space_error(
     if distance <= 1e-6 {
         return f64::INFINITY;
     }
-    let pixels_per_unit = viewport_height / (2.0 * distance * (fov_y_radians * 0.5).tan());
+    // FIX 4: clamp fov away from 0/PI so tan() can't go to 0 or blow up (inf/NaN SSE).
+    let t = (fov_y_radians.clamp(1e-3, std::f64::consts::PI - 1e-3) * 0.5).tan().max(1e-4);
+    let pixels_per_unit = viewport_height / (2.0 * distance * t);
     geometric_error * pixels_per_unit
 }
 
-/// The finest level (0..=`max_level`) whose screen-space error is within `sse_target_pixels` at
-/// `distance`. Model: geometric error halves each level.
+/// The coarsest level (0..=`max_level`) whose screen-space error is already within
+/// `sse_target_pixels` at `distance` — i.e. the lowest detail that still meets the target (refining
+/// further would be wasted). Model: geometric error halves each level.
 pub fn desired_level(
     base_geometric_error: f64,
     distance: f64,
@@ -28,7 +31,9 @@ pub fn desired_level(
 ) -> u8 {
     let mut level = 0u8;
     while level < max_level {
-        let ge = base_geometric_error / (1u64 << level) as f64;
+        // FIX 5: multiply by 0.5^level instead of dividing by `1 << level` — no shift overflow past
+        // level 63 and exact enough for the SSE comparison.
+        let ge = base_geometric_error * 0.5f64.powi(level as i32);
         if screen_space_error(ge, distance, fov_y_radians, viewport_height) <= sse_target_pixels {
             break;
         }

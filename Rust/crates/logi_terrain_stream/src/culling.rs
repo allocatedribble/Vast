@@ -44,10 +44,18 @@ impl Frustum {
         far: f64,
     ) -> Self {
         let f = forward.try_normalize().unwrap_or(DVec3::Z);
-        let r = f.cross(up).try_normalize().unwrap_or(DVec3::X);
+        // FIX 7b: if forward is parallel to `up`, f.cross(up) is ~zero; pick an alternate up-axis that is
+        // guaranteed non-parallel to `f` (avoid a fallback right-vector collinear with `f`), then re-derive.
+        let r = f.cross(up).try_normalize().unwrap_or_else(|| {
+            // f is nearly ±Y → Y is parallel to f, use X; otherwise Y is a safe non-parallel axis.
+            let alt_up = if f.y.abs() > 0.9 { DVec3::X } else { DVec3::Y };
+            f.cross(alt_up).normalize()
+        });
         let u = r.cross(f); // re-orthonormalized true up
 
-        let half_v = (fov_y_radians * 0.5).tan().max(1e-4);
+        // FIX 7a: clamp the FOV into (0, PI) before tan() so an out-of-range/degenerate angle can't blow up.
+        let half_v =
+            ((fov_y_radians.clamp(1e-3, std::f64::consts::PI - 1e-3)) * 0.5).tan().max(1e-4);
         let half_h = half_v * aspect.max(1e-4);
 
         // Four frustum corner rays in world space.
@@ -136,6 +144,9 @@ impl HorizonCuller {
         }
         let pt = (point - center) / radius;
         let vt = pt - cv;
+        if vt.dot(vt) <= 0.0 {
+            return true; // FIX 7c: point coincides with camera → nothing to occlude; avoid div-by-zero.
+        }
         let vt_dot_vc = -vt.dot(cv);
         let occluded = vt_dot_vc > vh2 && (vt_dot_vc * vt_dot_vc) / vt.dot(vt) > vh2;
         !occluded

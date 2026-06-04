@@ -1,16 +1,20 @@
 /*
- * logi_terrain.h — C ABI for the Logi terrain runtime (the LogiTerrainWorld object).
+ * logi_terrain_ffi.h — C ABI for the Logi terrain runtime (the LogiTerrainWorld object).
  *
- * Hand-written to mirror native/logi_terrain/crates/logi_terrain_scene/src/lib.rs and
- * crates/logi_terrain_ffi/src/ffi.rs byte-for-byte. Keep field order identical across this header,
- * the Rust #[repr(C)] structs, and the Unity LogiTerrainNative bindings. See docs/architecture/
- * ADR-0001 + runtime-model.md. ABI version 3 (glam-typed: f32 render-local + f64 world).
+ * Mirrors Rust/crates/logi_terrain_scene/src/lib.rs and Rust/crates/logi_terrain_ffi/src/ffi.rs
+ * byte-for-byte. Keep field order identical across this header and the Rust #[repr(C)] structs.
+ * See Docs/Architecture/ADR-0007-Actorless-Rust-Terrain.md.
+ * ABI version 3 (glam-typed: f32 render-local + f64 world).
  */
 #ifndef LOGI_TERRAIN_FFI_H
 #define LOGI_TERRAIN_FFI_H
 
 #include <stdint.h>
 #include <stddef.h>
+
+/* ABI version. Must match logi_terrain_abi_version() in the loaded DLL (mirrors LOGI_ABI_VERSION
+ * in Rust/crates/logi_terrain_ffi/src/lib.rs). Callers verify before any other call. */
+#define LOGI_TERRAIN_ABI_VERSION 3u
 
 #ifdef __cplusplus
 extern "C" {

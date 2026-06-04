@@ -16,10 +16,19 @@ pub struct MeshData {
 /// Build a flat `cols x rows`-quad grid centered at the origin, spanning `width x depth` world units.
 /// `u32` indices, wound to face +Y.
 pub fn build_grid(cols: u32, rows: u32, width: f32, depth: f32) -> MeshData {
+    // FIX 9: 0 quads => div-by-zero on the u/v normalize below and an empty/degenerate mesh.
+    assert!(cols >= 1 && rows >= 1, "grid needs >=1x1 quads");
+
     let vcols = cols + 1;
     let vrows = rows + 1;
 
-    let mut vertices: Vec<u8> = Vec::with_capacity((vcols * vrows) as usize * VERTEX_STRIDE);
+    // FIX 9: compute counts in usize (widen before multiplying) and assert they fit u32 before storing.
+    let vertex_count_usize = vcols as usize * vrows as usize;
+    let index_count_usize = cols as usize * rows as usize * 6;
+    assert!(vertex_count_usize <= u32::MAX as usize, "grid vertex count exceeds u32");
+    assert!(index_count_usize <= u32::MAX as usize, "grid index count exceeds u32");
+
+    let mut vertices: Vec<u8> = Vec::with_capacity(vertex_count_usize * VERTEX_STRIDE);
     for z in 0..vrows {
         for x in 0..vcols {
             let u = x as f32 / cols as f32;
@@ -38,7 +47,7 @@ pub fn build_grid(cols: u32, rows: u32, width: f32, depth: f32) -> MeshData {
         }
     }
 
-    let mut indices: Vec<u8> = Vec::with_capacity((cols * rows * 6) as usize * 4);
+    let mut indices: Vec<u8> = Vec::with_capacity(index_count_usize * 4);
     for z in 0..rows {
         for x in 0..cols {
             let i0 = z * vcols + x;
@@ -52,8 +61,8 @@ pub fn build_grid(cols: u32, rows: u32, width: f32, depth: f32) -> MeshData {
     }
 
     MeshData {
-        vertex_count: vcols * vrows,
-        index_count: cols * rows * 6,
+        vertex_count: vertex_count_usize as u32,
+        index_count: index_count_usize as u32,
         vertices,
         indices,
     }

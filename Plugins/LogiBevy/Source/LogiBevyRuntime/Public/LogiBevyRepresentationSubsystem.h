@@ -9,6 +9,7 @@
 #include "LogiBevyRepresentationSubsystem.generated.h"
 
 class ULogiBevyRepresentationSubsystem;
+class ULogiBevyAssetRegistry;
 class FLogiInstancedRenderer;
 class FLogiActorPool;
 class FLogiAnimationBridge;
@@ -59,6 +60,17 @@ public:
 private:
 	UPROPERTY()
 	FLogiBevyRepresentationTickFunction RepTickFunction;
+
+	/**
+	 * GC root for the asset registry (audit H4). The registry is LoadSynchronous'd
+	 * once at world begin play and held here so it -- and the FStreamableHandle
+	 * preload it owns -- stay alive for the subsystem's lifetime. The renderer /
+	 * actor pool are non-UObject pimpls and cannot root it; without this strong
+	 * reference the registry is GC'd and every bucket silently falls back to the
+	 * engine cube. Raw pointers handed to the renderer/pool borrow from this.
+	 */
+	UPROPERTY()
+	TObjectPtr<ULogiBevyAssetRegistry> AssetRegistry;
 
 	TPimplPtr<FLogiInstancedRenderer> InstancedRenderer;
 	TPimplPtr<FLogiActorPool> ActorPool;

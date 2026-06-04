@@ -60,7 +60,21 @@ public:
 
 	/** Enable the actorless terrain renderer (ADR-0007 / Milestone D). OFF by default
 	 *  while the debug-lane renderer is tuned -- when on it streams + builds tile mesh
-	 *  in game/PIE worlds. */
+	 *  in game/PIE worlds and the editor level-viewport. */
 	UPROPERTY(EditAnywhere, config, Category = "Terrain")
 	bool bEnableTerrain = false;
+
+	/** Milestone E production lane: build a real Nanite UStaticMesh per tile (engine build
+	 *  path) instead of the UProceduralMeshComponent debug lane -- gets native Nanite LOD /
+	 *  GPU culling / VSM (no shadows-off hack). EDITOR/PIE-only: the Nanite encoder is an
+	 *  editor module, so this does nothing in a packaged build. Toggle live to A/B the lanes. */
+	UPROPERTY(EditAnywhere, config, Category = "Terrain", meta = (DisplayName = "Use Nanite Terrain Lane (Editor only)"))
+	bool bUseNaniteTerrainLane = false;
+
+	/** Max Nanite tile-mesh builds to SUBMIT per kernel step. The Nanite build is ASYNC -- the encode
+	 *  runs on the static-mesh worker pool and the tile pops in a few frames late (self-healing); this
+	 *  is NOT a game-thread-cost throttle but a cap on how many builds are in flight at once (bounding
+	 *  worker load + transient encode memory). Lower it if streaming spikes memory or worker contention. */
+	UPROPERTY(EditAnywhere, config, Category = "Terrain", meta = (ClampMin = 1, ClampMax = 32))
+	int32 NaniteTileBuildsPerStep = 2;
 };

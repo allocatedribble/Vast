@@ -48,6 +48,18 @@ void ULogiBevyRepresentationSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 		return;
 	}
 
+	// Pure-presentation guard (audit L7): if the sim runtime is invalid (the DLL or
+	// the Rust world failed to come up) there is nothing to mirror. Skip renderer
+	// init, asset preload, and tick registration entirely so we never spawn render
+	// shells (host actor / ISM / pooled actors) that would never be driven. The sim
+	// subsystem itself already early-returns in that case, so its tick function is
+	// not registered and the prerequisite below would be a no-op anyway.
+	ULogiBevySubsystem* Sim = InWorld.GetSubsystem<ULogiBevySubsystem>();
+	if (Sim == nullptr || !Sim->IsRuntimeValid())
+	{
+		return;
+	}
+
 	RepTickFunction.bCanEverTick = true;
 	RepTickFunction.bStartWithTickEnabled = true;
 	RepTickFunction.bTickEvenWhenPaused = false;
@@ -56,10 +68,7 @@ void ULogiBevyRepresentationSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	RepTickFunction.RegisterTickFunction(InWorld.PersistentLevel);
 
 	// Explicit prerequisite: always run after the sim's PrePhysics tick.
-	if (ULogiBevySubsystem* Sim = InWorld.GetSubsystem<ULogiBevySubsystem>())
-	{
-		RepTickFunction.AddPrerequisite(Sim, Sim->GetSimTickFunction());
-	}
+	RepTickFunction.AddPrerequisite(Sim, Sim->GetSimTickFunction());
 
 	// The renderers create world objects: the instanced renderer's host actor + ISM
 	// components for the many, and the actor pool's promoted actors for the few.
@@ -74,13 +83,23 @@ void ULogiBevyRepresentationSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 	// Resolve + async-preload the asset registry from project settings (one sync
 	// load of the small registry data asset; its referenced meshes load async).
+	// Hold the loaded registry in a GC-rooted UPROPERTY (audit H4) so it -- and the
+	// FStreamableHandle preload it owns -- survive GC for the subsystem's lifetime;
+	// the renderer/pool only borrow a raw pointer to it (they are non-UObject pimpls
+	// that cannot root it). Without this root the registry is collected and every
+	// bucket silently and permanently falls back to the engine cube.
 	const ULogiBevyDeveloperSettings& Settings = *GetDefault<ULogiBevyDeveloperSettings>();
-	if (ULogiBevyAssetRegistry* Registry = Settings.AssetRegistry.LoadSynchronous())
+	AssetRegistry = Settings.AssetRegistry.LoadSynchronous();
+	if (AssetRegistry != nullptr)
 	{
-		Registry->PreloadAll();
+		AssetRegistry->PreloadAll();
 		if (InstancedRenderer.IsValid())
 		{
-			InstancedRenderer->SetAssetRegistry(Registry);
+			InstancedRenderer->SetAssetRegistry(AssetRegistry);
+		}
+		if (ActorPool.IsValid())
+		{
+			ActorPool->SetAssetRegistry(AssetRegistry);
 		}
 	}
 }
@@ -91,6 +110,8 @@ void ULogiBevyRepresentationSubsystem::Deinitialize()
 	{
 		RepTickFunction.UnRegisterTickFunction();
 	}
+	// Safe whether or not OnWorldBeginPlay ran: the pimpls are created in Initialize
+	// and Shutdown() is a no-op on never-initialized (default-constructed) state.
 	if (InstancedRenderer.IsValid())
 	{
 		InstancedRenderer->Shutdown();
@@ -99,6 +120,9 @@ void ULogiBevyRepresentationSubsystem::Deinitialize()
 	{
 		ActorPool->Shutdown();
 	}
+	// Drop the GC root (audit H4) so the registry + its preload handle can be
+	// collected when the world tears down. Null if we early-returned on L7.
+	AssetRegistry = nullptr;
 	Super::Deinitialize();
 }
 

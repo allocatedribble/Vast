@@ -1,6 +1,7 @@
 // Copyright LogiUE. All Rights Reserved.
 
 #include "LogiBevyActorPool.h"
+#include "LogiBevyAssetRegistry.h"
 #include "Engine/World.h"
 #include "Engine/StaticMeshActor.h"
 #include "Engine/StaticMesh.h"
@@ -29,6 +30,7 @@ void FLogiActorPool::Shutdown()
 	}
 	EntityToActor.Reset();
 	Pool.Reset();
+	AssetRegistry = nullptr; // borrowed; clear so a stale ptr is never read post-shutdown
 	World.Reset();
 }
 
@@ -38,7 +40,21 @@ FVector FLogiActorPool::TranslationOf(const LogiActorUpdate& Update)
 	return FVector(Update.transform_3x4[3], Update.transform_3x4[7], Update.transform_3x4[11]);
 }
 
-AStaticMeshActor* FLogiActorPool::SpawnActor(const FVector& Location)
+UStaticMesh* FLogiActorPool::ResolveMeshFor(const LogiActorUpdate& Update) const
+{
+	// Best-effort static-mesh resolution for the actor tier through the GC-rooted
+	// registry (audit H4): meshes authored for static-actor-tier entities are
+	// registered under the same stable hash the Rust side emits as `actor_class`.
+	// Returns null (caller falls back to the engine cube) when unregistered or not
+	// yet resident. Skeletal / full actor_class spawning remains a separate TODO.
+	if (AssetRegistry != nullptr && Update.actor_class.stable_hash != 0)
+	{
+		return AssetRegistry->ResolveStaticMesh(Update.actor_class.stable_hash);
+	}
+	return nullptr;
+}
+
+AStaticMeshActor* FLogiActorPool::SpawnActor(const FVector& Location, const LogiActorUpdate& Update)
 {
 	UWorld* W = World.Get();
 	if (W == nullptr)
@@ -58,10 +74,16 @@ AStaticMeshActor* FLogiActorPool::SpawnActor(const FVector& Location)
 	if (UStaticMeshComponent* MeshComp = Actor->GetStaticMeshComponent())
 	{
 		MeshComp->SetMobility(EComponentMobility::Movable);
-		// TODO: resolve actor_class / skeletal_mesh via ULogiBevyAssetRegistry. Default cube for now.
-		if (UStaticMesh* Cube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube")))
+		// Resolve from the registry (non-blocking after PreloadAll); fall back to the
+		// engine cube so the actor is always visible. TODO: skeletal_mesh / anim path.
+		UStaticMesh* Mesh = ResolveMeshFor(Update);
+		if (Mesh == nullptr)
 		{
-			MeshComp->SetStaticMesh(Cube);
+			Mesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+		}
+		if (Mesh != nullptr)
+		{
+			MeshComp->SetStaticMesh(Mesh);
 		}
 	}
 
@@ -69,7 +91,7 @@ AStaticMeshActor* FLogiActorPool::SpawnActor(const FVector& Location)
 	return Actor;
 }
 
-AStaticMeshActor* FLogiActorPool::AcquireActor(const FVector& Location)
+AStaticMeshActor* FLogiActorPool::AcquireActor(const FVector& Location, const LogiActorUpdate& Update)
 {
 	// Reuse a pooled (hidden) actor if available; skip any GC'd entries.
 	while (Pool.Num() > 0)
@@ -82,7 +104,7 @@ AStaticMeshActor* FLogiActorPool::AcquireActor(const FVector& Location)
 			return Actor;
 		}
 	}
-	return SpawnActor(Location);
+	return SpawnActor(Location, Update);
 }
 
 void FLogiActorPool::HideAndPool(AStaticMeshActor* Actor)
@@ -104,7 +126,7 @@ void FLogiActorPool::ApplyActorUpdate(const LogiActorUpdate& Update)
 	TWeakObjectPtr<AStaticMeshActor>& Slot = EntityToActor.FindOrAdd(Entity);
 	if (!Slot.IsValid())
 	{
-		Slot = AcquireActor(Location);
+		Slot = AcquireActor(Location, Update);
 	}
 	if (AStaticMeshActor* Actor = Slot.Get())
 	{

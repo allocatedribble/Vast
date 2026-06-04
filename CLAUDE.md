@@ -22,6 +22,10 @@ See [`AGENTS.md`](AGENTS.md) § 1 and [ADR-0005](Docs/Architecture/ADR-0005-Bevy
 - [ADR-0007 — Actorless Rust Terrain](Docs/Architecture/ADR-0007-Actorless-Rust-Terrain.md) — **supersedes
   the terrain-host-actor clause of ADR-0005.** No `AActor` per tile; Rust owns terrain truth, Unreal owns
   renderer shells (Nanite/Lumen/VSM participants) only.
+- [ADR-0008 — Terrain Nanite Lane](Docs/Architecture/ADR-0008-Terrain-Nanite-Lane.md) — **refines ADR-0007's
+  Milestone-E clause.** Runtime Nanite encode is infeasible in stock UE 5.8 (editor-only encoder); the
+  production lane is an **editor-only** Nanite `UStaticMesh` built via the engine path. Ship needs an
+  offline bake or a fast static-relevance proxy.
 - [ADR-0001 — Mass-First Unreal](Docs/Architecture/ADR-0001-Mass-First-Unreal.md) — **superseded in part**
   by ADR-0005. Its Determinism section and the "Unreal is a shell" principle still hold.
 - [ADR-0002 — Rust Terrain Kernel](Docs/Architecture/ADR-0002-Rust-Terrain-Kernel.md) — terrain truth in

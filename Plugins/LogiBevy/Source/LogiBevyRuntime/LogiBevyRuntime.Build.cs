@@ -31,6 +31,11 @@ public class LogiBevyRuntime : ModuleRules
 		{
 			// Editor-only: feed the level-viewport camera so terrain streams in-editor (D).
 			PrivateDependencyModuleNames.Add("UnrealEd");
+			// Editor-only Nanite terrain lane (Milestone E): build transient Nanite UStaticMeshes
+			// per tile through the engine build path. The Nanite *encoder* (NaniteBuilder) is an
+			// editor-only Developer module, so this lane only exists in WITH_EDITOR targets; a
+			// packaged ship would use an offline bake or a fast static-relevance proxy instead.
+			PrivateDependencyModuleNames.AddRange(new string[] { "MeshDescription", "StaticMeshDescription" });
 		}
 
 		// Plugins/LogiBevy/Source/LogiBevyRuntime -> .../Plugins/LogiBevy -> <ProjectRoot>
@@ -79,10 +84,13 @@ public class LogiBevyRuntime : ModuleRules
 				PublicDelayLoadDLLs.Add("logi_terrain.dll");
 				RuntimeDependencies.Add("$(BinaryOutputDir)/logi_terrain.dll", TerrainDll);
 				PublicDefinitions.Add("LOGI_BEVY_HAVE_TERRAIN=1");
+				// Nanite terrain lane (E) compiles only in editor targets (NaniteBuilder is editor-only).
+				PublicDefinitions.Add("LOGI_TERRAIN_NANITE_LANE=" + (Target.bBuildEditor ? "1" : "0"));
 			}
 			else
 			{
 				PublicDefinitions.Add("LOGI_BEVY_HAVE_TERRAIN=0");
+				PublicDefinitions.Add("LOGI_TERRAIN_NANITE_LANE=0");
 			}
 		}
 		else
@@ -91,6 +99,7 @@ public class LogiBevyRuntime : ModuleRules
 			PublicDefinitions.Add("LOGI_BEVY_HAVE_RUST=0");
 			PublicDefinitions.Add("LOGI_BEVY_HAVE_EDITOR_INSPECTOR=0");
 			PublicDefinitions.Add("LOGI_BEVY_HAVE_TERRAIN=0");
+			PublicDefinitions.Add("LOGI_TERRAIN_NANITE_LANE=0");
 		}
 	}
 

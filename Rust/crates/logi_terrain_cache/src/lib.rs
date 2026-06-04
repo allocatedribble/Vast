@@ -54,6 +54,12 @@ impl<V> ResidencyCache<V> {
     pub fn bytes_used(&self) -> usize {
         self.bytes_used
     }
+    /// FIX 8: true when residency exceeds the budget — observable when a single entry is larger than
+    /// the whole budget (insert keeps it and the breach is otherwise silent). Does not change behavior.
+    #[inline]
+    pub fn over_budget(&self) -> bool {
+        self.bytes_used > self.budget
+    }
     #[inline]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -106,7 +112,8 @@ impl<V> ResidencyCache<V> {
 
         if let Some(old) = self.entries.remove(&id) {
             self.order.remove(&old.tick);
-            self.bytes_used -= old.bytes;
+            // FIX 7: saturate so a bookkeeping slip can't underflow the byte counter.
+            self.bytes_used = self.bytes_used.saturating_sub(old.bytes);
         }
 
         self.clock += 1;
@@ -126,10 +133,58 @@ impl<V> ResidencyCache<V> {
             }
             self.order.remove(&lru_tick);
             if let Some(e) = self.entries.remove(&lru_id) {
-                self.bytes_used -= e.bytes;
+                // FIX 7: saturate so a bookkeeping slip can't underflow the byte counter.
+                self.bytes_used = self.bytes_used.saturating_sub(e.bytes);
             }
             self.evictions += 1;
             evicted.push(lru_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tile(i: u32) -> TileId {
+        TileId::new(4, i, 0)
+    }
+
+    /// FIX 7: after an interleaved sequence of inserts, replaces, and budget-driven evictions, the
+    /// byte counter must equal the exact sum of the bytes of the entries still resident.
+    #[test]
+    fn bytes_used_tracks_resident_sum() {
+        let mut cache: ResidencyCache<u32> = ResidencyCache::with_budget(1000);
+        let mut evicted = Vec::new();
+
+        // Track the intended byte cost per id, then derive the resident set from what survived.
+        let inserts: [(u32, usize); 6] =
+            [(0, 300), (1, 300), (2, 300), (0, 250), (3, 400), (4, 200)];
+        let mut resident: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for &(id, bytes) in &inserts {
+            cache.insert(tile(id), id, bytes, &mut evicted);
+            resident.insert(id, bytes); // replace updates the cost
+            for ev in &evicted {
+                resident.remove(&ev.x);
+            }
+        }
+
+        let expected: usize = resident.values().sum();
+        assert_eq!(cache.bytes_used(), expected, "byte counter must equal sum of resident bytes");
+        assert_eq!(cache.len(), resident.len());
+        assert!(cache.bytes_used() <= cache.budget());
+        assert!(!cache.over_budget());
+    }
+
+    /// FIX 8: a single entry larger than the whole budget is kept; the breach is observable.
+    #[test]
+    fn oversized_single_insert_is_observable() {
+        let mut cache: ResidencyCache<u32> = ResidencyCache::with_budget(100);
+        let mut evicted = Vec::new();
+        cache.insert(tile(0), 0, 50, &mut evicted);
+        cache.insert(tile(1), 1, 500, &mut evicted); // alone exceeds the budget
+        assert!(cache.over_budget(), "oversized resident entry must report over_budget");
+        assert_eq!(cache.bytes_used(), 500, "only the oversized entry remains");
+        assert_eq!(cache.len(), 1);
     }
 }

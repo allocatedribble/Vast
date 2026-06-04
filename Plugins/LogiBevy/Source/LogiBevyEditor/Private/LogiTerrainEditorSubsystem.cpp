@@ -65,6 +65,12 @@ TSharedRef<SDockTab> ULogiTerrainEditorSubsystem::SpawnTab(const FSpawnTabArgs& 
 			[
 				HeaderText.ToSharedRef()
 			]
+			// Clarify the list below: it shows currently-drawn patches, not the (larger) resident
+			// cache count reported in the header — so the two numbers don't look contradictory.
+			+ SVerticalBox::Slot().AutoHeight().Padding(4.0f, 0.0f)
+			[
+				SNew(STextBlock).Text(LOCTEXT("TerrainListLabel", "Drawn patches (subset of resident cache):"))
+			]
 			+ SVerticalBox::Slot().FillHeight(1.0f)
 			[
 				SNew(SScrollBox)

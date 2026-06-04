@@ -278,6 +278,14 @@ pub extern "C" fn logi_world_tick(world: *mut LogiWorld, input: *const LogiFrame
 
 /// Fill `out_snapshot` with a borrowed view of a render snapshot. Pass
 /// `snapshot_id == 0` for the latest. View is valid until the next tick.
+///
+/// THREADING (§11): although this is a read, it MUST be called from the world's
+/// owner (game) thread — the same thread that calls `logi_world_tick`. The
+/// returned pointers borrow the published ring slot, which the owner thread
+/// rewrites/retires on the next tick; reading it from another thread races that
+/// mutation. This is not enforced here (no owner-thread check on the read path)
+/// because the C++ side already drives both tick and snapshot consumption from the
+/// game thread; the contract is the caller's to keep.
 #[no_mangle]
 pub extern "C" fn logi_world_get_render_snapshot(
 	world: *mut LogiWorld,

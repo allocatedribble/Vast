@@ -16,22 +16,24 @@ fn mix64(mut h: u64) -> u64 {
 }
 
 #[inline]
-fn lattice(xi: i64, zi: i64, seed: u64) -> f32 {
+fn lattice(xi: i64, zi: i64, seed: u64) -> f64 {
     let h = mix64(seed ^ (xi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (zi as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
-    // map to [-1, 1]
-    (h as f64 / u64::MAX as f64) as f32 * 2.0 - 1.0
+    // map to [-1, 1] (FIX 11: stay in f64)
+    (h as f64 / u64::MAX as f64) * 2.0 - 1.0
 }
 
 #[inline]
-fn smoothstep(t: f32) -> f32 {
+fn smoothstep(t: f64) -> f64 {
     t * t * (3.0 - 2.0 * t)
 }
 
-fn value_noise(x: f32, z: f32, seed: u64) -> f32 {
+// FIX 11: keep the lattice/floor/fractional math in f64 so the same world position yields the same
+// height at large coordinates (no f32 narrowing of scaled coords ⇒ crack-free borders).
+fn value_noise(x: f64, z: f64, seed: u64) -> f64 {
     let xi = x.floor() as i64;
     let zi = z.floor() as i64;
-    let xf = x - xi as f32;
-    let zf = z - zi as f32;
+    let xf = x - xi as f64;
+    let zf = z - zi as f64;
     let v00 = lattice(xi, zi, seed);
     let v10 = lattice(xi + 1, zi, seed);
     let v01 = lattice(xi, zi + 1, seed);
@@ -68,26 +70,38 @@ impl TerrainHeights {
         }
     }
 
-    /// Height at a world position (deterministic; bounded by ±amplitude).
-    pub fn height_at(&self, x: f64, z: f64) -> f32 {
+    /// Height at a world position in **full f64 precision** (deterministic; bounded by ±amplitude).
+    /// Prefer this over [`height_at`](Self::height_at) when *differencing* nearby samples (e.g. a
+    /// finite-difference surface normal): subtracting two near-equal heights that have each been
+    /// narrowed to f32 loses the small gradient to catastrophic cancellation (FIX L4).
+    pub fn height_at_f64(&self, x: f64, z: f64) -> f64 {
         let mut freq = self.base_frequency;
         let mut amp = 1.0_f64;
         let mut sum = 0.0_f64;
         let mut norm = 0.0_f64;
         for o in 0..self.octaves {
             let s = self.seed.wrapping_add((o as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let n = value_noise((x * freq) as f32, (z * freq) as f32, s) as f64;
+            // FIX 11: pass full-precision f64 scaled coords (no f32 narrowing) into the noise.
+            let n = value_noise(x * freq, z * freq, s);
             sum += n * amp;
             norm += amp;
             freq *= self.lacunarity;
             amp *= self.gain;
         }
-        ((sum / norm.max(1e-9)) * self.amplitude) as f32
+        (sum / norm.max(1e-9)) * self.amplitude
+    }
+
+    /// Height at a world position (deterministic; bounded by ±amplitude).
+    #[inline]
+    pub fn height_at(&self, x: f64, z: f64) -> f32 {
+        self.height_at_f64(x, z) as f32
     }
 
     /// Sample a [`HeightPage`] of `res` x `res` over `[origin, origin + size]`, **edge-inclusive**, so a
     /// neighbor tile sharing an edge samples identical world positions ⇒ matching border heights.
     pub fn height_page(&self, origin_x: f64, origin_z: f64, size: f64, res: u16) -> HeightPage {
+        // FIX 12: downstream height_mesh requires >=2 samples per edge (it builds quads).
+        assert!(res >= 2, "height page needs >=2 samples per edge");
         let n = res as usize;
         let step = size / (res as f64 - 1.0).max(1.0);
         let mut heights = Vec::with_capacity(n * n);

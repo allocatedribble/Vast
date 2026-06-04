@@ -54,7 +54,7 @@ impl Terrain {
 	/// full tile -> ECEF rebasing lives in the renderer-facing terrain FFI; gameplay
 	/// uses this flat coarse field). Height is returned in Unreal cm.
 	pub fn sample_surface(&self, _tile: LogiTileId, world_x: f64, world_y: f64) -> TerrainSample {
-		let height_m = f64::from(self.heights.height_at(world_x, world_y));
+		let height_m = self.heights.height_at_f64(world_x, world_y);
 		TerrainSample {
 			height_cm: height_m * 100.0,
 			normal: self.surface_normal(world_x, world_y),
@@ -73,8 +73,10 @@ impl Terrain {
 	/// Surface normal via central finite differences of the height field.
 	fn surface_normal(&self, x: f64, y: f64) -> Vec3 {
 		const E: f64 = 1.0; // 1-metre epsilon
-		let dhx = f64::from(self.heights.height_at(x + E, y) - self.heights.height_at(x - E, y)) / (2.0 * E);
-		let dhy = f64::from(self.heights.height_at(x, y + E) - self.heights.height_at(x, y - E)) / (2.0 * E);
+		// FIX L4: difference in f64 (height_at_f64), not the f32 height_at — subtracting two near-equal
+		// large heights narrowed to f32 first loses the small gradient to catastrophic cancellation.
+		let dhx = (self.heights.height_at_f64(x + E, y) - self.heights.height_at_f64(x - E, y)) / (2.0 * E);
+		let dhy = (self.heights.height_at_f64(x, y + E) - self.heights.height_at_f64(x, y - E)) / (2.0 * E);
 		let (nx, ny, nz) = (-dhx as f32, -dhy as f32, 1.0_f32);
 		let len = (nx * nx + ny * ny + nz * nz).sqrt();
 		Vec3::new(nx / len, ny / len, nz / len)

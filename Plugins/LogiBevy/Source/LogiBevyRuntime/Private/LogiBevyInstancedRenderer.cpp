@@ -63,6 +63,7 @@ void FLogiInstancedRenderer::Shutdown()
 	HostActor.Reset();
 	Buckets.Reset();
 	EntityToSlot.Reset();
+	AssetRegistry = nullptr; // borrowed; clear so a stale ptr is never read post-shutdown
 	World.Reset();
 }
 
@@ -89,7 +90,7 @@ UInstancedStaticMeshComponent* FLogiInstancedRenderer::GetOrCreateComponent(cons
 	// fall back to the engine cube so the bucket is always visible.
 	UStaticMesh* Mesh = nullptr;
 	UMaterialInterface* Material = nullptr;
-	if (ULogiBevyAssetRegistry* Reg = AssetRegistry.Get())
+	if (ULogiBevyAssetRegistry* Reg = AssetRegistry)
 	{
 		Mesh = Reg->ResolveStaticMesh(Key.Mesh);
 		Material = Reg->ResolveMaterial(Key.Material);
