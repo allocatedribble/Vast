@@ -1,0 +1,52 @@
+name: Rust CI
+
+# Gates the headless Rust simulation workspace under Rust/ (the gameplay authority — bevy_ecs, no
+# Unreal). The Unreal/C++ bridge is built separately with UE 5.8 + UBT and is NOT covered here.
+#
+# Runs on Linux because the workspace is platform-agnostic (bevy_ecs/serde/url/glam/ureq); the shipping
+# target is x86_64-pc-windows-msvc, validated via the editor build rather than this gate. The toolchain
+# is pinned to the dev nightly so a new nightly's lints can't silently turn the `-D warnings` gate red.
+
+on:
+  push:
+    branches: [main]
+    paths: ['Rust/**', '.github/workflows/rust.yml']
+  pull_request:
+    paths: ['Rust/**', '.github/workflows/rust.yml']
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt-clippy-test:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Rust
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false # the Rust gate needs no binary Content assets (examples compile but don't run)
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # Keep in sync with the dev toolchain (see AGENTS.md § Environment). Bump deliberately.
+          toolchain: nightly-2026-05-04
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: Rust
+
+      - name: Formatting (rustfmt.toml)
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --all
