@@ -1,0 +1,13 @@
+# Workspace formatting standard — used by `cargo fmt --all` and `cargo fmt --check` (CI).
+#
+# Indentation: 4 spaces (`hard_tabs = false`, the Rust default). The workspace was historically
+# MIXED — the Bevy-ECS gameplay-authority crates (logi_ffi, logi_runtime, logi_sim,
+# logi_render_extract, logi_schema) used hard tabs, while the terrain kernel + 3D-Tiles crates used
+# spaces — and was standardized on spaces (the dominant ~77% of the code and the Rust ecosystem default).
+#
+# `max_width = 120` matches the codebase's existing wide style (only ~19 lines exceeded it), so the
+# one-shot reformat reflows almost no code beyond the tab→space conversion.
+edition = "2021"
+hard_tabs = false
+tab_spaces = 4
+max_width = 120
