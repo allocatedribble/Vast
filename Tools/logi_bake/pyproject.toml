@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "logi-bake"
+version = "0.1.0"
+description = "Offline semantic-tile bake for LogiUE (ADR-0011) — turns real-world data into enriched .lst tiles."
+requires-python = ">=3.11"
+dependencies = []  # the synthetic/HE-0 path is stdlib-only and deterministic.
+
+# Real-data stages are optional extras so the package imports + the synthetic path runs without them.
+[project.optional-dependencies]
+lidar = ["pdal>=3.2", "laspy>=2.5", "rasterio>=1.3", "pyproj>=3.6", "numpy>=1.26"]
+vector = ["geopandas>=0.14", "shapely>=2.0", "osmnx>=1.9"]
+trees = ["deepforest>=1.4", "scikit-image>=0.22"]
+materials = ["torch>=2.2", "diffusers>=0.27"]
+dev = ["pytest>=8", "ruff>=0.4", "mypy>=1.10"]
+
+[project.scripts]
+logi-bake = "logi_bake.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/logi_bake"]
+
+# Standards (plan §8): strict typing + lint. Run in CI; the synthetic path is fully typed.
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/logi_bake"]

@@ -35,6 +35,8 @@ members = [
 	"crates/logi_collada",
 	"crates/logi_3dtiles_scene",
 	"crates/logi_3dtiles_ion",
+	# Semantic tile enrichment (ADR-0011): baked-tile-store reader + render meshing.
+	"crates/logi_semantic",
 ]
 
 [workspace.package]

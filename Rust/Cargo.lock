@@ -1023,6 +1023,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "logi_semantic"
+version = "0.1.0"
+dependencies = [
+ "logi_3dtiles_io",
+ "logi_geospatial",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "logi_sim"
 version = "0.1.0"
 dependencies = [
@@ -1060,6 +1071,7 @@ version = "0.1.0"
 dependencies = [
  "logi_3dtiles_io",
  "logi_3dtiles_scene",
+ "logi_semantic",
  "logi_terrain_core",
  "logi_terrain_scene",
 ]

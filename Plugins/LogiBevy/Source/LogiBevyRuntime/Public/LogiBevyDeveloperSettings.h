@@ -7,6 +7,15 @@
 #include "LogiBevyDeveloperSettings.generated.h"
 
 class ULogiBevyAssetRegistry;
+class UMaterialInterface;
+
+/** HE-0 baked-terrain meshing toggle (ADR-0011 / terrain-representation research). */
+UENUM(BlueprintType)
+enum class EBakedTerrainMeshing : uint8
+{
+	Uniform UMETA(DisplayName = "Uniform grid"),
+	TIN     UMETA(DisplayName = "Adaptive TIN")
+};
 
 /**
  * Project settings for the LogiBevy simulation (Project Settings -> Plugins ->
@@ -145,4 +154,40 @@ public:
 	/** Disk-cache size budget in GB (oldest tiles LRU-evicted past this). */
 	UPROPERTY(EditAnywhere, config, Category = "3D Tiles (Milestone F)", meta = (DisplayName = "Globe Disk Cache Budget (GB)", ClampMin = 1, ClampMax = 2048, EditCondition = "bGlobeDiskCache"))
 	int32 GlobeCacheBudgetGB = 20;
+
+	/** HE-0 (ADR-0011): load an offline-baked TERRAIN tile store (the Tools/logi_bake output) via the Rust
+	 *  logi_baked_* FFI and draw each tile as a procedural-mesh section. Off by default. HE-0 serves the
+	 *  whole AOI statically (no camera streaming yet). */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Show Baked Terrain"))
+	bool bShowBakedTerrain = false;
+
+	/** Baked tile-store directory. A relative path resolves under <Project>/Saved (e.g. "LogiTiles/hero",
+	 *  the default `python -m logi_bake bake` output); an absolute path is used as-is. */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Baked Tile Store Dir"))
+	FString BakedTileStoreDir = TEXT("LogiTiles/hero");
+
+	/** Meshing toggle: Uniform grid, or adaptive TIN (fewer triangles on flats, dense on slopes). Selected
+	 *  in Rust at world creation via logi_baked_world_create's LogiBakedCreateInfo. */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Baked Terrain Meshing"))
+	EBakedTerrainMeshing BakedTerrainMeshing = EBakedTerrainMeshing::Uniform;
+
+	/** TIN max vertical error (metres): higher = fewer triangles. Ignored for Uniform meshing. */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Baked Terrain TIN Error (m)", ClampMin = 0.0, EditCondition = "BakedTerrainMeshing == EBakedTerrainMeshing::TIN"))
+	float BakedTerrainTinErrorM = 1.0f;
+
+	/** Apply a DISPLACEMENT material to the baked terrain for first-person micro-detail. For true Nanite
+	 *  tessellation the material must enable Nanite displacement AND the mesh must ride the Nanite
+	 *  static-mesh lane (ADR-0008, editor-only); on the current proc-mesh lane the material's
+	 *  displacement / World Position Offset is used as supported. */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Baked Terrain Nanite Displacement"))
+	bool bBakedTerrainNaniteDisplacement = false;
+
+	/** Displacement material applied when the toggle above is on (a MID is created and its
+	 *  "DisplacementScale" scalar parameter set). Author it with Nanite tessellation displacement enabled. */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Baked Terrain Displacement Material", EditCondition = "bBakedTerrainNaniteDisplacement"))
+	TSoftObjectPtr<UMaterialInterface> BakedTerrainDisplacementMaterial;
+
+	/** Displacement magnitude (cm) fed to the material's "DisplacementScale" parameter. */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Baked Terrain Displacement Scale (cm)", ClampMin = 0.0, EditCondition = "bBakedTerrainNaniteDisplacement"))
+	float BakedTerrainDisplacementScale = 20.0f;
 };

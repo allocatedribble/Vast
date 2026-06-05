@@ -8,6 +8,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod ffi;
+// HE-0 (ADR-0011): additive C ABI for the baked semantic-tile world. Separate module; does not touch the
+// terrain `LogiFramePacket` ABI (v3) — new symbols only, like the globe/building additions.
+pub mod ffi_baked;
 
 /// ABI version of the C boundary. Unity must verify `logi_terrain_abi_version()` matches before any other call.
 /// v2 = the `LogiTerrainWorld` runtime model (was v1 `logi_kernel_*`).

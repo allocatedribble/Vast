@@ -1,0 +1,21 @@
+[package]
+name = "logi_semantic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# WIP: the future voxel terrain lane (dual contouring / SDF). Off by default — compiles a skeleton only.
+voxel = []
+
+[dependencies]
+# The fetch contract BakedTileSource implements (RequestId / Loaded / TileContentSource).
+logi_3dtiles_io = { path = "../logi_3dtiles_io" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Cross-check that the bake's manifest origin ECEF matches the engine's geodesy (Python↔Rust agreement).
+logi_geospatial = { path = "../logi_geospatial" }

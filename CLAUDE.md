@@ -31,6 +31,11 @@ See [`AGENTS.md`](AGENTS.md) § 1 and [ADR-0005](Docs/Architecture/ADR-0005-Bevy
   glTF/quantized-mesh decode in Rust; reuses the kernel core; one vendored-Draco FFI exception; streams
   from Cesium ion). Implements ADR-0007's Cesium provider; plan in
   [Docs/Plans/Milestone-F-3DTiles-Rust-Stack.md](Docs/Plans/Milestone-F-3DTiles-Rust-Stack.md).
+- [ADR-0011 — Semantic Tile Enrichment](Docs/Architecture/ADR-0011-Semantic-Tile-Enrichment.md) — **offline
+  bake** that turns real-world data into our own enriched tiles (terrain / trees / foliage / water /
+  param-procedural buildings) over the ADR-0009 path. ML stays offline; the runtime stays lean; render data
+  is non-authoritative (promote to coarse for gameplay, ADR-0007). Subsumes the reserved ADR-0010 (foliage).
+  Plan in [Docs/Plans/Hero-Location-Semantic-Enrichment.md](Docs/Plans/Hero-Location-Semantic-Enrichment.md).
 - [ADR-0001 — Mass-First Unreal](Docs/Architecture/ADR-0001-Mass-First-Unreal.md) — **superseded in part**
   by ADR-0005. Its Determinism section and the "Unreal is a shell" principle still hold.
 - [ADR-0002 — Rust Terrain Kernel](Docs/Architecture/ADR-0002-Rust-Terrain-Kernel.md) — terrain truth in

@@ -1,0 +1,15 @@
+# Python build / test artifacts (the bake is stdlib-run; no venv committed)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Bake outputs go to <Project>/Saved/LogiTiles (gitignored); never under Tools/
+cache/

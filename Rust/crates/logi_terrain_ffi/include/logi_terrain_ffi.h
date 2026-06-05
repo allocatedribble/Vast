@@ -277,6 +277,45 @@ LogiStatus      logi_globe_world_step(LogiGlobeWorld* world,
 uint64_t        logi_globe_world_cached_bytes(const LogiGlobeWorld* world); /* disk-cache resident bytes (telemetry) */
 void            logi_globe_world_destroy(LogiGlobeWorld* world);
 
+/* --- Baked semantic-tile world (ADR-0011, Milestone HE-0) — additive; see src/ffi_baked.rs. Opens an
+ * offline-baked tile store (the Tools/logi_bake output) and returns every tile's mesh in Unreal render
+ * space (cm, Z-up LH) as zero-copy views valid until destroy. HE-0 = terrain only, whole AOI served
+ * statically (no camera streaming yet). New symbols only — the terrain LogiFramePacket ABI is unchanged. --- */
+
+typedef struct LogiBakedWorld LogiBakedWorld; /* opaque */
+
+typedef struct LogiBakedTile {
+    uint64_t       tile_key;          /* stable TileId key — the C++ section-cache key */
+    const uint8_t* vertices;          /* vertex_count * 32-byte vertices (pos f3 | normal f3 | uv f2), UE cm */
+    uint64_t       vertices_len;
+    uint32_t       vertex_count;
+    uint32_t       vertex_stride;     /* = 32 */
+    const uint8_t* indices;           /* index_count little-endian uint32 indices */
+    uint32_t       index_count;
+    uint32_t       _pad;
+    float          bounds_center[3];  /* UE render space (cm) */
+    float          bounds_radius;
+} LogiBakedTile;
+
+typedef struct LogiBakedFrame {
+    const LogiBakedTile* tiles;       /* -> world-owned array, valid until logi_baked_world_destroy */
+    uint32_t             tile_count;
+    uint32_t             _pad;
+    double               origin_ecef[3]; /* ENU origin's WGS84 ECEF (metres) — globe/atmosphere placement */
+} LogiBakedFrame;
+
+typedef struct LogiBakedCreateInfo {
+    uint32_t meshing_mode;     /* the meshing toggle: 0 = uniform grid, 1 = adaptive TIN */
+    float    tin_max_error_m;  /* TIN max vertical error (metres); ignored when uniform */
+} LogiBakedCreateInfo;
+
+/* Open a baked store directory (UTF-8 path) with the meshing mode in `info` (NULL = uniform). Blocking
+ * (reads + triangulates the AOI) — call off the render thread. Returns NULL on a null/non-UTF-8 path or an
+ * open/decode failure. */
+LogiBakedWorld* logi_baked_world_create(const char* store_dir_utf8, const LogiBakedCreateInfo* info);
+LogiStatus      logi_baked_world_get_frame(const LogiBakedWorld* world, LogiBakedFrame* out_frame);
+void            logi_baked_world_destroy(LogiBakedWorld* world);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
