@@ -205,6 +205,10 @@ void ULogiBevyRepresentationSubsystem::TickRepresentation(float DeltaTime)
 		AnimationBridge->ApplyActorUpdate(Update);
 	}
 
+	// Flush all deferred ISM render-state dirties once per touched component (audit H4): despawns and
+	// bucket switches hid their instances WITHOUT a per-instance MarkRenderStateDirty.
+	InstancedRenderer->FlushDirty();
+
 	Telemetry->RecordFrame(InstancedRenderer->LiveInstanceCount(), ActorPool->AssignedCount(), Sim->GetSimTick());
 
 	// §11 thread-safety policy: representation only READS the published snapshot

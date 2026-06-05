@@ -45,6 +45,16 @@ fn value_noise(x: f64, z: f64, seed: u64) -> f64 {
     a + (b - a) * sz
 }
 
+/// **Canonical terrain seed** — the SINGLE SOURCE OF TRUTH for which world the terrain *is*, shared
+/// by BOTH the gameplay sampler (`logi_sim`) and the render scene (`logi_terrain_scene`). Build the
+/// shared field via [`TerrainHeights::canonical`]; never hardcode a different seed in one consumer,
+/// or the gameplay ground and the rendered ground describe different surfaces (agents float).
+pub const DEFAULT_SEED: u64 = 0xA11CE;
+
+/// **Canonical peak relief in metres** — the field is bounded to ±this. Both the height generation
+/// and the renderer's screen-space-error estimate must use this one value (do not override per crate).
+pub const DEFAULT_AMPLITUDE_M: f64 = 250.0;
+
 /// Deterministic fractal terrain height field over world coordinates.
 #[derive(Clone, Copy, Debug)]
 pub struct TerrainHeights {
@@ -63,11 +73,17 @@ impl TerrainHeights {
         Self {
             seed,
             base_frequency: 1.0 / 2048.0,
-            amplitude: 400.0,
+            amplitude: DEFAULT_AMPLITUDE_M,
             octaves: 5,
             lacunarity: 2.0,
             gain: 0.5,
         }
+    }
+
+    /// The **canonical shared terrain field** ([`DEFAULT_SEED`] + the default params). BOTH the sim
+    /// sampler and the renderer must construct via this so they describe the exact same surface.
+    pub fn canonical() -> Self {
+        Self::new(DEFAULT_SEED)
     }
 
     /// Height at a world position in **full f64 precision** (deterministic; bounded by ±amplitude).

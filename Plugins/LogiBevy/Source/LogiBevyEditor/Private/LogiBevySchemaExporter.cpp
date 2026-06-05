@@ -21,6 +21,11 @@ bool FLogiBevySchemaExporter::ExportScenario(const ULogiBevyScenarioAsset* Scena
 			Spawn.RecipeId, Spawn.Position.X, Spawn.Position.Y, Spawn.Position.Z, Spawn.Count));
 	}
 
+	// NOTE (audit): this is a WRITE-ONLY authoring export — no Rust deserializer reads it yet, and these
+	// JSON keys (`high_res_actors`, `terrain_world_config`, …) do NOT match the Rust `WorldConfig` /
+	// `LogiInitDesc` field names (`high_res_actor_budget`, …). When a Rust scenario loader is added, make it
+	// the single source of truth (serialize FROM the Rust types) and keep these keys in sync — otherwise
+	// this silently drifts from whatever finally consumes it.
 	const FString Json = FString::Printf(
 		TEXT("{\n")
 		TEXT("  \"seed\": %lld,\n")

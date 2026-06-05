@@ -10,7 +10,7 @@
 //! - there is always something correct to render (the root ancestor is pinned),
 //! - steady-state streaming allocates nothing (all per-frame buffers are reused).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use logi_terrain_cache::ResidencyCache;
 use logi_terrain_core::{DVec3, Telemetry, TileId, Vec3};
@@ -19,7 +19,7 @@ use logi_terrain_lod::desired_level;
 pub mod culling;
 pub mod scheduler;
 use culling::{Frustum, HorizonCuller};
-use scheduler::{EvalContext, PageState, PriorityTerms, QueueClass, StreamingBudgets, QUEUE_COUNT};
+use scheduler::{EvalContext, PriorityTerms, QueueClass, StreamingBudgets, QUEUE_COUNT};
 
 /// A streamed page payload. (Phase 0: just its byte size; later, a decoded-mesh handle.)
 #[derive(Clone, Copy)]
@@ -194,7 +194,7 @@ impl World {
 /// Streaming engine configuration.
 pub struct StreamConfig {
     pub budget_bytes: usize,
-    pub max_in_flight: usize,
+    pub max_in_flight: usize, // construction seed for budgets.max_inflight_requests (the live cap); not read after new()
     pub window_radius: u32,
     pub sse_target_pixels: f64,
     pub fov_y_radians: f64,
@@ -224,7 +224,6 @@ pub struct StreamEngine<P: Provider> {
 
     // Scheduler (scheduler-design.md §6).
     budgets: StreamingBudgets,
-    states: HashMap<TileId, PageState>,
     candidates: Vec<(TileId, PriorityTerms, QueueClass)>,
     candidate_seen: HashSet<TileId>,
     queue_counts: [u32; QUEUE_COUNT],
@@ -241,6 +240,14 @@ pub struct StreamEngine<P: Provider> {
     // View-aware selection scratch (culling.rs §2.3).
     select_stack: Vec<TileId>,
     last_select_capped: bool,
+
+    // Refine-decision hysteresis (anti-thrash): the internal (refined) node set from the previous
+    // select pass. A tile near the SSE target keeps last frame's refine/coarsen state until SSE leaves
+    // a dead-band below the target, so sub-metre camera jitter can't flip a parent<->4-children swap
+    // (which churns tile ids and forces the C++ Nanite lane to re-encode). `cur_refined` accumulates
+    // this pass; the two are swapped at the end of select_hierarchical. (Empty => old stateless behavior.)
+    prev_refined: HashSet<TileId>,
+    cur_refined: HashSet<TileId>,
 }
 
 impl<P: Provider> StreamEngine<P> {
@@ -266,7 +273,6 @@ impl<P: Provider> StreamEngine<P> {
             renderable: Vec::new(),
             renderable_set: HashSet::new(),
             budgets,
-            states: HashMap::new(),
             candidates: Vec::new(),
             candidate_seen: HashSet::new(),
             queue_counts: [0; QUEUE_COUNT],
@@ -279,6 +285,8 @@ impl<P: Provider> StreamEngine<P> {
             view_up: DVec3::new(0.0, 1.0, 0.0),
             select_stack: Vec::new(),
             last_select_capped: false,
+            prev_refined: HashSet::new(),
+            cur_refined: HashSet::new(),
         }
     }
 
@@ -300,7 +308,8 @@ impl<P: Provider> StreamEngine<P> {
         // FIX L3: apply the EXACT byte budget, not the MB-rounded field — otherwise
         // `set_budgets(budgets())` would floor a sub-MB / non-MB-aligned cache budget on every round-trip.
         self.cache.set_budget(budgets.total_cpu_cache_bytes as usize);
-        self.cfg.max_in_flight = budgets.max_inflight_requests as usize;
+        // `budgets.max_inflight_requests` is the single live in-flight cap (the request gate reads it);
+        // cfg.max_in_flight is only the construction seed, so don't shadow-write it here.
     }
     /// Per-frame request counts by [`QueueClass`] (index = `queue as usize`).
     pub fn queue_counts(&self) -> [u32; QUEUE_COUNT] {
@@ -310,14 +319,11 @@ impl<P: Provider> StreamEngine<P> {
     pub fn last_priority_terms(&self) -> PriorityTerms {
         self.last_top_terms
     }
-    pub fn page_state(&self, tile: &TileId) -> PageState {
-        self.states.get(tile).copied().unwrap_or(PageState::Unknown)
-    }
 
     /// Re-budget the engine at runtime (memory budget + in-flight cap).
     pub fn set_budget(&mut self, budget_bytes: usize, max_in_flight: usize) {
         self.cache.set_budget(budget_bytes);
-        self.cfg.max_in_flight = max_in_flight;
+        // budgets.max_inflight_requests (derived here) is the live cap; cfg.max_in_flight is seed-only.
         self.budgets = StreamingBudgets::from_cache(budget_bytes, max_in_flight as u32);
     }
 
@@ -350,16 +356,13 @@ impl<P: Provider> StreamEngine<P> {
         if sse_target_pixels > 0.0 {
             self.view_sse_target_pixels = sse_target_pixels;
         }
-        // FIX 6: guard against a zero/negative viewport or FOV so aspect/SSE math never divides by zero.
-        if !(self.view_viewport_height > 0.0) {
-            self.view_viewport_height = 1080.0;
-        }
-        if !(self.view_viewport_width > 0.0) {
-            self.view_viewport_width = self.view_viewport_height;
-        }
-        if !(self.view_fov_y_radians > 0.0) {
-            self.view_fov_y_radians = 1.0;
-        }
+        // FIX 6: guard against a zero/negative/NaN viewport or FOV so aspect/SSE math never divides by
+        // zero. The positive `> 0.0` test also rejects NaN (every comparison with NaN is false → the
+        // default is taken), and reads cleaner than the `!(x > 0.0)` form.
+        let positive_or = |v: f64, default: f64| if v > 0.0 { v } else { default };
+        self.view_viewport_height = positive_or(self.view_viewport_height, 1080.0);
+        self.view_viewport_width = positive_or(self.view_viewport_width, self.view_viewport_height);
+        self.view_fov_y_radians = positive_or(self.view_fov_y_radians, 1.0);
     }
 
     /// The current desired set (visible, SSE-appropriate tiles). For tests/inspection.
@@ -386,12 +389,25 @@ impl<P: Provider> StreamEngine<P> {
         &mut self,
         world: &World,
         camera: DVec3,
+        motion: DVec3,
         frustum: &Frustum,
         horizon: &HorizonCuller,
     ) {
-        const MAX_SELECTED: usize = 8192;
+        // Per-frame selection ceiling. Kept == the resident-tile budget (logi_terrain_scene
+        // MESH_CACHE_CAP) and the C++ renderer caps (MaxSections/MaxNaniteTiles) so the whole pipeline
+        // agrees on one number: kernel selects <= this, the mesh cache holds them, the renderer draws
+        // them. ~2x the observed peak (~1930); raise all three together if a busy view truncates.
+        const MAX_SELECTED: usize = 4096;
         self.last_select_capped = false;
+        // Refine hysteresis dead-band as a fraction of the SSE target: once refined, a tile coarsens
+        // only when SSE drops below target/(1+H); a coarse tile still refines at the target. So a tile
+        // straddling the target holds its state instead of flip-flopping parent<->children every time
+        // sub-metre camera motion nudges SSE across the line (each flip swaps a parent tile id for 4
+        // child ids => the C++ Nanite lane sees "new" tiles and re-encodes). ~matches logi_sim agent-LOD
+        // hysteresis. Selection is display-only (non-authoritative), so per-frame state is fine here.
+        const SSE_HYSTERESIS: f64 = 0.25;
         self.select_stack.clear();
+        self.cur_refined.clear();
         self.select_stack.push(TileId::root());
         while let Some(node) = self.select_stack.pop() {
             let (center, radius) = world.tile_bounds(node);
@@ -404,15 +420,30 @@ impl<P: Provider> StreamEngine<P> {
                 // FIX L1: overflow-safe geometric-error halving (matches logi_terrain_lod FIX 5) —
                 // `1u64 << level` would overflow past level 63; `0.5^level` cannot.
                 let ge = world.base_geometric_error * 0.5f64.powi(node.level as i32);
-                let dist = camera.distance(center).max(1.0);
-                logi_terrain_lod::screen_space_error(
+                // Predictive prefetch: bias the LOD distance toward where the camera is heading so tiles
+                // in the path refine (stream + encode) ~prefetch_lead frames early instead of popping to
+                // fine detail on arrival. min(current, future): approaching => the nearer future distance
+                // (refine early); receding/static (motion≈0 => future==current) => unchanged.
+                let future = camera + motion * self.cfg.prefetch_lead;
+                let dist = camera.distance(center).min(future.distance(center)).max(1.0);
+                let sse = logi_terrain_lod::screen_space_error(
                     ge,
                     dist,
                     self.view_fov_y_radians,
                     self.view_viewport_height,
-                ) > self.view_sse_target_pixels
+                );
+                // Bias the threshold by last frame's decision: a refined tile holds until SSE falls a
+                // dead-band below target; a coarse tile refines at the target (so a fresh engine with an
+                // empty prev_refined reproduces the old stateless threshold exactly).
+                let threshold = if self.prev_refined.contains(&node) {
+                    self.view_sse_target_pixels / (1.0 + SSE_HYSTERESIS)
+                } else {
+                    self.view_sse_target_pixels
+                };
+                sse > threshold
             };
             if refine {
+                self.cur_refined.insert(node); // remember for next frame's hysteresis bias
                 for child in node.children() {
                     self.select_stack.push(child);
                 }
@@ -424,6 +455,8 @@ impl<P: Provider> StreamEngine<P> {
                 }
             }
         }
+        // This pass's refined set becomes next pass's hysteresis reference.
+        std::mem::swap(&mut self.prev_refined, &mut self.cur_refined);
     }
 
     /// HARNESS-ONLY (the `!has_view()` stress path): uses `camera.y.abs()` as the viewing distance.
@@ -457,17 +490,21 @@ impl<P: Provider> StreamEngine<P> {
         self.tick += 1;
         self.telemetry.frames += 1;
 
-        // 1. Ingest completed fetches into the bounded cache.
+        // 1. Ingest completed fetches into the bounded byte cache. Each insert may evict the LRU resident
+        //    tiles to stay under `budget_bytes`; the evicted ids land in `self.evicted` (per-insert) and the
+        //    running total is surfaced as `telemetry.evictions` (step 4, mirrored from `cache.evictions`).
+        //    OPERATIONAL NOTE (audit H6): if `budget_bytes` is smaller than the peak *desired* working set,
+        //    a tile can be fetched here, evicted by a later insert in the same frame, then re-requested in
+        //    step 3b next frame — a re-fetch thrash that silently burns the promote/network budget. The
+        //    signature is `telemetry.evictions` climbing in lock-step with `requests_issued`; size
+        //    `budget_bytes` to hold a full desired set (the mesh cache guarantees this via
+        //    MESH_CACHE_CAP >= MAX_SELECTED, but the byte budget is caller-configured and not auto-clamped).
         self.provider.poll_completed(self.tick, &mut self.completed);
         for i in 0..self.completed.len() {
             let (id, bytes) = self.completed[i];
             self.cache.insert(id, Page { size_bytes: bytes }, bytes, &mut self.evicted);
             self.in_flight.remove(&id);
-            self.states.insert(id, PageState::DecodedResident);
             self.telemetry.requests_completed += 1;
-            for k in 0..self.evicted.len() {
-                self.states.remove(&self.evicted[k]);
-            }
         }
 
         // 2. Desired set. With a live camera basis: view-aware hierarchical selection (frustum +
@@ -498,7 +535,7 @@ impl<P: Provider> StreamEngine<P> {
                 far,
             );
             let horizon = HorizonCuller::flat();
-            self.select_hierarchical(world, camera, &frustum, &horizon);
+            self.select_hierarchical(world, camera, motion, &frustum, &horizon);
         } else {
             let level = self.pick_level(world, camera);
             self.add_desired_window(world, camera.x, camera.z, level);
@@ -549,7 +586,6 @@ impl<P: Provider> StreamEngine<P> {
                 }
                 if self.renderable_set.insert(chosen) {
                     self.renderable.push(chosen);
-                    self.states.insert(chosen, PageState::Visible);
                 }
             }
         }
@@ -576,7 +612,6 @@ impl<P: Provider> StreamEngine<P> {
             }
             self.provider.request(tile, self.tick);
             self.in_flight.insert(tile);
-            self.states.insert(tile, PageState::Requesting);
             self.queue_counts[queue as usize] += 1; // FIX 3: count after the budget gate = requests issued
             self.telemetry.requests_issued += 1;
             promoted += 1;

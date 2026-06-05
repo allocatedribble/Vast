@@ -24,6 +24,17 @@ members = [
 	"crates/logi_terrain_scene",
 	"crates/logi_terrain_ffi",
 	"crates/logi_terrain_tools",
+	# 3D Tiles / real-world terrain stack (Milestone F, ADR-0009).
+	"crates/logi_geospatial",
+	"crates/logi_qmesh",
+	"crates/logi_3dtiles_tileset",
+	"crates/logi_3dtiles_implicit",
+	"crates/logi_3dtiles_select",
+	"crates/logi_gltf",
+	"crates/logi_3dtiles_io",
+	"crates/logi_collada",
+	"crates/logi_3dtiles_scene",
+	"crates/logi_3dtiles_ion",
 ]
 
 [workspace.package]
@@ -36,6 +47,7 @@ bevy_ecs = "0.18.1"
 bevy_tasks = "0.18.1"
 bevy_app = "0.18.1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 glam = "0.30"

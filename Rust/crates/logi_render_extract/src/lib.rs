@@ -10,16 +10,20 @@
 //! [`build_ffi_batches`]), owned by the non-resource runtime.
 
 use bevy_ecs::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use logi_schema::{LogiAnimationParams, LogiAssetHandle, LogiEntityId, RepresentationTier};
 use logi_sim::components::{AnimationDrive, Renderable, Representation, StableId, Transform3d};
 use logi_sim::resources::{SimClock, UnrealFrameInput};
 
-/// Local-frame rebase origin quantum, in world centimetres (256 m). The primary
+/// Agent-render rebase origin quantum, in world centimetres (256 m). The primary
 /// camera position is snapped to this grid before it becomes `world_origin_cm`
 /// (audit H3): retained instances only re-bake when the camera crosses a cell,
 /// instead of drifting every frame as a continuous camera position would force.
+/// Deliberately FINE (256 m) — small per-agent transforms need tight f32 precision
+/// near the camera. (Contrast the much coarser TERRAIN rebase grid,
+/// logi_terrain_scene REBASE_SNAP = 2048 m: big terrain tiles tolerate a far origin,
+/// so a wide grid means rarer rebuilds. Different precision needs, different grids.)
 pub const ORIGIN_GRID_CM: f64 = 25_600.0;
 
 /// Snap a world-cm position to the [`ORIGIN_GRID_CM`] lattice, per axis.
@@ -129,7 +133,10 @@ impl RenderSnapshotResource {
 	/// on a dropped frame this is skipped so the same retirements / origin-rebase
 	/// are recomputed and retried on the next published frame.
 	pub fn commit(&mut self) {
-		self.rendered.clone_from(&self.pending_rendered);
+		// Swap rather than clone: `rendered` takes the freshly computed set in O(1) and the old set lands
+		// in `pending_rendered`, which the next extract clears before refilling. (audit: a `clone_from`
+		// re-hashed/copied up to ~100k ids on every published frame.)
+		std::mem::swap(&mut self.rendered, &mut self.pending_rendered);
 		self.committed_origin_cm = self.world_origin_cm;
 		self.origin_seeded = true;
 		self.force_full_reextract = false;
@@ -216,11 +223,16 @@ pub fn transform_to_3x4(t: &Transform3d, origin_cm: [f64; 3]) -> [f32; 12] {
 /// rendered set is needed every frame regardless of what changed.
 // The render-component tuple is inherently wide; a `type` alias would hurt
 // readability more than it helps (idiomatic for Bevy systems).
+/// Scratch element used to group ISM instances before segmentation: (mesh, material, lod, instance).
+type GroupEntry = (LogiAssetHandle, LogiAssetHandle, u32, LogiInstanceUpdate);
+
 #[allow(clippy::type_complexity)]
 pub fn extract_render_snapshot(
 	clock: Res<SimClock>,
 	frame: Res<UnrealFrameInput>,
 	mut snap: ResMut<RenderSnapshotResource>,
+	// Reused across frames so ISM grouping allocates nothing on the hot path (audit).
+	mut group_scratch: Local<Vec<GroupEntry>>,
 	query: Query<(
 		&StableId,
 		Ref<Transform3d>,
@@ -249,9 +261,7 @@ pub fn extract_render_snapshot(
 	snap.actor_updates.clear();
 	snap.despawns.clear();
 	snap.pending_rendered.clear();
-
-	// Group ISM instances by (mesh, material, lod) handle.
-	let mut groups: HashMap<(LogiAssetHandle, LogiAssetHandle, u32), Vec<LogiInstanceUpdate>> = HashMap::new();
+	group_scratch.clear();
 
 	for (id, transform, renderable, rep, anim) in query.iter() {
 		// Is this entity rendered at all this frame? (Drives the retirement diff.)
@@ -281,13 +291,13 @@ pub fn extract_render_snapshot(
 					continue;
 				}
 				let lod = 0u32; // TODO: LOD selection from significance/screen size.
-				groups.entry((renderable.mesh, renderable.material, lod)).or_default().push(LogiInstanceUpdate {
+				group_scratch.push((renderable.mesh, renderable.material, lod, LogiInstanceUpdate {
 					entity: id.0,
 					stable_instance_slot: u32::MAX, // Unreal assigns/keeps the slot.
 					transform_3x4: transform_to_3x4(&transform, origin),
 					custom_data: [0.0; 8],
 					flags: renderable.flags.0,
-				});
+				}));
 			}
 			RepresentationTier::LowResActor | RepresentationTier::HighResActor => {
 				let animation = anim
@@ -323,21 +333,29 @@ pub fn extract_render_snapshot(
 	despawns.sort_unstable_by_key(|id| (id.index, id.generation, id.shard, id.kind));
 	snap.despawns = despawns;
 
-	// Flatten groups into the contiguous instance buffer + batch metadata.
-	// Deterministic batch order: sort by handle key.
-	let mut keys: Vec<(LogiAssetHandle, LogiAssetHandle, u32)> = groups.keys().copied().collect();
-	keys.sort_unstable();
-	for key in keys {
-		let group = &groups[&key];
+	// Flatten the grouped instances into the contiguous instance buffer + pointer-free batch metadata.
+	// Sort by batch key (then entity id) for a deterministic, replay-stable order, then emit one BatchMeta
+	// per contiguous run of equal keys. (audit: replaces a per-frame HashMap + one heap Vec per bucket with
+	// a single reused scratch buffer + a sort — no per-bucket allocation, no HashMap iteration.)
+	group_scratch.sort_unstable_by(|a, b| {
+		(a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)).then_with(|| {
+			let (x, y) = (a.3.entity, b.3.entity);
+			(x.index, x.generation, x.shard, x.kind).cmp(&(y.index, y.generation, y.shard, y.kind))
+		})
+	});
+	let mut i = 0;
+	while i < group_scratch.len() {
+		let (mesh, material, lod, _) = group_scratch[i];
 		let offset = snap.instances.len() as u32;
-		snap.instances.extend_from_slice(group);
-		snap.batch_metas.push(BatchMeta {
-			mesh: key.0,
-			material: key.1,
-			lod: key.2,
-			offset,
-			count: group.len() as u32,
-		});
+		let mut count = 0u32;
+		while i < group_scratch.len()
+			&& (group_scratch[i].0, group_scratch[i].1, group_scratch[i].2) == (mesh, material, lod)
+		{
+			snap.instances.push(group_scratch[i].3);
+			i += 1;
+			count += 1;
+		}
+		snap.batch_metas.push(BatchMeta { mesh, material, lod, offset, count });
 	}
 }
 

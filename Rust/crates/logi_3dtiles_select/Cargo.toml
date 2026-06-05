@@ -1,0 +1,11 @@
+[package]
+name = "logi_3dtiles_select"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+glam = { workspace = true }
+logi_geospatial = { path = "../logi_geospatial" }
+logi_3dtiles_tileset = { path = "../logi_3dtiles_tileset" }

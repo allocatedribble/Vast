@@ -56,6 +56,9 @@ public:
 
 	void ApplyBatch(const LogiStaticBatch& Batch);
 	void ApplyDespawn(uint64 EntityIndex);
+	/// Flush deferred render-state dirties once per touched ISM. Call after ALL ApplyBatch/ApplyDespawn
+	/// for the frame (audit H4: despawn/bucket-switch must not flush render state per hidden instance).
+	void FlushDirty();
 	void Reset();
 
 	int32 LiveInstanceCount() const { return EntityToSlot.Num(); }
@@ -91,4 +94,7 @@ private:
 	FVector FrameOrigin = FVector::ZeroVector;
 	TMap<FLogiBucketKey, FBucket> Buckets;
 	TMap<uint64 /*entity index*/, FSlotRef> EntityToSlot;
+	/// ISMs touched by a hide this frame; FlushDirty marks each render-state dirty exactly once
+	/// (audit H4) instead of once per hidden/despawned instance.
+	TSet<TWeakObjectPtr<UInstancedStaticMeshComponent>> DirtyIsms;
 };

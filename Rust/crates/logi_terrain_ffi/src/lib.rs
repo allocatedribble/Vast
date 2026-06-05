@@ -2,6 +2,10 @@
 //!
 //! Thin by design (ADR-0001): it wraps the `LogiTerrainWorld` runtime object from `logi_terrain_scene` and
 //! exposes the stable C ABI in `include/logi_terrain.h`. See `runtime-model.md` for the object model.
+//!
+//! The exported `extern "C"` entry points take raw pointers from the C caller and are therefore declared
+//! `unsafe`; each pointer use is wrapped in an explicit `unsafe` block so it is individually auditable.
+#![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod ffi;
 

@@ -5,6 +5,10 @@
 //! function validates the ABI version + null pointers; the hot path is batched
 //! (one snapshot, never per-entity calls). Panics never cross the boundary:
 //! release builds use `panic = "abort"`; non-abort builds are caught here.
+//!
+//! The exported `extern "C"` entry points take raw pointers from the C caller and are therefore declared
+//! `unsafe`; each pointer use sits in an explicit `unsafe` block so it is individually auditable.
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use core::slice;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -177,8 +181,12 @@ pub extern "C" fn logi_abi_version() -> u32 {
 }
 
 /// Create a world. Validates the ABI version. Returns null on failure (and fills `err`).
+///
+/// # Safety
+/// `desc` must be null or point to a readable `LogiInitDesc`; `err` must be null or point to writable
+/// `LogiError` storage. The returned handle is owned by the caller — free it with [`logi_world_destroy`].
 #[no_mangle]
-pub extern "C" fn logi_world_create(desc: *const LogiInitDesc, err: *mut LogiError) -> *mut LogiWorld {
+pub unsafe extern "C" fn logi_world_create(desc: *const LogiInitDesc, err: *mut LogiError) -> *mut LogiWorld {
 	clear_err(err);
 	if desc.is_null() {
 		write_err(err, &FfiError::NullArg("desc"));
@@ -211,8 +219,12 @@ pub extern "C" fn logi_world_create(desc: *const LogiInitDesc, err: *mut LogiErr
 }
 
 /// Destroy a world created by [`logi_world_create`].
+///
+/// # Safety
+/// `world` must be null or a handle from [`logi_world_create`] that has not already been destroyed, and
+/// this must be called on the world's owner thread.
 #[no_mangle]
-pub extern "C" fn logi_world_destroy(world: *mut LogiWorld) {
+pub unsafe extern "C" fn logi_world_destroy(world: *mut LogiWorld) {
 	if world.is_null() {
 		return;
 	}
@@ -227,8 +239,13 @@ pub extern "C" fn logi_world_destroy(world: *mut LogiWorld) {
 }
 
 /// Advance the simulation. The fixed-step accumulator is internal to Rust.
+///
+/// # Safety
+/// `world` must be a valid handle called on its owner thread. `input` must be null or point to a readable
+/// `LogiFrameInput` whose `cameras`/`player_intents` are null or point to `camera_count`/
+/// `player_intent_count` readable elements. `err` must be null or point to writable `LogiError` storage.
 #[no_mangle]
-pub extern "C" fn logi_world_tick(world: *mut LogiWorld, input: *const LogiFrameInput, err: *mut LogiError) -> LogiTickResult {
+pub unsafe extern "C" fn logi_world_tick(world: *mut LogiWorld, input: *const LogiFrameInput, err: *mut LogiError) -> LogiTickResult {
 	clear_err(err);
 	if world.is_null() || input.is_null() {
 		write_err(err, &FfiError::NullArg(if world.is_null() { "world" } else { "input" }));
@@ -286,8 +303,13 @@ pub extern "C" fn logi_world_tick(world: *mut LogiWorld, input: *const LogiFrame
 /// mutation. This is not enforced here (no owner-thread check on the read path)
 /// because the C++ side already drives both tick and snapshot consumption from the
 /// game thread; the contract is the caller's to keep.
+///
+/// # Safety
+/// `world` must be a valid handle called on its owner thread; `out_snapshot` must be null or point to
+/// writable `LogiRenderSnapshot` storage. The returned borrowed pointers stay valid only until the next
+/// tick or `logi_buffer_release`.
 #[no_mangle]
-pub extern "C" fn logi_world_get_render_snapshot(
+pub unsafe extern "C" fn logi_world_get_render_snapshot(
 	world: *mut LogiWorld,
 	snapshot_id: u64,
 	out_snapshot: *mut LogiRenderSnapshot,
@@ -354,8 +376,12 @@ pub extern "C" fn logi_world_get_render_snapshot(
 
 /// Submit a batch of spawn commands (a controlled mutation phase). Returns the
 /// number applied; 0 with an error set on failure.
+///
+/// # Safety
+/// `world` must be a valid handle called on its owner thread; `commands` must be null or point to `count`
+/// readable `LogiSpawnCommand` elements; `err` must be null or point to writable `LogiError` storage.
 #[no_mangle]
-pub extern "C" fn logi_submit_spawn_commands(
+pub unsafe extern "C" fn logi_submit_spawn_commands(
 	world: *mut LogiWorld,
 	commands: *const LogiSpawnCommand,
 	count: u32,
@@ -395,8 +421,11 @@ pub extern "C" fn logi_submit_spawn_commands(
 /// buffer: writing / published / retired). Pass the `snapshot_id` from the
 /// snapshot you are done reading. Must be called from the owner thread. Returns
 /// `LOGI_OK` even if the id was already retired/unknown (idempotent release).
+///
+/// # Safety
+/// `world` must be null or a valid handle from [`logi_world_create`], called on its owner thread.
 #[no_mangle]
-pub extern "C" fn logi_buffer_release(world: *mut LogiWorld, snapshot_id: u64) -> u32 {
+pub unsafe extern "C" fn logi_buffer_release(world: *mut LogiWorld, snapshot_id: u64) -> u32 {
 	if world.is_null() {
 		return LOGI_ERR_NULL;
 	}

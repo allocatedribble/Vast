@@ -115,7 +115,7 @@ impl<'a> Package<'a> {
         let dir_len = rd_u64(bytes, 28)? as usize;
 
         if dir_len != count * DESCRIPTOR_LEN
-            || dir_offset.checked_add(dir_len).map_or(true, |end| end > bytes.len())
+            || dir_offset.checked_add(dir_len).is_none_or(|end| end > bytes.len())
         {
             return Err(PackError::BadDirectory);
         }
@@ -131,7 +131,7 @@ impl<'a> Package<'a> {
             let uncompressed_len = rd_u32(bytes, at + 24)?;
             let stored_len = rd_u32(bytes, at + 28)?;
             let offset = rd_u64(bytes, at + 32)?;
-            if offset.checked_add(stored_len as u64).map_or(true, |end| end > bytes.len() as u64) {
+            if offset.checked_add(stored_len as u64).is_none_or(|end| end > bytes.len() as u64) {
                 return Err(PackError::BadDirectory);
             }
             dir.push(PageDescriptor { id, kind, compression, license_id, uncompressed_len, stored_len, offset });

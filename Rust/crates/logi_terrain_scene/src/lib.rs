@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use logi_terrain_core::{DVec3, LogiBoundingSphere, Telemetry, TileId, Vec3};
 use logi_terrain_decode::height_mesh;
 use logi_terrain_geo::{self as geo, MeshData};
-use logi_terrain_procgen::TerrainHeights;
+use logi_terrain_procgen::{TerrainHeights, DEFAULT_AMPLITUDE_M};
 use logi_terrain_stream::{StreamConfig, StreamEngine, SyntheticProvider, World as StreamWorld};
 
 /// Index buffer element format.
@@ -73,6 +73,10 @@ pub struct LogiWorldCreateInfo {
 
 impl LogiWorldCreateInfo {
     pub fn defaults() -> Self {
+        // max_level is the close-up DETAIL CEILING: the finest tile is world_size / 2^max_level, with
+        // HEIGHT_PAGE_RES (17) samples per edge. At 16384 m / 2^8 = 64 m tiles -> 4 m sample spacing —
+        // ample from altitude, coarse for a ground-level view. Raising it adds finer tiles (more detail)
+        // at the cost of more resident tiles/memory; lowering it is coarser + cheaper. Clamped to <= 20.
         Self { world_size: 16_384.0, budget: LogiStreamingBudget::defaults(), max_level: 8, _reserved: 0 }
     }
 }
@@ -164,14 +168,15 @@ pub struct LogiAttributionEntry {
 /// Streaming health/perf counters carried on every [`LogiFramePacket`].
 ///
 /// FIX 3: these fields mix two semantics — a HUD must not treat them uniformly:
-///   - CUMULATIVE-since-start (monotonic totals, only ever grow):
-///       `frames`, `cache_hits`, `cache_misses`, `evictions`, `requests_issued`,
-///       `requests_completed`, `fallbacks_used`.
-///     For per-frame rates, diff against the previous frame's value.
-///   - INSTANTANEOUS gauges (current value this frame, can go up or down):
-///       `resident_tiles`, `bytes_resident`, `in_flight`.
-///   - `peak_bytes_resident` is a running HIGH-WATER MARK (max of `bytes_resident` over all frames) —
-///     monotonic non-decreasing, but not a "since-start sum".
+///
+/// - CUMULATIVE-since-start (monotonic totals, only ever grow): `frames`, `cache_hits`, `cache_misses`,
+///   `evictions`, `requests_issued`, `requests_completed`, `fallbacks_used`. For per-frame rates, diff
+///   against the previous frame's value.
+/// - INSTANTANEOUS gauges (current value this frame, can go up or down): `resident_tiles`,
+///   `bytes_resident`, `in_flight`.
+/// - `peak_bytes_resident` is a running HIGH-WATER MARK (max of `bytes_resident` over all frames) —
+///   monotonic non-decreasing, but not a "since-start sum".
+///
 /// The C++ telemetry panel reads resident_tiles/in_flight/bytes (gauges) + peak (high-water) and
 /// evictions/fallbacks/requests_completed (cumulative TOTALS, not per-frame).
 #[repr(C)]
@@ -258,12 +263,20 @@ const _: () = {
 
 const VERTEX_STRIDE: u32 = geo::VERTEX_STRIDE as u32;
 const HEIGHT_PAGE_RES: u16 = 17; // FIX 7: fixed N (=17) samples per tile edge regardless of level/size
-// FIX 1: cap >= engine MAX_SELECTED (8192) so the resident set alone never forces live-tile eviction.
-const MESH_CACHE_CAP: usize = 8192; // bounded LRU of decoded per-tile meshes
-const TERRAIN_AMPLITUDE: f64 = 250.0; // peak relief (m)
+// Resident-tile budget. Must stay >= the kernel's MAX_SELECTED so a single frame's selection never
+// forces live-tile eviction. This is THE single resident cap for the whole pipeline: the C++ renderer's
+// MaxSections / MaxNaniteTiles MUST be >= this (it holds every tile the kernel keeps resident). Keep all
+// three (here, stream MAX_SELECTED, and LogiTerrainSubsystem.cpp) in sync — they describe one budget.
+const MESH_CACHE_CAP: usize = 4096; // decoded per-tile meshes (count cap)
+// Byte budget for the decoded-mesh cache — bounds memory regardless of count, since tiles vary in
+// geometry (and skirts add ~50% indices). Evicted together with MESH_CACHE_CAP, whichever binds first.
+const MESH_BYTE_BUDGET: usize = 128 * 1024 * 1024; // 128 MiB of decoded mesh
+// Terrain relief (amplitude) is the SHARED canonical constant `logi_terrain_procgen::DEFAULT_AMPLITUDE_M`
+// (250 m) — the SAME value the sim's gameplay sampler uses. Do not re-declare a local copy here.
 // FIX 2: frame ring depth. Max in-flight frames the host may hold; it MUST release a frame within RING
-// steps of receiving it, else step() reuses the slot and the host reads silently-stale data (no backpressure).
-const RING: usize = 8;
+// steps of receiving it, else step() reuses the slot and the host reads silently-stale data. The C++
+// host releases each frame the SAME tick it acquires it (1 in flight), so 4 is ample headroom (was 8).
+const RING: usize = 4;
 
 /// A decoded, displaced per-tile mesh (procgen height page -> displaced grid). Unique per tile, so it
 /// cannot be shared per-level like the old flat template.
@@ -301,6 +314,13 @@ pub struct LogiTerrainWorld {
     engine: StreamEngine<SyntheticProvider>,
     heights: TerrainHeights,
     tile_meshes: HashMap<TileId, TileMesh>,
+    // Running byte total of `tile_meshes` (sum of each mesh's vertices+indices len), maintained on
+    // insert/remove so evict_meshes' steady-state guard is O(1) instead of re-summing every frame.
+    mesh_bytes: usize,
+    // Reused eviction scratch (no per-call alloc on the churn path): the pinned-tile set + the
+    // sorted-by-age candidate list.
+    evict_pinned: HashSet<TileId>,
+    evict_candidates: Vec<(u64, TileId, usize)>,
     camera: LogiCameraState,
     prev_camera: Option<DVec3>,
     next_frame_id: LogiFrameId,
@@ -311,8 +331,12 @@ pub struct LogiTerrainWorld {
 impl LogiTerrainWorld {
     pub fn new(info: LogiWorldCreateInfo) -> Self {
         let max_level = info.max_level.min(20) as u8;
-        let mut stream_world = StreamWorld::new(info.world_size, max_level, info.world_size / 64.0); // was /4.0 (=4096): SSE stayed > pixel target even at max level, so every visible tile refined to lod 8 (thousands of non-Nanite sections -> VSM marking overflow). /64 (~relief) gives a real LOD pyramid.
-        stream_world.set_height_amplitude(TERRAIN_AMPLITUDE);
+        // base_geometric_error = the terrain relief: a root tile (flat) deviates from the true surface
+        // by ~the amplitude, so that is the right coarsest-level error. Tie it to the SHARED
+        // DEFAULT_AMPLITUDE_M (was world_size/64 = 256, which only coincided with the relief at this one
+        // world size and would silently mis-tune the LOD pyramid if world_size changed).
+        let mut stream_world = StreamWorld::new(info.world_size, max_level, DEFAULT_AMPLITUDE_M);
+        stream_world.set_height_amplitude(DEFAULT_AMPLITUDE_M);
 
         let budget = if info.budget.memory_budget_bytes > 0 {
             info.budget.memory_budget_bytes as usize
@@ -330,14 +354,18 @@ impl LogiTerrainWorld {
         };
         let engine = StreamEngine::new(cfg, SyntheticProvider::new(2, 8));
 
-        let mut heights = TerrainHeights::new(0xA11CE);
-        heights.amplitude = TERRAIN_AMPLITUDE;
+        // The CANONICAL shared field — identical to the sim's gameplay sampler (logi_sim Terrain::canonical),
+        // so agents sit on the terrain that is drawn. Never hardcode a seed or amplitude here.
+        let heights = TerrainHeights::canonical();
 
         Self {
             stream_world,
             engine,
             heights,
             tile_meshes: HashMap::new(),
+            mesh_bytes: 0,
+            evict_pinned: HashSet::new(),
+            evict_candidates: Vec::new(),
             camera: LogiCameraState::default(),
             prev_camera: None,
             next_frame_id: 1,
@@ -368,6 +396,7 @@ impl LogiTerrainWorld {
         let page = self.heights.height_page(cx - ts * 0.5, cz - ts * 0.5, ts, HEIGHT_PAGE_RES);
         let (min_elevation, max_elevation) = (page.min_elevation, page.max_elevation);
         let MeshData { vertices, indices, vertex_count, index_count } = height_mesh(&page, ts as f32);
+        self.mesh_bytes += vertices.len() + indices.len(); // keep the running byte total in sync (see evict_meshes)
         self.tile_meshes.insert(
             tile,
             TileMesh { vertices, indices, vertex_count, index_count, min_elevation, max_elevation, last_used: frame },
@@ -386,44 +415,75 @@ impl LogiTerrainWorld {
     /// this frame rather than freeing memory the host is still reading.
     ///
     /// FIX M4: the just-built frame is not the only one the host may still be reading. The frame ring
-    /// holds up to `RING` (=8) un-released frames; each holds a `patches` list that references tile
+    /// holds up to `RING` (=4) un-released frames; each holds a `patches` list that references tile
     /// meshes by handle, and the host resolves those handles to zero-copy mesh pointers via
     /// `buffer_view` for as long as it holds the frame. Pinning only the current frame could evict a
     /// mesh that an *outstanding* (older, still-unreleased) ring frame references, dangling the host's
     /// pointer. So we pin the union of tiles referenced by EVERY live ring slot (`frame_id != 0`) — in
     /// addition to the current-frame stamp pin — and never evict any of them.
     fn evict_meshes(&mut self) {
-        if self.tile_meshes.len() <= MESH_CACHE_CAP {
+        // O(1) steady-state guard: `mesh_bytes` is maintained incrementally on insert/remove (mirroring
+        // logi_terrain_cache::ResidencyCache::bytes_used) instead of re-summing every resident mesh each
+        // frame. Bounded by BOTH the count cap and the byte budget; whichever binds first.
+        if self.tile_meshes.len() <= MESH_CACHE_CAP && self.mesh_bytes <= MESH_BYTE_BUDGET {
             return;
         }
         let live = self.next_frame_id.wrapping_sub(1); // frame just built; its tiles are pinned
         // Tiles referenced by any still-live ring frame: the host may hold zero-copy pointers into their
-        // mesh bytes until it releases that frame, so they must outlive eviction. `patch_handle` is the
-        // tile's `key()` (see `step`), so it round-trips back to the TileId.
-        let mut pinned: HashSet<TileId> = HashSet::new();
+        // mesh bytes until it releases that frame, so they must outlive eviction (FIX M4). Reuse the
+        // scratch set — no per-call allocation on the churn path.
+        self.evict_pinned.clear();
         for slot in &self.frames {
             if slot.frame_id == 0 {
                 continue; // released/empty ring slot
             }
             for patch in &slot.patches {
-                pinned.insert(TileId::from_key(patch.patch_handle));
+                // `patch_handle` is the tile's `key()` (see `step`). from_key masks to 62 bits, so a
+                // handle that ever carried high bits (e.g. the bit-63-stealing buffer handle) would pin
+                // the WRONG tile — assert the clean round-trip so future encoding drift trips in debug.
+                debug_assert!(
+                    TileId::from_key(patch.patch_handle).key() == patch.patch_handle,
+                    "patch_handle is not a clean TileId::key() round-trip",
+                );
+                self.evict_pinned.insert(TileId::from_key(patch.patch_handle));
             }
         }
-        let mut entries: Vec<(u64, TileId)> = self
-            .tile_meshes
-            .iter()
-            // Exclude both the just-built-frame stamp AND any tile referenced by a live ring frame.
-            .filter(|(t, m)| m.last_used != live && !pinned.contains(t))
-            .map(|(t, m)| (m.last_used, *t))
-            .collect();
-        entries.sort_unstable_by_key(|(lu, _)| *lu);
-        // Only un-pinned, strictly-older entries are candidates, so we may remove fewer than (len - cap);
-        // the cap can stay exceeded this frame, which is intentional — never drop a mesh the host is
-        // still (or may still be) reading to satisfy it.
-        let remove = (self.tile_meshes.len() - MESH_CACHE_CAP).min(entries.len());
-        for (_, t) in entries.into_iter().take(remove) {
+        // Candidates = un-pinned, strictly-older entries (carry each one's byte size for the byte budget).
+        // mem::take the scratch Vec so the filter closure can borrow the other self fields; restore it
+        // (capacity preserved → reused next call) at the end.
+        let mut candidates = std::mem::take(&mut self.evict_candidates);
+        candidates.clear();
+        candidates.extend(
+            self.tile_meshes
+                .iter()
+                .filter(|(t, m)| m.last_used != live && !self.evict_pinned.contains(t))
+                .map(|(t, m)| (m.last_used, *t, m.vertices.len() + m.indices.len())),
+        );
+        candidates.sort_unstable_by_key(|(lu, _, _)| *lu);
+        // Evict oldest-first until BOTH budgets are met (or only pinned/live entries remain — then a budget
+        // can stay exceeded this frame, intentional: never drop a mesh the host is still/maybe reading).
+        let mut count = self.tile_meshes.len();
+        let mut bytes = self.mesh_bytes;
+        for &(_, t, sz) in &candidates {
+            if count <= MESH_CACHE_CAP && bytes <= MESH_BYTE_BUDGET {
+                break;
+            }
             self.tile_meshes.remove(&t);
+            count -= 1;
+            bytes = bytes.saturating_sub(sz);
         }
+        self.mesh_bytes = bytes;
+        // Observability (audit): if we exit STILL over budget it must be because every remaining mesh is
+        // pinned by a live ring frame the host may be reading (FIX M4) or is the just-built frame (FIX 1) —
+        // never because the loop quit early with an evictable (un-pinned, non-live) mesh left. This makes
+        // the intentional over-cap distinguishable from an eviction-logic regression in tests, instead of
+        // the single pipeline-wide resident cap being silently exceeded.
+        debug_assert!(
+            (self.tile_meshes.len() <= MESH_CACHE_CAP && self.mesh_bytes <= MESH_BYTE_BUDGET)
+                || self.tile_meshes.iter().all(|(t, m)| m.last_used == live || self.evict_pinned.contains(t)),
+            "evict_meshes left the mesh cache over budget while an evictable (un-pinned, non-live) mesh remained"
+        );
+        self.evict_candidates = candidates; // restore the scratch (now with capacity) for reuse
     }
 
     /// Advance one frame; returns the new frame id (assembled into the ring).
@@ -465,6 +525,11 @@ impl LogiTerrainWorld {
         // proc-mesh near its host actor with small float coords. Absolute planetary world coords (km from
         // origin) give huge bounds + LWC precision loss and the mesh fails to draw. The C++ side places the
         // host actor at this origin and emits vertices relative to it; on a grid crossing it rebuilds.
+        // Terrain rebase grid: 2048 m. Deliberately COARSE — terrain tiles are large and their f32
+        // vertices tolerate a far origin, so a wide grid means rare host-actor moves + section rebuilds.
+        // (Contrast the AGENT rebase grid, logi_render_extract::ORIGIN_GRID_CM = 256 m, which is FINE
+        // because small per-agent transforms need tight f32 precision near the camera. Different needs,
+        // different grids — intentional, not an inconsistency.)
         const REBASE_SNAP: f64 = 2048.0;
         let origin = DVec3::new(
             (camera_pos.x / REBASE_SNAP).round() * REBASE_SNAP,

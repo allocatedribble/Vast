@@ -113,6 +113,18 @@ void FLogiActorPool::HideAndPool(AStaticMeshActor* Actor)
 	{
 		return;
 	}
+	// Cap the free pool (audit): without a bound, a long session of promote→demote churn accumulates
+	// unbounded hidden actors. Steady state never needs more pooled actors than the actor budget
+	// (HighRes+LowRes, ~320 by default), so destroy beyond a generous cap rather than leak. The rare
+	// destroys at the cap boundary are far cheaper than the per-frame spawn/destroy churn the pool avoids.
+	// (Hidden — not destroyed — actors stay in the world's actor list, so the world GC-roots them; the
+	// TWeakObjectPtrs are defensive against world teardown, not load-bearing.)
+	constexpr int32 MaxPooledActors = 512;
+	if (Pool.Num() >= MaxPooledActors)
+	{
+		Actor->Destroy();
+		return;
+	}
 	Actor->SetActorHiddenInGame(true);
 	Pool.Add(Actor);
 }

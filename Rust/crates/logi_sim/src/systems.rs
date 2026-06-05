@@ -4,10 +4,10 @@
 
 use crate::components::{CullState, Representation, StableId, Transform3d, Velocity3d};
 use crate::resources::{RepresentationBudget, SimClock, UnrealFrameInput};
+use bevy_ecs::entity::EntityHashMap;
 use bevy_ecs::prelude::*;
-use logi_schema::RepresentationTier;
+use logi_schema::{LogiEntityId, RepresentationTier};
 use std::cmp::Ordering;
-use std::collections::HashMap;
 
 /// Integrate motion deterministically: translation += linear_velocity * dt.
 pub fn integrate_motion(clock: Res<SimClock>, mut query: Query<(&mut Transform3d, &Velocity3d)>) {
@@ -52,7 +52,10 @@ pub fn compute_significance(
 		// a culling system feeds CullState). Camera position drives promotion to
 		// actor tiers; a dedicated culling/frustum system will refine visibility.
 		let _ = cull.visible_to_any_camera;
+		// Sanitize to a finite value: a NaN significance would make the budget sort order
+		// input-dependent and break replay determinism (ADR-0001).
 		let significance = distance_term + area_term;
+		let significance = if significance.is_finite() { significance } else { 0.0 };
 		// Conditional write: only mark Changed when it actually changes (§8).
 		if rep.significance != significance {
 			rep.significance = significance;
@@ -60,23 +63,80 @@ pub fn compute_significance(
 	}
 }
 
-/// Allocate representation tiers TOP-DOWN by significance against the budget
-/// (ADR-0003) — never by raw distance. Ties break by StableId for determinism.
+/// One entry in the per-frame significance ranking.
+#[derive(Clone, Copy)]
+struct RankEntry {
+	significance: f32,
+	id: LogiEntityId,
+	entity: Entity,
+}
+
+/// Per-system scratch, reused across frames via `Local` so budgeting allocates nothing on the hot path.
+/// Opaque (all fields private); only `allocate_representation_budget` touches it.
+#[derive(Default)]
+pub struct BudgetScratch {
+	/// `(significance, stable id, entity)` for every live entity this frame.
+	ranked: Vec<RankEntry>,
+	/// Tier assigned to each selected (top-K) entity; an absent entity ⇒ `None` tier.
+	assignment: EntityHashMap<RepresentationTier>,
+}
+
+/// Total, deterministic tie-break key over the full stable identity — not just `index`, so two entities
+/// that ever share an `index` across shards/kinds can never collide (the prior `index`-only key could).
+#[inline]
+fn stable_key(id: &LogiEntityId) -> (u64, u32, u16, u16) {
+	(id.index, id.generation, id.shard, id.kind)
+}
+
+/// Allocate representation tiers TOP-DOWN by significance against the budget (ADR-0003) — never by raw
+/// distance. Ties break by stable id for determinism.
+///
+/// Scales to 1M agents: a bounded top-K selection (`select_nth_unstable`, O(n) average) replaces a full
+/// O(n·log n) sort of the whole population; the scratch buffers are reused across frames (zero per-frame
+/// allocation); and the entity→tier map is keyed by `Entity` (correct across shards) with a fast hash.
 pub fn allocate_representation_budget(
 	budget: Res<RepresentationBudget>,
-	mut query: Query<(&StableId, &mut Representation)>,
+	mut scratch: Local<BudgetScratch>,
+	mut query: Query<(Entity, &StableId, &mut Representation)>,
 ) {
-	// Rank by (significance desc, stable-id asc) — deterministic ordering.
-	let mut ranked: Vec<(u64, f32)> = query.iter().map(|(id, rep)| (id.0.index, rep.significance)).collect();
-	ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+	let BudgetScratch { ranked, assignment } = &mut *scratch;
 
+	// Pass 1 (read): snapshot significance. NaN is sanitized to 0.0 so the ordering is total and
+	// replay-deterministic (a NaN would otherwise make the sort order input-dependent).
+	ranked.clear();
+	for (entity, id, rep) in query.iter() {
+		let significance = if rep.significance.is_finite() { rep.significance } else { 0.0 };
+		ranked.push(RankEntry { significance, id: id.0, entity });
+	}
+
+	// Rank by (significance desc, stable-id asc). Both operands are finite after sanitisation, so
+	// `partial_cmp` only yields `Equal` for truly equal scores — the stable-id tie-break then totalises it.
+	let cmp = |a: &RankEntry, b: &RankEntry| {
+		b.significance
+			.partial_cmp(&a.significance)
+			.unwrap_or(Ordering::Equal)
+			.then_with(|| stable_key(&a.id).cmp(&stable_key(&b.id)))
+	};
+
+	// Only the top `k = high + low + ism` entities can earn a non-None tier; rank just those.
+	let k = (budget.high_res_actors as usize)
+		.saturating_add(budget.low_res_actors as usize)
+		.saturating_add(budget.instanced_meshes as usize)
+		.min(ranked.len());
+	if k >= ranked.len() {
+		ranked.sort_unstable_by(cmp);
+	} else if k > 0 {
+		ranked.select_nth_unstable_by(k - 1, cmp);
+		ranked[..k].sort_unstable_by(cmp);
+	}
+
+	// Assign tiers positionally to the ranked top-K.
+	assignment.clear();
 	let mut high = budget.high_res_actors;
 	let mut low = budget.low_res_actors;
 	let mut ism = budget.instanced_meshes;
-
-	let mut tier_for: HashMap<u64, RepresentationTier> = HashMap::with_capacity(ranked.len());
-	for (id, significance) in &ranked {
-		let tier = if *significance <= 0.0 {
+	for entry in &ranked[..k] {
+		let tier = if entry.significance <= 0.0 {
 			RepresentationTier::None
 		} else if high > 0 {
 			high -= 1;
@@ -90,20 +150,21 @@ pub fn allocate_representation_budget(
 		} else {
 			RepresentationTier::None
 		};
-		tier_for.insert(*id, tier);
+		if tier != RepresentationTier::None {
+			assignment.insert(entry.entity, tier);
+		}
 	}
 
-	for (id, mut rep) in &mut query {
-		if let Some(&tier) = tier_for.get(&id.0.index) {
-			// Conditional writes preserve change detection (§8): unchanged
-			// representation does not re-enter the render-extract delta.
-			if rep.desired_tier != tier {
-				rep.desired_tier = tier;
-			}
-			let next = step_tier(rep.current_tier, tier);
-			if rep.current_tier != next {
-				rep.current_tier = next;
-			}
+	// Pass 2 (write): apply the desired tier (None for anything not selected). Conditional writes preserve
+	// change detection (§8) so unchanged representation stays out of the render-extract delta.
+	for (entity, _id, mut rep) in &mut query {
+		let tier = assignment.get(&entity).copied().unwrap_or(RepresentationTier::None);
+		if rep.desired_tier != tier {
+			rep.desired_tier = tier;
+		}
+		let next = step_tier(rep.current_tier, tier);
+		if rep.current_tier != next {
+			rep.current_tier = next;
 		}
 	}
 }

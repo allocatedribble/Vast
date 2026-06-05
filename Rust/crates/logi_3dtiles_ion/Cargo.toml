@@ -1,0 +1,14 @@
+[package]
+name = "logi_3dtiles_ion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# Cesium ion asset-endpoint resolver (ADR-0009 Milestone F). ureq = blocking HTTP + rustls (no tokio);
+# the streaming kernel is single-owner-thread, so a blocking client on a worker pool is the right model.
+ureq = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

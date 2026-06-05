@@ -1,0 +1,10 @@
+[package]
+name = "logi_qmesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+glam = { workspace = true }
+logi_geospatial = { path = "../logi_geospatial" }

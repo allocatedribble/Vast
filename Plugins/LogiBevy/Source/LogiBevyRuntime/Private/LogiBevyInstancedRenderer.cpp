@@ -63,6 +63,7 @@ void FLogiInstancedRenderer::Shutdown()
 	HostActor.Reset();
 	Buckets.Reset();
 	EntityToSlot.Reset();
+	DirtyIsms.Reset();
 	AssetRegistry = nullptr; // borrowed; clear so a stale ptr is never read post-shutdown
 	World.Reset();
 }
@@ -145,7 +146,8 @@ void FLogiInstancedRenderer::ApplyBatch(const LogiStaticBatch& Batch)
 				{
 					if (UInstancedStaticMeshComponent* OldIsm = OldBucket->Ism.Get())
 					{
-						OldIsm->UpdateInstanceTransform(Existing->Slot, HiddenTransform(), true, true, false);
+						OldIsm->UpdateInstanceTransform(Existing->Slot, HiddenTransform(), /*bWorldSpace=*/true, /*bMarkRenderStateDirty=*/false, /*bTeleport=*/true);
+						DirtyIsms.Add(OldIsm); // defer the flush (audit H4)
 					}
 					OldBucket->Release(Existing->Slot);
 				}
@@ -173,14 +175,15 @@ void FLogiInstancedRenderer::ApplyBatch(const LogiStaticBatch& Batch)
 			Ism->UpdateInstanceTransform(Slot, Xform, /*bWorldSpace=*/true, /*bMarkRenderStateDirty=*/false, /*bTeleport=*/true);
 		}
 
-		for (int32 C = 0; C < 8; ++C)
-		{
-			Ism->SetCustomDataValue(Slot, C, Inst.custom_data[C], /*bMarkRenderStateDirty=*/false);
-		}
+		// Bulk-write all 8 custom-data floats in one call (audit H4): eight per-instance virtual
+		// SetCustomDataValue calls × up to 100k instances/frame was a dominant per-frame cost.
+		Ism->SetCustomData(Slot, MakeArrayView(Inst.custom_data, 8), /*bMarkRenderStateDirty=*/false);
 	}
 
-	// One render-state flush per bucket per frame (not per instance).
+	// One render-state flush per bucket per frame (not per instance). This ISM is now clean, so drop it
+	// from the deferred set (a despawn earlier this frame may have added it).
 	Ism->MarkRenderStateDirty();
+	DirtyIsms.Remove(Ism);
 }
 
 void FLogiInstancedRenderer::ApplyDespawn(uint64 EntityIndex)
@@ -192,15 +195,30 @@ void FLogiInstancedRenderer::ApplyDespawn(uint64 EntityIndex)
 		{
 			if (UInstancedStaticMeshComponent* Ism = Bucket->Ism.Get())
 			{
-				Ism->UpdateInstanceTransform(Ref.Slot, HiddenTransform(), true, true, false);
+				Ism->UpdateInstanceTransform(Ref.Slot, HiddenTransform(), /*bWorldSpace=*/true, /*bMarkRenderStateDirty=*/false, /*bTeleport=*/true);
+					DirtyIsms.Add(Ism); // defer the flush (audit H4): no per-instance render-state recreate
 			}
 			Bucket->Release(Ref.Slot);
 		}
 	}
 }
 
+void FLogiInstancedRenderer::FlushDirty()
+{
+	// One MarkRenderStateDirty per touched ISM (audit H4), not one per hidden/despawned instance.
+	for (const TWeakObjectPtr<UInstancedStaticMeshComponent>& Weak : DirtyIsms)
+	{
+		if (UInstancedStaticMeshComponent* Ism = Weak.Get())
+		{
+			Ism->MarkRenderStateDirty();
+		}
+	}
+	DirtyIsms.Reset();
+}
+
 void FLogiInstancedRenderer::Reset()
 {
 	Buckets.Reset();
 	EntityToSlot.Reset();
+	DirtyIsms.Reset();
 }

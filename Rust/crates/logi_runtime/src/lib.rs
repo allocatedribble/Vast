@@ -203,9 +203,11 @@ impl LogiWorld {
 		let mut world = World::new();
 		world.insert_resource(SimClock { tick: 0, fixed_hz: hz });
 		world.insert_resource(SimRng::new(config.deterministic_seed));
-		// Terrain honours the configured seed like SimRng (audit M1): a hardcoded
-		// seed-0 field would desync gameplay placement/route-cost from the sim's RNG.
-		world.insert_resource(TerrainResource(Terrain::with_seed(config.deterministic_seed)));
+		// Terrain is the CANONICAL shared field (logi_terrain_procgen::canonical) — the SAME surface
+		// the renderer draws (logi_terrain_scene), so agents sit on the terrain you see. The terrain
+		// is a fixed designed world; deterministic_seed drives agent RNG, not terrain geography.
+		// (Supersedes audit M1's per-seed terrain: the holistic fix is one shared field, not two.)
+		world.insert_resource(TerrainResource(Terrain::canonical()));
 		world.insert_resource(UnrealFrameInput::default());
 		// Representation budgets from config; all-zero => library defaults.
 		let budget = if config.high_res_actor_budget == 0
@@ -673,22 +675,25 @@ mod tests {
 		assert_eq!(published.actor_updates[0].entity.index, 50);
 	}
 
-	/// M1: the terrain field honours the configured deterministic seed (it is no
-	/// longer hardcoded to 0). Two worlds with different seeds sample different
-	/// ground; the same seed samples identically.
+	/// The terrain is the CANONICAL shared field — the same surface the renderer (logi_terrain_scene)
+	/// draws — so it deliberately does NOT vary with the world seed (a fixed designed world; the seed
+	/// drives agent RNG, not terrain geography). Supersedes M1's per-seed terrain.
 	#[test]
-	fn terrain_honours_configured_seed() {
+	fn terrain_is_the_canonical_shared_field() {
 		use logi_schema::LogiTileId;
-		let sample = |seed: u64| -> f64 {
-			let w = LogiWorld::new(cfg(seed));
-			w.world
+		let sample_world = |seed: u64| -> f64 {
+			LogiWorld::new(cfg(seed))
+				.world
 				.resource::<TerrainResource>()
 				.0
 				.sample_surface(LogiTileId::new(1), 1234.0, 5678.0)
 				.height_cm
 		};
-		assert_ne!(sample(1), sample(2), "different seeds must yield different terrain");
-		assert_eq!(sample(7), sample(7), "same seed must be deterministic");
+		// Different world seeds -> IDENTICAL ground (terrain is the shared canonical field, not seeded).
+		assert_eq!(sample_world(1), sample_world(2), "terrain must be the canonical shared field, independent of seed");
+		// ...and it equals Terrain::canonical (the exact field logi_terrain_scene renders).
+		let canonical = Terrain::canonical().sample_surface(LogiTileId::new(1), 1234.0, 5678.0).height_cm;
+		assert_eq!(sample_world(1), canonical, "sim terrain must equal the canonical shared field");
 	}
 
 	/// M3: a duplicate `requested_id` is de-duplicated — the live entity is left

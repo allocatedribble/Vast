@@ -73,7 +73,7 @@ impl HeightPage {
     pub fn is_hole(&self, index: usize) -> bool {
         self.hole_mask
             .get(index / 8)
-            .map_or(false, |b| b & (1 << (index % 8)) != 0)
+            .is_some_and(|b| b & (1 << (index % 8)) != 0)
     }
 
     /// Reconstruct elevation at a sample index (lossy by up to `error_metric`).

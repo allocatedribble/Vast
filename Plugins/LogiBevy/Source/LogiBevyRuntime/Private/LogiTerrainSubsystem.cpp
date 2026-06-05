@@ -34,6 +34,12 @@ namespace
 	// The terrain kernel works in metres; Unreal in centimetres.
 	constexpr double LogiTerrainToUnreal = 100.0;
 
+	// A tile whose bounding radius (metres) exceeds this — the coarse quadtree roots — is skipped by
+	// both render lanes: as one giant proc-mesh section it bloats the component bounds to ~world size
+	// and breaks UE frustum culling (dropping the real fine terrain); the Nanite lane skips it for
+	// parity. Radius-based (not a fixed level) so it adapts to any world size.
+	constexpr float GiantTileRadiusMeters = 2500.0f;
+
 	// View point for streaming: the PIE/game player camera, else (editor, no PIE)
 	// the active level-viewport camera so terrain streams in the editor viewport.
 	bool GetTerrainViewPoint(UWorld* World, FVector& OutLoc, FRotator& OutRot)
@@ -115,13 +121,28 @@ namespace
 	}
 
 #if LOGI_TERRAIN_NANITE_LANE
+	// World-relative offset (under the host actor) for a Nanite tile's component. The kernel's
+	// local_position is origin-relative metres in kernel space (Y up); map it to Unreal cm with the
+	// same Y<->Z swap the vertices use. Because the tile MESH is built tile-local (origin-free, see
+	// BuildTileNaniteMesh), applying local_position HERE as the component transform -- instead of
+	// baking it into the vertices -- makes the encoded mesh origin-INDEPENDENT: a floating-origin
+	// rebase only repositions components (cheap) instead of re-encoding every tile, and the re-entry
+	// cache survives the rebase. host(at origin) + component(local_position) == tile_center, exactly.
+	FVector NaniteTileRelativeLocation(const LogiTerrainPatchDraw& P)
+	{
+		return FVector(
+			static_cast<double>(P.local_position.x) * LogiTerrainToUnreal,
+			static_cast<double>(P.local_position.z) * LogiTerrainToUnreal,
+			static_cast<double>(P.local_position.y) * LogiTerrainToUnreal);
+	}
+
 	// Build a transient, **Nanite-enabled** UStaticMesh from a tile's interleaved 32-byte verts
-	// (pos f3, normal f3, uv f2) + u32 indices. Uses the SAME coordinate mapping as BuildSection
-	// (Y<->Z swap, m->cm x100, origin-relative local_position, kernel winding unchanged) so the
-	// component -- parked at the host actor = render origin -- places the tile at the same world
-	// spot as the proc-mesh lane. Editor-only: BuildFromMeshDescriptions with bFastBuild=false
-	// reaches UStaticMesh::Build(true), whose Nanite encode lives in the editor-only NaniteBuilder
-	// module.
+	// (pos f3, normal f3, uv f2) + u32 indices. Vertices are TILE-LOCAL (kernel-space, tile-centered,
+	// Y<->Z swap, m->cm x100, kernel winding unchanged) -- the origin/local_position is NOT baked in;
+	// the caller positions the component via NaniteTileRelativeLocation so the encoded mesh is
+	// origin-independent and reusable across rebases. Editor-only: BuildFromMeshDescriptions with
+	// bFastBuild=false reaches UStaticMesh::Build(true), whose Nanite encode lives in the editor-only
+	// NaniteBuilder module.
 	//
 	// ASYNC, not synchronous: Build(true) -> BatchBuild queues an FStaticMeshAsyncBuildTask on the
 	// static-mesh thread pool and returns immediately with IsCompiling()==true (it does NOT block
@@ -139,9 +160,6 @@ namespace
 		const uint32 ICount = FMath::Min<uint32>(P.index_count, static_cast<uint32>(IView.byte_length / 4));
 		if (VCount < 3 || ICount < 3) { return nullptr; }
 
-		const double X0 = static_cast<double>(P.local_position.x);
-		const double Y0 = static_cast<double>(P.local_position.y);
-		const double Z0 = static_cast<double>(P.local_position.z);
 		const uint32* IData = reinterpret_cast<const uint32*>(IView.data);
 
 		FMeshDescription MeshDesc;
@@ -166,10 +184,11 @@ namespace
 		{
 			const float* F = reinterpret_cast<const float*>(VView.data + static_cast<uint64>(v) * Stride);
 			const FVertexID Vid = MeshDesc.CreateVertex();
+			// Tile-local (no origin/local_position term): the component transform places the tile.
 			Positions[Vid] = FVector3f(
-				static_cast<float>((X0 + F[0]) * LogiTerrainToUnreal),
-				static_cast<float>((Z0 + F[2]) * LogiTerrainToUnreal),
-				static_cast<float>((Y0 + F[1]) * LogiTerrainToUnreal));
+				static_cast<float>(F[0] * LogiTerrainToUnreal),
+				static_cast<float>(F[2] * LogiTerrainToUnreal),
+				static_cast<float>(F[1] * LogiTerrainToUnreal));
 			VIDs[v] = Vid;
 		}
 
@@ -334,7 +353,10 @@ void ULogiTerrainSubsystem::EnsureRenderTarget()
 
 void ULogiTerrainSubsystem::EvictIfOverBudget()
 {
-	constexpr int32 MaxSections = 2048;
+	// Resident proc-mesh section cap. Kept >= the kernel's resident budget (logi_terrain_scene
+	// MESH_CACHE_CAP = 4096) so the renderer holds every tile the kernel keeps -> this LRU is a pure
+	// safety backstop that should not fire in normal operation. Keep in sync with the kernel cap.
+	constexpr int32 MaxSections = 4096;
 	UProceduralMeshComponent* Mesh = TerrainMesh.Get();
 	if (Mesh == nullptr)
 	{
@@ -413,7 +435,9 @@ void ULogiTerrainSubsystem::EvictNaniteIfOverBudget()
 	// is the primary bound, but a runaway working set (or a bug) must never grow TileNanite without
 	// limit. Release the oldest tiles by LastSeen, but NEVER one resident this frame (see L9 in
 	// EvictIfOverBudget) -- dropping a live tile would just rebuild it next frame.
-	constexpr int32 MaxNaniteTiles = 2048;
+	// Resident Nanite-tile cap — the same budget as the proc-mesh MaxSections and the kernel's
+	// MESH_CACHE_CAP (4096); a safety backstop, since the kernel already bounds the resident set.
+	constexpr int32 MaxNaniteTiles = 4096;
 	if (TileNanite.Num() <= MaxNaniteTiles)
 	{
 		return;
@@ -430,7 +454,10 @@ void ULogiTerrainSubsystem::EvictNaniteIfOverBudget()
 	const int32 NumToEvict = FMath::Min(TileNanite.Num() - MaxNaniteTiles, Cands.Num());
 	for (int32 i = 0; i < NumToEvict; ++i)
 	{
-		ReleaseNaniteTile(TileNanite.FindAndRemoveChecked(Cands[i].Key));
+		// Cache (don't drop) the evicted mesh so a re-entry skips the async re-encode, same as the
+		// per-frame resident-set release. This backstop shouldn't fire under the synchronized 4096
+		// caps, but if it ever does keep it re-entry-cheap (TrimNaniteCache bounds the cache next step).
+		CacheNaniteTile(Cands[i].Key, TileNanite.FindAndRemoveChecked(Cands[i].Key));
 	}
 }
 
@@ -441,6 +468,60 @@ void ULogiTerrainSubsystem::ClearNaniteLane()
 		ReleaseNaniteTile(Pair.Value);
 	}
 	TileNanite.Reset();
+	// ClearNaniteLane runs only on lane switch / shutdown now (NOT rebase -- tiles are origin-independent
+	// since the tile-local-mesh change), so dropping the whole re-entry cache here is correct.
+	ClearNaniteCache();
+}
+
+void ULogiTerrainSubsystem::CacheNaniteTile(uint64 Key, const FNaniteTile& Tile)
+{
+	UStaticMeshComponent* Comp = Tile.Comp.Get();
+	if (Comp == nullptr)
+	{
+		return;
+	}
+	// Retain the encoded mesh for cheap re-entry (skips the async re-encode), then pool the component.
+	// The TStrongObjectPtr becomes the only ref keeping the mesh alive while it sits out of view.
+	if (UStaticMesh* Mesh = Comp->GetStaticMesh())
+	{
+		// Invariant: a resident tile is never also in the re-entry cache (cache<->resident are mutually
+		// exclusive), so this key can't already be present and FindOrAdd won't orphan a prior encode.
+		checkSlow(!NaniteMeshCache.Contains(Key));
+		FLogiNaniteCachedTile& Entry = NaniteMeshCache.FindOrAdd(Key);
+		Entry.Mesh.Reset(Mesh);
+		Entry.CachedFrame = FrameCounter;
+	}
+	Comp->SetStaticMesh(nullptr);
+	Comp->SetVisibility(false);
+	FreeStaticComps.Add(Comp);
+}
+
+void ULogiTerrainSubsystem::TrimNaniteCache()
+{
+	const int32 MaxCache = FMath::Max(0, GetDefault<ULogiBevyDeveloperSettings>()->NaniteReentryCacheSize);
+	if (NaniteMeshCache.Num() <= MaxCache)
+	{
+		return;
+	}
+	// LRU: drop the oldest cached entries (their TStrongObjectPtr releases -> mesh eligible for GC).
+	struct FCacheAge { uint64 CachedFrame; uint64 Key; };
+	TArray<FCacheAge> ByAge;
+	ByAge.Reserve(NaniteMeshCache.Num());
+	for (const TPair<uint64, FLogiNaniteCachedTile>& Pair : NaniteMeshCache)
+	{
+		ByAge.Add(FCacheAge{ Pair.Value.CachedFrame, Pair.Key });
+	}
+	ByAge.Sort([](const FCacheAge& A, const FCacheAge& B) { return A.CachedFrame < B.CachedFrame; });
+	const int32 NumToDrop = NaniteMeshCache.Num() - MaxCache;
+	for (int32 i = 0; i < NumToDrop; ++i)
+	{
+		NaniteMeshCache.Remove(ByAge[i].Key);
+	}
+}
+
+void ULogiTerrainSubsystem::ClearNaniteCache()
+{
+	NaniteMeshCache.Empty(); // every TStrongObjectPtr releases -> cached meshes eligible for GC
 }
 #endif // LOGI_TERRAIN_NANITE_LANE
 
@@ -591,9 +672,11 @@ void ULogiTerrainSubsystem::Tick(float DeltaTime)
 				FreeSections.Reset();
 				NextSection = 0;
 #if LOGI_TERRAIN_NANITE_LANE
-				// Nanite tile meshes are built origin-relative too -- drop them so they rebuild
-				// against the new render origin (their components ride the host but the geometry is stale).
-				ClearNaniteLane();
+				// Nanite tiles are origin-INDEPENDENT (tile-local geometry; the origin lives in each
+				// component's relative transform, not the vertices) -- they survive the rebase. Don't clear
+				// them: the resident loop below slides each component to the new origin via SetRelativeLocation,
+				// and the re-entry cache stays valid (keys are origin-free tile ids). This is what stops the
+				// whole view re-encoding every time the camera crosses a REBASE_SNAP grid line.
 #endif
 			}
 		}
@@ -610,13 +693,13 @@ void ULogiTerrainSubsystem::Tick(float DeltaTime)
 			// SUBMISSIONS, not game-thread cost: at most NaniteTileBuildsPerStep builds are submitted
 			// per step, bounding in-flight worker builds + encode memory; the rest submit on later steps.
 			int32 BuildBudget = FMath::Max(1, GetDefault<ULogiBevyDeveloperSettings>()->NaniteTileBuildsPerStep);
-			TSet<uint64> Resident;
-			Resident.Reserve(Packet.terrain_patch_count);
+			TSet<uint64>& Resident = ResidentScratch; // reused member; Empty reuses backing (no per-frame free)
+			Resident.Empty(Packet.terrain_patch_count);
 			for (uint32 i = 0; i < Packet.terrain_patch_count; ++i)
 			{
 				const LogiTerrainPatchDraw& P = Packet.terrain_patches[i];
 				const uint64 Key = P.patch_handle;
-				if (P.bounds.radius > 2500.0f) // same giant-root skip as the proc-mesh lane
+				if (P.bounds.radius > GiantTileRadiusMeters) // same giant-root skip as the proc-mesh lane
 				{
 					if (FNaniteTile* Giant = TileNanite.Find(Key))
 					{
@@ -629,7 +712,31 @@ void ULogiTerrainSubsystem::Tick(float DeltaTime)
 				if (FNaniteTile* Existing = TileNanite.Find(Key))
 				{
 					Existing->LastSeen = FrameCounter; // already built -> just refresh its LRU stamp
+					// Tile-local mesh: keep the component on the tile by (re)setting its origin-relative
+					// offset. Constant between rebases (SetRelativeLocation early-outs when unchanged); on a
+					// rebase this is what slides the resident tile to the new origin -- no re-encode.
+					if (UStaticMeshComponent* C = Existing->Comp.Get())
+					{
+						C->SetRelativeLocation(NaniteTileRelativeLocation(P));
+					}
 					continue;
+				}
+				// Re-entry cache: a recently-evicted tile re-entered the view -> reuse its already-encoded
+				// Nanite mesh instead of re-running the (expensive, async) encode. Cheap -> NOT budgeted.
+				if (FLogiNaniteCachedTile* Cached = NaniteMeshCache.Find(Key))
+				{
+					if (UStaticMesh* CachedMesh = Cached->Mesh.Get())
+					{
+						if (UStaticMeshComponent* Comp = AcquireStaticMeshComponent())
+						{
+							Comp->SetStaticMesh(CachedMesh); // the component now roots the mesh
+							Comp->SetRelativeLocation(NaniteTileRelativeLocation(P)); // tile-local mesh -> place via transform
+							TileNanite.Add(Key, FNaniteTile{ Comp, FrameCounter });
+							NaniteMeshCache.Remove(Key); // moved cache -> resident
+						}
+						continue; // reused (or host gone -> left cached, retry next step); no rebuild
+					}
+					NaniteMeshCache.Remove(Key); // stale entry -> fall through to a fresh build
 				}
 				if (BuildBudget <= 0)
 				{
@@ -650,6 +757,7 @@ void ULogiTerrainSubsystem::Tick(float DeltaTime)
 						if (UStaticMeshComponent* Comp = AcquireStaticMeshComponent())
 						{
 							Comp->SetStaticMesh(TileMesh);
+							Comp->SetRelativeLocation(NaniteTileRelativeLocation(P)); // tile-local mesh -> place via transform
 							TileNanite.Add(Key, FNaniteTile{ Comp, FrameCounter });
 						}
 						else
@@ -668,22 +776,24 @@ void ULogiTerrainSubsystem::Tick(float DeltaTime)
 				}
 			}
 			// Return tiles that left the resident set to the component pool.
-			TArray<uint64> ToReleaseNanite;
+			DepartedScratch.Reset(); // reused member (keeps capacity, no per-frame alloc)
 			for (const TPair<uint64, FNaniteTile>& Pair : TileNanite)
 			{
-				if (!Resident.Contains(Pair.Key)) { ToReleaseNanite.Add(Pair.Key); }
+				if (!Resident.Contains(Pair.Key)) { DepartedScratch.Add(Pair.Key); }
 			}
-			for (uint64 K : ToReleaseNanite)
+			for (uint64 K : DepartedScratch)
 			{
-				ReleaseNaniteTile(TileNanite.FindAndRemoveChecked(K));
+				// Cache the departed tile's encoded mesh (don't drop it) so a quick re-visit skips the rebuild.
+				CacheNaniteTile(K, TileNanite.FindAndRemoveChecked(K));
 			}
+			TrimNaniteCache();         // bound the re-entry cache (NaniteReentryCacheSize, LRU)
 			EvictNaniteIfOverBudget(); // bounded-LRU safety cap (parity with proc-mesh EvictIfOverBudget)
 		}
 		else
 #endif
 		{
-		TSet<uint64> Resident;
-		Resident.Reserve(Packet.terrain_patch_count);
+		TSet<uint64>& Resident = ResidentScratch; // reused member; Empty reuses backing (no per-frame free)
+		Resident.Empty(Packet.terrain_patch_count);
 		for (uint32 i = 0; i < Packet.terrain_patch_count; ++i)
 		{
 			const LogiTerrainPatchDraw& P = Packet.terrain_patches[i];
@@ -691,7 +801,7 @@ void ULogiTerrainSubsystem::Tick(float DeltaTime)
 			// Skip world-spanning coarse/root fallbacks (lod 0-2, radius > 2.5 km): drawn as one giant
 			// proc-mesh section they bloat the component bounds to ~world size and break UE's culling,
 			// dropping the real fine terrain. Drop any existing giant section so it stops polluting bounds.
-			if (P.bounds.radius > 2500.0f)
+			if (P.bounds.radius > GiantTileRadiusMeters)
 			{
 				if (FTileEntry* Giant = TileSection.Find(Key))
 				{
@@ -727,12 +837,12 @@ void ULogiTerrainSubsystem::Tick(float DeltaTime)
 		// unions SectionLocalBox over ALL sections ignoring visibility, and SetMeshSectionVisible never
 		// updates bounds -- so merely hiding a tile leaves it inflating the component bounds and wrecking
 		// frustum culling. Collect keys first (can't mutate TileSection while iterating it), then clear.
-		TArray<uint64> ToRemove;
+		DepartedScratch.Reset(); // reused member (keeps capacity, no per-frame alloc)
 		for (const TPair<uint64, FTileEntry>& Pair : TileSection)
 		{
-			if (!Resident.Contains(Pair.Key)) { ToRemove.Add(Pair.Key); }
+			if (!Resident.Contains(Pair.Key)) { DepartedScratch.Add(Pair.Key); }
 		}
-		for (uint64 K : ToRemove)
+		for (uint64 K : DepartedScratch)
 		{
 			const FTileEntry E = TileSection.FindAndRemoveChecked(K);
 			Mesh->ClearMeshSection(E.Section);

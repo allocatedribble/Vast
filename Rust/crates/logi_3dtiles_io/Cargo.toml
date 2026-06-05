@@ -1,0 +1,19 @@
+[package]
+name = "logi_3dtiles_io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# Production HTTP backend: blocking ureq (rustls TLS) + the url crate for tile-URL resolution. NO tokio —
+# the streaming kernel is single-owner-thread; HTTP runs on a worker pool draining into poll_completed.
+ureq = "2"
+url = "2"
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+# For the live P3DT streaming example (resolve → fetch → parse → fetch a tile → attempt decode).
+logi_3dtiles_ion = { path = "../logi_3dtiles_ion" }
+logi_3dtiles_tileset = { path = "../logi_3dtiles_tileset" }
+logi_gltf = { path = "../logi_gltf" }

@@ -94,11 +94,6 @@ impl<V> ResidencyCache<V> {
         }
     }
 
-    /// Resident lookup without touching LRU order or stats (for ancestor-fallback probing).
-    pub fn peek(&self, id: &TileId) -> Option<&V> {
-        self.entries.get(id).map(|e| &e.value)
-    }
-
     /// Mark `id` most-recently-used without affecting hit/miss stats — pins the active working set
     /// (e.g. coarse ancestors used for fallback) so it is never evicted out from under the camera.
     pub fn promote(&mut self, id: &TileId) {

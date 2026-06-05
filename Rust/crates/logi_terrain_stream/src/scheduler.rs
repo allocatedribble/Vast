@@ -4,28 +4,6 @@
 use logi_terrain_core::{DVec3, TileId};
 use logi_terrain_lod::screen_space_error;
 
-/// Page lifecycle (§6.1).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PageState {
-    Unknown,
-    Indexed,
-    Wanted,
-    Reserved,
-    RequestQueued,
-    Requesting,
-    CompressedResident,
-    DecodeQueued,
-    DecodedResident,
-    GpuUploadQueued,
-    GpuMirrorResident,
-    Visible,
-    KeepAlive,
-    Evictable,
-    Evicted,
-    FailedTransient,
-    FailedPermanent,
-}
-
 /// Scheduling queues (§6.2), most urgent first.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(usize)]

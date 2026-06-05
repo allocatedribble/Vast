@@ -27,8 +27,14 @@ pub struct LogiEntityInspectorPacket {
 }
 
 /// Fill `out_packet` with a page of entity summaries. Owner-thread only.
+///
+/// # Safety
+/// `world` must be a valid handle from [`crate::logi_world_create`] called on its owner thread; `query`
+/// must be null or point to a readable `LogiEntityQueryDesc`; `out_packet` must be null or point to
+/// writable `LogiEntityInspectorPacket` storage; `err` must be null or writable. The returned `entities`
+/// pointer is valid only until the next query on the same world.
 #[no_mangle]
-pub extern "C" fn logi_editor_query_entities(
+pub unsafe extern "C" fn logi_editor_query_entities(
 	world: *mut LogiWorld,
 	query: *const LogiEntityQueryDesc,
 	out_packet: *mut LogiEntityInspectorPacket,
@@ -62,8 +68,12 @@ pub extern "C" fn logi_editor_query_entities(
 }
 
 /// Pin/unpin an entity for editor debug focus. Owner-thread only.
+///
+/// # Safety
+/// `world` must be a valid handle from [`crate::logi_world_create`] called on its owner thread; `err` must
+/// be null or point to writable `LogiError` storage.
 #[no_mangle]
-pub extern "C" fn logi_editor_set_debug_pin(
+pub unsafe extern "C" fn logi_editor_set_debug_pin(
 	world: *mut LogiWorld,
 	id: LogiEntityId,
 	pinned: u8,

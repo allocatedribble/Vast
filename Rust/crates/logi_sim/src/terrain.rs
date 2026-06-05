@@ -32,7 +32,7 @@ pub struct Terrain {
 
 impl Default for Terrain {
 	fn default() -> Self {
-		Self { heights: TerrainHeights::new(0) }
+		Self::canonical()
 	}
 }
 
@@ -41,6 +41,15 @@ impl Terrain {
 		Self::default()
 	}
 
+	/// The **canonical shared terrain** — the same field (seed + amplitude + noise params) the renderer
+	/// draws (`logi_terrain_procgen::TerrainHeights::canonical`). Gameplay MUST sample this so agents sit
+	/// on the terrain you see; do not seed the sim terrain independently of the render scene.
+	pub fn canonical() -> Self {
+		Self { heights: TerrainHeights::canonical() }
+	}
+
+	/// Test/diagnostic helper: a terrain with an arbitrary seed. NOT for gameplay — production terrain
+	/// must be [`Terrain::canonical`] so the sim and render fields agree.
 	pub fn with_seed(seed: u64) -> Self {
 		Self { heights: TerrainHeights::new(seed) }
 	}

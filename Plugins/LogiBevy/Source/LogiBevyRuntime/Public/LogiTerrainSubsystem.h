@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
 #include "Templates/PimplPtr.h"
+#include "UObject/StrongObjectPtr.h" // Nanite re-entry cache keeps evicted meshes GC-strong
 #include "LogiTerrainSubsystem.generated.h"
 
 class FLogiTerrainWorld;
@@ -86,8 +87,25 @@ private:
 	/** Bounded-LRU safety cap for the Nanite lane (parity with proc-mesh EvictIfOverBudget):
 	 *  when TileNanite exceeds MaxNaniteTiles, release the oldest (never a current-frame tile). */
 	void EvictNaniteIfOverBudget();
-	/** Tear down every Nanite-lane tile (lane switch / origin rebase / shutdown). */
+	/** Tear down every Nanite-lane tile (lane switch / shutdown -- NOT rebase; tiles survive it now). */
 	void ClearNaniteLane();
+
+	/** One recently-EVICTED Nanite tile, retained for cheap re-entry: keeps the already-encoded
+	 *  UStaticMesh alive (TStrongObjectPtr, GC-strong, no UPROPERTY needed) so re-visiting the area
+	 *  skips the expensive async Nanite re-encode. Bounded by NaniteReentryCacheSize. The meshes are
+	 *  origin-INDEPENDENT (tile-local geometry + component transform), so the cache survives an origin
+	 *  rebase -- only a lane switch / shutdown clears it. */
+	struct FLogiNaniteCachedTile
+	{
+		TStrongObjectPtr<class UStaticMesh> Mesh;
+		uint64 CachedFrame = 0; // for LRU trim
+	};
+	/** Move a departed tile's encoded mesh into the re-entry cache (then pool its component). */
+	void CacheNaniteTile(uint64 Key, const FNaniteTile& Tile);
+	/** Bound the re-entry cache to NaniteReentryCacheSize (LRU: drop the oldest). */
+	void TrimNaniteCache();
+	/** Drop the whole re-entry cache (lane switch / shutdown). */
+	void ClearNaniteCache();
 #endif
 
 	TPimplPtr<FLogiTerrainWorld> TerrainWorld;
@@ -98,10 +116,15 @@ private:
 	int32 NextSection = 0;
 	uint64 FrameCounter = 0;
 	float EditorTickAccum = 0.0f; // editor-world tick throttle (don't step the streaming kernel every editor frame)
+	// Reused per-frame scratch for the resident-set diff (both render lanes; only one runs per frame): the
+	// keys resident THIS frame + the keys that departed. Members so the per-frame diff reuses backing storage.
+	TSet<uint64> ResidentScratch;
+	TArray<uint64> DepartedScratch;
 #if LOGI_TERRAIN_NANITE_LANE
 	TMap<uint64 /*patch handle*/, FNaniteTile> TileNanite; // resident Nanite-lane tiles
 	TArray<TWeakObjectPtr<class UStaticMeshComponent>> FreeStaticComps; // recyclable pooled components
 	bool bNaniteLaneActive = false; // which lane is currently live (tracks the setting for switch-over)
+	TMap<uint64 /*patch handle*/, FLogiNaniteCachedTile> NaniteMeshCache; // evicted meshes kept for cheap re-entry
 #endif
 #if WITH_EDITOR
 	FLogiTerrainStats EditorStats;

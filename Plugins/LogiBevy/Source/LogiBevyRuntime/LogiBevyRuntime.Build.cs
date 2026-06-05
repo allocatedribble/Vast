@@ -25,6 +25,8 @@ public class LogiBevyRuntime : ModuleRules
 			"Projects",                // IPluginManager (locating the staged DLL at runtime)
 			"DeveloperSettings",       // ULogiBevyDeveloperSettings (Project Settings)
 			"ProceduralMeshComponent", // actorless terrain debug-lane mesh (ADR-0007 / D)
+			"ImageWrapper",            // decode per-tile P3DT JPEG/PNG atlases into runtime textures (Milestone F M2)
+			"RenderCore",              // UTexture2D transient mip upload (PF_B8G8R8A8)
 		});
 
 		if (Target.bBuildEditor)
@@ -43,7 +45,12 @@ public class LogiBevyRuntime : ModuleRules
 		string ProjectRoot = Path.GetFullPath(Path.Combine(PluginDir, "..", ".."));
 		string RustDir = Path.Combine(ProjectRoot, "Rust");
 		string FfiInclude = Path.Combine(RustDir, "crates", "logi_ffi", "include");
-		string RustOutDir = Path.Combine(RustDir, "target", "release");
+		// Separate cargo output by feature set (audit): editor builds carry editor_inspector; game/shipping
+		// don't. One shared target/release dir let an editor build link a DLL a prior game build staged (or
+		// vice-versa) — a feature mismatch surfacing only as a delay-load failure at first inspector use.
+		bool bWithEditorInspector = Target.Type == TargetType.Editor;
+		string RustTargetSubdir = bWithEditorInspector ? "ue-editor" : "ue-game";
+		string RustOutDir = Path.Combine(RustDir, "target", RustTargetSubdir, "release");
 
 		PublicIncludePaths.Add(FfiInclude);
 
@@ -51,9 +58,11 @@ public class LogiBevyRuntime : ModuleRules
 		{
 			// Editor builds get the editor_inspector feature (logi_editor_* exports);
 			// Game/Shipping stay clean (zero editor cost, ADR-0006).
-			bool bWithEditorInspector = Target.Type == TargetType.Editor;
-			TryBuildCargo(RustDir, "logi_ffi", bWithEditorInspector ? " --features editor_inspector" : "");
-			TryBuildCargo(RustDir, "logi_terrain_ffi", "");
+			// Both crates build into the SAME per-feature target dir so the terrain DLL is found alongside
+			// logi_ffi at RustOutDir (relative path = relative to RustDir, cargo's working dir).
+			string TargetDirArg = " --target-dir target/" + RustTargetSubdir;
+			TryBuildCargo(RustDir, "logi_ffi", (bWithEditorInspector ? " --features editor_inspector" : "") + TargetDirArg);
+			TryBuildCargo(RustDir, "logi_terrain_ffi", TargetDirArg);
 
 			string ImportLib = Path.Combine(RustOutDir, "logi_ffi.dll.lib");
 			string Dll = Path.Combine(RustOutDir, "logi_ffi.dll");

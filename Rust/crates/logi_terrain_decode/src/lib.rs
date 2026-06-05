@@ -16,6 +16,13 @@ pub fn height_mesh(page: &HeightPage, world_size: f32) -> MeshData {
     let w = page.width as usize;
     let h = page.height as usize;
     assert!(w >= 2 && h >= 2, "height page must be at least 2x2");
+    // Guard the u32 vertex/index counts built below: the surface alone needs 6·(w-1)·(h-1) indices, so an
+    // oversized page (width/height are u16, up to 65535²) would overflow `(indices.len()/4) as u32` and the
+    // vertex buffer allocation. Cap w·h well under u32::MAX/6 — realistic pages are ≤513².
+    assert!(
+        (w as u64) * (h as u64) <= (u32::MAX as u64) / 8,
+        "height page too large ({w}x{h}): u32 vertex/index counts would overflow"
+    );
 
     let step_x = world_size / (w as f32 - 1.0);
     let step_z = world_size / (h as f32 - 1.0);

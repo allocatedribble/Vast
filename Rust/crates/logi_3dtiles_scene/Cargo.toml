@@ -1,0 +1,20 @@
+[package]
+name = "logi_3dtiles_scene"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# M1: the AGI_HQ building scene — decode the .dae + transform into UE render space. Grows into the full
+# streaming scene (select + io + decode + rebase) once the M1 texture/placement path is proven.
+logi_collada = { path = "../logi_collada" }
+logi_geospatial = { path = "../logi_geospatial" }
+glam = { workspace = true }
+# The streaming tileset world (3D Tiles): traversal + worker-pool fetch + glTF decode + ECEF→ENU rebase.
+logi_3dtiles_tileset = { path = "../logi_3dtiles_tileset" }
+logi_3dtiles_select = { path = "../logi_3dtiles_select" }
+logi_3dtiles_io = { path = "../logi_3dtiles_io" }
+logi_gltf = { path = "../logi_gltf" }
+# ion endpoint resolution for the `from_ion` convenience constructor (resolve → fetch root → build world).
+logi_3dtiles_ion = { path = "../logi_3dtiles_ion" }

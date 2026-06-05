@@ -4,10 +4,12 @@ edition.workspace = true
 version.workspace = true
 publish = false
 
-# cdylib (delay-loaded DLL) for iteration; staticlib also emitted so Unreal can
-# switch link strategy after profiling (ADR-0005 / AGENTS.md § 5).
+# cdylib (delay-loaded DLL) — the link strategy the Build.cs uses today (it links `logi_ffi.dll.lib`).
+# The staticlib was emitted "in case" but is never linked, so it only cost build time (LTO +
+# codegen-units=1) on every cargo run (ADR-0004: don't build what nothing uses). Re-add "staticlib" here
+# together with the Build.cs switch when profiling justifies it (ADR-0005 / AGENTS.md § 5).
 [lib]
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["cdylib"]
 
 [features]
 default = []

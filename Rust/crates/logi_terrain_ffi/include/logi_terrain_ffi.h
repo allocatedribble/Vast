@@ -194,6 +194,89 @@ void       logi_terrain_world_release_frame(LogiTerrainWorld* world, LogiFrameId
 
 size_t     logi_terrain_last_error_message(uint8_t* buf, size_t buf_len);
 
+/* --- M1 building (AGI_HQ, ADR-0009) — additive; see src/ffi.rs. Decode a .dae + .jpg into a textured
+ * mesh in Unreal render space (cm, Z-up LH). Separate from the streaming terrain world. --- */
+
+typedef struct LogiBuilding LogiBuilding; /* opaque */
+
+typedef struct LogiPlacement {
+    double longitude_deg;
+    double latitude_deg;
+    double height_m;
+    double heading_deg;
+} LogiPlacement;
+
+typedef struct LogiBuildingData {
+    const uint8_t* vertices;          /* vertex_count * 32-byte vertices (pos f3 | normal f3 | uv f2) */
+    uint64_t       vertices_len;
+    uint32_t       vertex_count;
+    uint32_t       vertex_stride;     /* = 32 */
+    const uint8_t* indices;           /* index_count little-endian uint32 indices */
+    uint32_t       index_count;
+    uint32_t       _pad;
+    const uint8_t* texture_jpeg;      /* raw JPEG bytes (decode C++-side) */
+    uint64_t       texture_jpeg_len;
+    float          bounds_center[3];
+    float          bounds_radius;
+    double         ecef_origin[3];    /* WGS84 ECEF (metres) — for globe placement (M2+) */
+} LogiBuildingData;
+
+LogiBuilding* logi_building_load(const char* dae_path, const char* jpg_path, const LogiPlacement* placement);
+LogiStatus    logi_building_get_data(const LogiBuilding* building, LogiBuildingData* out);
+void          logi_building_destroy(LogiBuilding* building);
+
+/* --- Streaming globe (Google Photorealistic 3D Tiles, ADR-0009 Milestone F) — additive; see src/ffi.rs.
+ * Resolves a Cesium ion asset, streams + decodes glTF tiles on a worker pool, and rebases each into
+ * Unreal render space (cm, Z-up LH) at a fixed ENU origin. step() returns a multi-tile frame whose tile
+ * buffers are zero-copy views into Rust-owned memory, valid until the next step() on that world. --- */
+
+typedef struct LogiGlobeWorld LogiGlobeWorld; /* opaque */
+
+typedef struct LogiGlobeCreateInfo {
+    uint64_t ion_asset_id;
+    double   origin_longitude_deg;
+    double   origin_latitude_deg;
+    double   origin_height_m;
+    double   max_tile_distance_m;    /* spatial cull radius (metres) around the camera */
+    uint32_t workers;                /* fetch threads (clamped 1..64) */
+    uint32_t _reserved;
+    uint64_t cache_budget_bytes;     /* persistent disk-cache budget (bytes); 0 disables (dir = cache_dir arg) */
+} LogiGlobeCreateInfo;
+
+typedef struct LogiGlobeTile {
+    uint64_t       tile_key;          /* stable hash of the tile path — key for C++ section caching */
+    const uint8_t* vertices;          /* vertex_count * 32-byte vertices (pos f3 | normal f3 | uv f2), UE cm */
+    uint64_t       vertices_len;
+    uint32_t       vertex_count;
+    uint32_t       vertex_stride;     /* = 32 */
+    const uint8_t* indices;           /* index_count little-endian uint32 indices */
+    uint32_t       index_count;
+    uint32_t       _pad;
+    const uint8_t* texture_jpeg;      /* raw encoded image bytes (JPEG/PNG), decode C++-side; may be empty */
+    uint64_t       texture_jpeg_len;
+    float          bounds_center[3];  /* UE render space (cm) */
+    float          bounds_radius;
+} LogiGlobeTile;
+
+typedef struct LogiGlobeFrame {
+    const LogiGlobeTile* tiles;       /* -> world scratch array, valid until the next step() */
+    uint32_t             tile_count;
+    uint32_t             resident_tiles;
+    uint32_t             in_flight;
+    uint32_t             _pad;
+    double               origin_ecef[3]; /* ENU origin's WGS84 ECEF (metres) — globe/atmosphere placement */
+} LogiGlobeFrame;
+
+/* Blocking (ion resolve + root fetch); call off the render thread. Returns NULL on failure. `cache_dir`
+ * (UTF-8 path, or NULL/empty) + info.cache_budget_bytes enable the persistent on-disk tile cache. */
+LogiGlobeWorld* logi_globe_world_create(const LogiGlobeCreateInfo* info, const char* ion_token, const char* cache_dir);
+LogiStatus      logi_globe_world_step(LogiGlobeWorld* world,
+                                      double camera_x_cm, double camera_y_cm, double camera_z_cm,
+                                      double fov_y_radians, double viewport_height, double max_sse_pixels,
+                                      LogiGlobeFrame* out_frame);
+uint64_t        logi_globe_world_cached_bytes(const LogiGlobeWorld* world); /* disk-cache resident bytes (telemetry) */
+void            logi_globe_world_destroy(LogiGlobeWorld* world);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
