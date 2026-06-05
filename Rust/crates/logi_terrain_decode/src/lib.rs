@@ -58,8 +58,16 @@ pub fn height_mesh(page: &HeightPage, world_size: f32) -> MeshData {
             let n = [nx * inv, ny * inv, nz * inv];
             normals.push(n);
 
-            for v in [px, py, pz, n[0], n[1], n[2],
-                      i as f32 / (w as f32 - 1.0), j as f32 / (h as f32 - 1.0)] {
+            for v in [
+                px,
+                py,
+                pz,
+                n[0],
+                n[1],
+                n[2],
+                i as f32 / (w as f32 - 1.0),
+                j as f32 / (h as f32 - 1.0),
+            ] {
                 vertices.extend_from_slice(&v.to_le_bytes());
             }
         }
@@ -88,10 +96,18 @@ pub fn height_mesh(page: &HeightPage, world_size: f32) -> MeshData {
 
     // Perimeter ring (corners once → a continuous skirt).
     let mut perim: Vec<(usize, usize)> = Vec::with_capacity(2 * w + 2 * h);
-    for i in 0..w { perim.push((i, 0)); }                 // bottom edge
-    for j in 1..h { perim.push((w - 1, j)); }             // right edge
-    for i in (0..w - 1).rev() { perim.push((i, h - 1)); } // top edge
-    for j in (1..h - 1).rev() { perim.push((0, j)); }     // left edge
+    for i in 0..w {
+        perim.push((i, 0));
+    } // bottom edge
+    for j in 1..h {
+        perim.push((w - 1, j));
+    } // right edge
+    for i in (0..w - 1).rev() {
+        perim.push((i, h - 1));
+    } // top edge
+    for j in (1..h - 1).rev() {
+        perim.push((0, j));
+    } // left edge
 
     let skirt_base = (w * h) as u32;
     for &(i, j) in &perim {
@@ -99,8 +115,16 @@ pub fn height_mesh(page: &HeightPage, world_size: f32) -> MeshData {
         let pz = -half + j as f32 * step_z;
         let py = elev(i, j) - skirt_depth;
         let n = normals[j * w + i];
-        for v in [px, py, pz, n[0], n[1], n[2],
-                  i as f32 / (w as f32 - 1.0), j as f32 / (h as f32 - 1.0)] {
+        for v in [
+            px,
+            py,
+            pz,
+            n[0],
+            n[1],
+            n[2],
+            i as f32 / (w as f32 - 1.0),
+            j as f32 / (h as f32 - 1.0),
+        ] {
             vertices.extend_from_slice(&v.to_le_bytes());
         }
     }

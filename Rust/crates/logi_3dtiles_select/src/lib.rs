@@ -52,12 +52,7 @@ pub struct Selection {
 /// The same SSE model as `logi_terrain_lod` and 3D Tiles: `geometricError · height / (2 · distance ·
 /// tan(fovY/2))`.
 #[inline]
-pub fn screen_space_error(
-    geometric_error: f64,
-    distance: f64,
-    fov_y_radians: f64,
-    viewport_height: f64,
-) -> f64 {
+pub fn screen_space_error(geometric_error: f64, distance: f64, fov_y_radians: f64, viewport_height: f64) -> f64 {
     // Clamp `tan(fovY/2)` to a tiny positive: a degenerate `fov_y_radians` (0, or ≥ π) would otherwise
     // divide by zero → inf/NaN, and a NaN SSE silently disables refinement. Real FOVs are inside (0, π).
     let half_fov_tan = (fov_y_radians * 0.5).tan().max(1e-6);
@@ -89,8 +84,14 @@ pub fn bounding_sphere_ecef(bv: &BoundingVolume, world: &DMat4, ellipsoid: &Elli
             // uses an oriented box there. v1 simplification (regions are normally tiny leaves).
             let (west, south, east, north, min_h, max_h) = (r[0], r[1], r[2], r[3], r[4], r[5]);
             let corners = [
-                (west, south, min_h), (east, south, min_h), (west, north, min_h), (east, north, min_h),
-                (west, south, max_h), (east, south, max_h), (west, north, max_h), (east, north, max_h),
+                (west, south, min_h),
+                (east, south, min_h),
+                (west, north, min_h),
+                (east, north, min_h),
+                (west, south, max_h),
+                (east, south, max_h),
+                (west, north, max_h),
+                (east, north, max_h),
             ];
             let pts: Vec<DVec3> = corners
                 .iter()
@@ -104,7 +105,11 @@ pub fn bounding_sphere_ecef(bv: &BoundingVolume, world: &DMat4, ellipsoid: &Elli
 }
 
 fn max_axis_scale(m: &DMat4) -> f64 {
-    m.x_axis.truncate().length().max(m.y_axis.truncate().length()).max(m.z_axis.truncate().length())
+    m.x_axis
+        .truncate()
+        .length()
+        .max(m.y_axis.truncate().length())
+        .max(m.z_axis.truncate().length())
 }
 
 /// Select the tiles to render + load for `params`, given pluggable predicates:
@@ -132,7 +137,14 @@ pub fn select_tree(
 ) -> Selection {
     let mut render: HashMap<Vec<u32>, Rc<SelectedTile>> = HashMap::new();
     let mut load: Vec<SelectedTile> = Vec::new();
-    let mut ctx = Ctx { ellipsoid, params, is_loaded, is_visible, render: &mut render, load: &mut load };
+    let mut ctx = Ctx {
+        ellipsoid,
+        params,
+        is_loaded,
+        is_visible,
+        render: &mut render,
+        load: &mut load,
+    };
     visit(root, Vec::new(), root.matrix(), None, &mut ctx);
     // By here each render entry is the sole owner of its Rc (the recursion's clones are dropped), so
     // `try_unwrap` moves the value out without copying; it would only clone on the (unreachable) shared case.
@@ -288,7 +300,7 @@ mod tests {
         let mut is_loaded = |p: &[u32]| p.is_empty();
         let sel = select(&ts, &e, &params_at(2000.0), &mut is_loaded, &mut |_, _| true);
         assert_eq!(paths(&sel.render), BTreeSet::from([vec![]])); // root is the only resident fallback
-        // all four leaves are requested.
+                                                                  // all four leaves are requested.
         assert_eq!(
             paths(&sel.load),
             BTreeSet::from([vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1]])
@@ -338,7 +350,7 @@ mod tests {
         let (c2, r2) = bounding_sphere_ecef(&BoundingVolume::Sphere([1.0, 0.0, 0.0, 5.0]), &m, &e);
         assert_eq!(c2, DVec3::new(102.0, 0.0, 0.0)); // 100 + 1*2
         assert!((r2 - 10.0).abs() < 1e-9); // 5 * scale 2
-        // region: a small patch near the equator bounds to a sphere on the globe.
+                                           // region: a small patch near the equator bounds to a sphere on the globe.
         let patch = BoundingVolume::Region([-0.01, -0.01, 0.01, 0.01, 0.0, 100.0]);
         let (cr, rr) = bounding_sphere_ecef(&patch, &id, &e);
         assert!((cr.length() - WGS84_ISH).abs() < 70_000.0); // center is ~on the globe

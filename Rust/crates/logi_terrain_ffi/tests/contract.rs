@@ -5,9 +5,9 @@
 
 // The ffi crate's lib is named `logi_terrain` (so the plugin is logi_terrain.dll).
 use logi_terrain::ffi::{
-    logi_terrain_abi_version, logi_terrain_world_acquire_buffer_view, logi_terrain_world_create, logi_terrain_world_destroy,
-    logi_terrain_world_get_frame_packet, logi_terrain_world_release_frame, logi_terrain_world_set_camera, logi_terrain_world_step,
-    LogiStatus,
+    logi_terrain_abi_version, logi_terrain_world_acquire_buffer_view, logi_terrain_world_create,
+    logi_terrain_world_destroy, logi_terrain_world_get_frame_packet, logi_terrain_world_release_frame,
+    logi_terrain_world_set_camera, logi_terrain_world_step, LogiStatus,
 };
 use logi_terrain_core::{DVec3, Vec3};
 use logi_terrain_scene::{LogiBufferView, LogiCameraState, LogiFramePacket, LogiTerrainPatchDraw};
@@ -32,14 +32,20 @@ fn world_streams_tiles_and_serves_buffer_views() {
     assert!(!world.is_null());
 
     let camera = camera_over_world();
-    assert_eq!(unsafe { logi_terrain_world_set_camera(world, &camera as *const _) }, LogiStatus::Ok);
+    assert_eq!(
+        unsafe { logi_terrain_world_set_camera(world, &camera as *const _) },
+        LogiStatus::Ok
+    );
 
     let mut frame_id: u64 = 0;
     let mut packet: LogiFramePacket = unsafe { std::mem::zeroed() };
 
     // Warm up: full step -> get -> release cycle so synthetic tiles stream in.
     for _ in 0..40 {
-        assert_eq!(unsafe { logi_terrain_world_step(world, 0.016, &mut frame_id as *mut u64) }, LogiStatus::Ok);
+        assert_eq!(
+            unsafe { logi_terrain_world_step(world, 0.016, &mut frame_id as *mut u64) },
+            LogiStatus::Ok
+        );
         assert_ne!(frame_id, 0);
         assert_eq!(
             unsafe { logi_terrain_world_get_frame_packet(world, frame_id, &mut packet as *mut _) },
@@ -49,14 +55,21 @@ fn world_streams_tiles_and_serves_buffer_views() {
     }
 
     // Final frame: inspect before releasing.
-    assert_eq!(unsafe { logi_terrain_world_step(world, 0.016, &mut frame_id as *mut u64) }, LogiStatus::Ok);
+    assert_eq!(
+        unsafe { logi_terrain_world_step(world, 0.016, &mut frame_id as *mut u64) },
+        LogiStatus::Ok
+    );
     assert_eq!(
         unsafe { logi_terrain_world_get_frame_packet(world, frame_id, &mut packet as *mut _) },
         LogiStatus::Ok
     );
 
     assert_eq!(packet.frame_id, frame_id);
-    assert!(packet.terrain_patch_count >= 1, "streamed patches after warmup: {}", packet.terrain_patch_count);
+    assert!(
+        packet.terrain_patch_count >= 1,
+        "streamed patches after warmup: {}",
+        packet.terrain_patch_count
+    );
     assert!(!packet.terrain_patches.is_null());
     // The not-yet-implemented descriptor arrays are present-but-empty.
     assert_eq!(packet.instance_batch_count, 0);
@@ -76,7 +89,10 @@ fn world_streams_tiles_and_serves_buffer_views() {
     );
     assert!(!vview.data.is_null());
     assert_eq!(vview.element_stride, 32);
-    assert_eq!(vview.byte_length, (patch.vertex_count as u64) * (patch.vertex_stride as u64));
+    assert_eq!(
+        vview.byte_length,
+        (patch.vertex_count as u64) * (patch.vertex_stride as u64)
+    );
 
     let mut iview: LogiBufferView = unsafe { std::mem::zeroed() };
     assert_eq!(
@@ -104,19 +120,28 @@ fn max_lod_for_sse(sse_target_pixels: f32) -> u32 {
         viewport_height: 1080.0,
         sse_target_pixels,
     };
-    assert_eq!(unsafe { logi_terrain_world_set_camera(world, &camera as *const _) }, LogiStatus::Ok);
+    assert_eq!(
+        unsafe { logi_terrain_world_set_camera(world, &camera as *const _) },
+        LogiStatus::Ok
+    );
 
     let mut frame_id: u64 = 0;
     let mut packet: LogiFramePacket = unsafe { std::mem::zeroed() };
     for _ in 0..60 {
-        assert_eq!(unsafe { logi_terrain_world_step(world, 0.016, &mut frame_id as *mut u64) }, LogiStatus::Ok);
+        assert_eq!(
+            unsafe { logi_terrain_world_step(world, 0.016, &mut frame_id as *mut u64) },
+            LogiStatus::Ok
+        );
         assert_eq!(
             unsafe { logi_terrain_world_get_frame_packet(world, frame_id, &mut packet as *mut _) },
             LogiStatus::Ok
         );
         unsafe { logi_terrain_world_release_frame(world, frame_id) };
     }
-    assert_eq!(unsafe { logi_terrain_world_step(world, 0.016, &mut frame_id as *mut u64) }, LogiStatus::Ok);
+    assert_eq!(
+        unsafe { logi_terrain_world_step(world, 0.016, &mut frame_id as *mut u64) },
+        LogiStatus::Ok
+    );
     assert_eq!(
         unsafe { logi_terrain_world_get_frame_packet(world, frame_id, &mut packet as *mut _) },
         LogiStatus::Ok
@@ -164,19 +189,28 @@ fn rendered_patches_are_in_front_of_camera() {
         viewport_height: 1080.0,
         sse_target_pixels: 2.0,
     };
-    assert_eq!(unsafe { logi_terrain_world_set_camera(world, &camera as *const _) }, LogiStatus::Ok);
+    assert_eq!(
+        unsafe { logi_terrain_world_set_camera(world, &camera as *const _) },
+        LogiStatus::Ok
+    );
 
     let mut frame_id: u64 = 0;
     let mut packet: LogiFramePacket = unsafe { std::mem::zeroed() };
     for _ in 0..60 {
-        assert_eq!(unsafe { logi_terrain_world_step(world, 0.016, &mut frame_id as *mut u64) }, LogiStatus::Ok);
+        assert_eq!(
+            unsafe { logi_terrain_world_step(world, 0.016, &mut frame_id as *mut u64) },
+            LogiStatus::Ok
+        );
         assert_eq!(
             unsafe { logi_terrain_world_get_frame_packet(world, frame_id, &mut packet as *mut _) },
             LogiStatus::Ok
         );
         unsafe { logi_terrain_world_release_frame(world, frame_id) };
     }
-    assert_eq!(unsafe { logi_terrain_world_step(world, 0.016, &mut frame_id as *mut u64) }, LogiStatus::Ok);
+    assert_eq!(
+        unsafe { logi_terrain_world_step(world, 0.016, &mut frame_id as *mut u64) },
+        LogiStatus::Ok
+    );
     assert_eq!(
         unsafe { logi_terrain_world_get_frame_packet(world, frame_id, &mut packet as *mut _) },
         LogiStatus::Ok
@@ -208,7 +242,10 @@ fn terrain_has_relief() {
     let world = unsafe { logi_terrain_world_create(std::ptr::null()) };
     assert!(!world.is_null());
     let camera = camera_over_world();
-    assert_eq!(unsafe { logi_terrain_world_set_camera(world, &camera as *const _) }, LogiStatus::Ok);
+    assert_eq!(
+        unsafe { logi_terrain_world_set_camera(world, &camera as *const _) },
+        LogiStatus::Ok
+    );
 
     let mut frame_id: u64 = 0;
     let mut packet: LogiFramePacket = unsafe { std::mem::zeroed() };
@@ -229,7 +266,10 @@ fn terrain_has_relief() {
     }
     unsafe { logi_terrain_world_release_frame(world, frame_id) };
     unsafe { logi_terrain_world_destroy(world) };
-    assert!(max_abs_y > 1.0, "terrain should be displaced, not flat (max |mean elevation| = {max_abs_y})");
+    assert!(
+        max_abs_y > 1.0,
+        "terrain should be displaced, not flat (max |mean elevation| = {max_abs_y})"
+    );
 }
 
 #[test]
@@ -238,9 +278,15 @@ fn world_null_args_rejected_not_crashed() {
     assert!(!world.is_null());
 
     // Valid world, null arg.
-    assert_eq!(unsafe { logi_terrain_world_set_camera(world, std::ptr::null()) }, LogiStatus::NullArg);
+    assert_eq!(
+        unsafe { logi_terrain_world_set_camera(world, std::ptr::null()) },
+        LogiStatus::NullArg
+    );
     let mut fid: u64 = 0;
-    assert_eq!(unsafe { logi_terrain_world_step(world, 0.016, std::ptr::null_mut()) }, LogiStatus::NullArg);
+    assert_eq!(
+        unsafe { logi_terrain_world_step(world, 0.016, std::ptr::null_mut()) },
+        LogiStatus::NullArg
+    );
 
     // Null world.
     assert_eq!(

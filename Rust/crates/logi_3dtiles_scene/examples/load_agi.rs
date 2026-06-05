@@ -21,7 +21,10 @@ fn main() {
                 m.indices.len() / 3,
                 m.texture_jpeg.len()
             );
-            println!("    bounds_center {:?} radius {:.1} cm", m.bounds_center, m.bounds_radius);
+            println!(
+                "    bounds_center {:?} radius {:.1} cm",
+                m.bounds_center, m.bounds_radius
+            );
             println!("    ecef_origin {:?}", m.ecef_origin);
             // Sanity: indices in range, finite positions.
             let vcount = (m.vertices.len() / 32) as u32;

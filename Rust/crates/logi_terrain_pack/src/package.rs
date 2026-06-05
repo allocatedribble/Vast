@@ -2,9 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::page::{
-    content_id, Compression, PackError, PageDescriptor, PageId, PageKind, DESCRIPTOR_LEN,
-};
+use crate::page::{content_id, Compression, PackError, PageDescriptor, PageId, PageKind, DESCRIPTOR_LEN};
 
 const MAGIC: &[u8; 8] = b"LOGIPACK";
 const HEADER_LEN: usize = 36; // magic8 + schema4 + package4 + count4 + dir_offset8 + dir_len8
@@ -79,7 +77,8 @@ impl PackageBuilder {
             out.extend_from_slice(&d.license_id.to_le_bytes());
             out.extend_from_slice(&d.uncompressed_len.to_le_bytes());
             out.extend_from_slice(&d.stored_len.to_le_bytes());
-            out.extend_from_slice(&(d.offset + HEADER_LEN as u64).to_le_bytes()); // absolute
+            out.extend_from_slice(&(d.offset + HEADER_LEN as u64).to_le_bytes());
+            // absolute
         }
         out
     }
@@ -94,13 +93,22 @@ pub struct Package<'a> {
 }
 
 fn rd_u16(b: &[u8], at: usize) -> Result<u16, PackError> {
-    b.get(at..at + 2).and_then(|s| s.try_into().ok()).map(u16::from_le_bytes).ok_or(PackError::Truncated)
+    b.get(at..at + 2)
+        .and_then(|s| s.try_into().ok())
+        .map(u16::from_le_bytes)
+        .ok_or(PackError::Truncated)
 }
 fn rd_u32(b: &[u8], at: usize) -> Result<u32, PackError> {
-    b.get(at..at + 4).and_then(|s| s.try_into().ok()).map(u32::from_le_bytes).ok_or(PackError::Truncated)
+    b.get(at..at + 4)
+        .and_then(|s| s.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or(PackError::Truncated)
 }
 fn rd_u64(b: &[u8], at: usize) -> Result<u64, PackError> {
-    b.get(at..at + 8).and_then(|s| s.try_into().ok()).map(u64::from_le_bytes).ok_or(PackError::Truncated)
+    b.get(at..at + 8)
+        .and_then(|s| s.try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or(PackError::Truncated)
 }
 
 impl<'a> Package<'a> {
@@ -114,9 +122,7 @@ impl<'a> Package<'a> {
         let dir_offset = rd_u64(bytes, 20)? as usize;
         let dir_len = rd_u64(bytes, 28)? as usize;
 
-        if dir_len != count * DESCRIPTOR_LEN
-            || dir_offset.checked_add(dir_len).is_none_or(|end| end > bytes.len())
-        {
+        if dir_len != count * DESCRIPTOR_LEN || dir_offset.checked_add(dir_len).is_none_or(|end| end > bytes.len()) {
             return Err(PackError::BadDirectory);
         }
 
@@ -131,13 +137,29 @@ impl<'a> Package<'a> {
             let uncompressed_len = rd_u32(bytes, at + 24)?;
             let stored_len = rd_u32(bytes, at + 28)?;
             let offset = rd_u64(bytes, at + 32)?;
-            if offset.checked_add(stored_len as u64).is_none_or(|end| end > bytes.len() as u64) {
+            if offset
+                .checked_add(stored_len as u64)
+                .is_none_or(|end| end > bytes.len() as u64)
+            {
                 return Err(PackError::BadDirectory);
             }
-            dir.push(PageDescriptor { id, kind, compression, license_id, uncompressed_len, stored_len, offset });
+            dir.push(PageDescriptor {
+                id,
+                kind,
+                compression,
+                license_id,
+                uncompressed_len,
+                stored_len,
+                offset,
+            });
         }
 
-        Ok(Self { bytes, schema_version, package_version, dir })
+        Ok(Self {
+            bytes,
+            schema_version,
+            package_version,
+            dir,
+        })
     }
 
     pub fn page_count(&self) -> usize {

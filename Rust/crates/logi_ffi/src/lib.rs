@@ -48,53 +48,59 @@ const LOGI_ERROR_MSG_LEN: usize = 256;
 /// fixed, null-terminated buffer (no allocation crosses the boundary).
 #[repr(C)]
 pub struct LogiError {
-	pub code: u32,
-	pub message: [core::ffi::c_char; 256],
+    pub code: u32,
+    pub message: [core::ffi::c_char; 256],
 }
 
 /// Creation parameters.
 #[repr(C)]
 pub struct LogiInitDesc {
-	pub abi_version: u32,
-	pub worker_thread_count: u32,
-	pub fixed_step_hz: u32,
-	pub deterministic_seed: u64,
-	pub flags: u32,
-	/// Representation budgets (ADR-0003): top-N entities by significance per tier.
-	/// All three zero => library defaults (64 / 256 / 100000).
-	pub high_res_actor_budget: u32,
-	pub low_res_actor_budget: u32,
-	pub instanced_mesh_budget: u32,
+    pub abi_version: u32,
+    pub worker_thread_count: u32,
+    pub fixed_step_hz: u32,
+    pub deterministic_seed: u64,
+    pub flags: u32,
+    /// Representation budgets (ADR-0003): top-N entities by significance per tier.
+    /// All three zero => library defaults (64 / 256 / 100000).
+    pub high_res_actor_budget: u32,
+    pub low_res_actor_budget: u32,
+    pub instanced_mesh_budget: u32,
 }
 
 /// Per-frame input from Unreal. `cameras`/`player_intents` are borrowed for the
 /// duration of the call only.
 #[repr(C)]
 pub struct LogiFrameInput {
-	pub unreal_time_seconds: f64,
-	pub frame_delta_seconds: f32,
-	pub max_fixed_steps: u32,
-	pub camera_count: u32,
-	pub cameras: *const LogiCameraView,
-	pub player_intent_count: u32,
-	pub player_intents: *const LogiPlayerIntent,
+    pub unreal_time_seconds: f64,
+    pub frame_delta_seconds: f32,
+    pub max_fixed_steps: u32,
+    pub camera_count: u32,
+    pub cameras: *const LogiCameraView,
+    pub player_intent_count: u32,
+    pub player_intents: *const LogiPlayerIntent,
 }
 
 /// Result of a tick.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct LogiTickResult {
-	pub fixed_steps_run: u32,
-	pub dropped_steps: u32,
-	pub sim_tick: u64,
-	pub render_snapshot_id: u64,
-	pub status: u32,
+    pub fixed_steps_run: u32,
+    pub dropped_steps: u32,
+    pub sim_tick: u64,
+    pub render_snapshot_id: u64,
+    pub status: u32,
 }
 
 impl LogiTickResult {
-	fn empty(status: u32) -> Self {
-		Self { fixed_steps_run: 0, dropped_steps: 0, sim_tick: 0, render_snapshot_id: 0, status }
-	}
+    fn empty(status: u32) -> Self {
+        Self {
+            fixed_steps_run: 0,
+            dropped_steps: 0,
+            sim_tick: 0,
+            render_snapshot_id: 0,
+            status,
+        }
+    }
 }
 
 /// Borrowed view over a published render snapshot (§8). Triple-buffered (§11):
@@ -102,74 +108,74 @@ impl LogiTickResult {
 /// or its ring slot is reused (>= 2 ticks later), whichever comes first.
 #[repr(C)]
 pub struct LogiRenderSnapshot {
-	pub snapshot_id: u64,
-	pub sim_tick: u64,
-	/// Local-frame origin (world cm, f64); add to each `transform_3x4` translation
-	/// to recover world position (P0 #6 planetary precision).
-	pub world_origin_cm: [f64; 3],
-	pub static_batch_count: u32,
-	pub static_batches: *const LogiStaticBatch,
-	pub actor_update_count: u32,
-	pub actor_updates: *const LogiActorUpdate,
-	pub despawn_count: u32,
-	pub despawns: *const LogiEntityId,
+    pub snapshot_id: u64,
+    pub sim_tick: u64,
+    /// Local-frame origin (world cm, f64); add to each `transform_3x4` translation
+    /// to recover world position (P0 #6 planetary precision).
+    pub world_origin_cm: [f64; 3],
+    pub static_batch_count: u32,
+    pub static_batches: *const LogiStaticBatch,
+    pub actor_update_count: u32,
+    pub actor_updates: *const LogiActorUpdate,
+    pub despawn_count: u32,
+    pub despawns: *const LogiEntityId,
 }
 
 // --- error helpers -----------------------------------------------------------
 
 #[derive(thiserror::Error, Debug)]
 enum FfiError {
-	#[error("null pointer argument: {0}")]
-	NullArg(&'static str),
-	#[error("ABI version mismatch: caller={caller}, library={library}")]
-	AbiMismatch { caller: u32, library: u32 },
-	#[error("operation panicked: {0}")]
-	Panic(&'static str),
-	#[error("render snapshot {0} is unavailable")]
-	SnapshotUnavailable(u64),
-	#[error("{0} called from a non-owner thread (§11: single mutable world owner)")]
-	WrongThread(&'static str),
+    #[error("null pointer argument: {0}")]
+    NullArg(&'static str),
+    #[error("ABI version mismatch: caller={caller}, library={library}")]
+    AbiMismatch { caller: u32, library: u32 },
+    #[error("operation panicked: {0}")]
+    Panic(&'static str),
+    #[error("render snapshot {0} is unavailable")]
+    SnapshotUnavailable(u64),
+    #[error("{0} called from a non-owner thread (§11: single mutable world owner)")]
+    WrongThread(&'static str),
 }
 
 impl FfiError {
-	fn code(&self) -> u32 {
-		match self {
-			FfiError::NullArg(_) => LOGI_ERR_NULL,
-			FfiError::AbiMismatch { .. } => LOGI_ERR_ABI,
-			FfiError::Panic(_) => LOGI_ERR_PANIC,
-			FfiError::SnapshotUnavailable(_) => LOGI_ERR_SNAPSHOT,
-			FfiError::WrongThread(_) => LOGI_ERR_WRONG_THREAD,
-		}
-	}
+    fn code(&self) -> u32 {
+        match self {
+            FfiError::NullArg(_) => LOGI_ERR_NULL,
+            FfiError::AbiMismatch { .. } => LOGI_ERR_ABI,
+            FfiError::Panic(_) => LOGI_ERR_PANIC,
+            FfiError::SnapshotUnavailable(_) => LOGI_ERR_SNAPSHOT,
+            FfiError::WrongThread(_) => LOGI_ERR_WRONG_THREAD,
+        }
+    }
 }
 
 /// Write a structured error into the caller's out-param (no-op if null).
 fn write_err(err: *mut LogiError, e: &FfiError) {
-	if err.is_null() {
-		return;
-	}
-	let msg = e.to_string();
-	let bytes = msg.as_bytes();
-	let n = bytes.len().min(LOGI_ERROR_MSG_LEN - 1);
-	// SAFETY: caller guarantees `err` points to writable LogiError storage.
-	unsafe {
-		(*err).code = e.code();
-		let dst = (*err).message.as_mut_ptr() as *mut u8;
-		core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, n);
-		*dst.add(n) = 0;
-	}
+    if err.is_null() {
+        return;
+    }
+    let msg = e.to_string();
+    let bytes = msg.as_bytes();
+    let n = bytes.len().min(LOGI_ERROR_MSG_LEN - 1);
+    // SAFETY: caller guarantees `err` points to writable LogiError storage.
+    unsafe {
+        (*err).code = e.code();
+        let dst = (*err).message.as_mut_ptr() as *mut u8;
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, n);
+        *dst.add(n) = 0;
+    }
 }
 
 /// Reset the caller's error out-param to "ok".
 fn clear_err(err: *mut LogiError) {
-	if err.is_null() {
-		return;
-	}
-	// SAFETY: caller guarantees `err` points to writable LogiError storage.
-	unsafe {
-		(*err).code = LOGI_OK;
-		(*err).message[0] = 0;
-	}
+    if err.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `err` points to writable LogiError storage.
+    unsafe {
+        (*err).code = LOGI_OK;
+        (*err).message[0] = 0;
+    }
 }
 
 // --- exported C ABI ----------------------------------------------------------
@@ -177,7 +183,7 @@ fn clear_err(err: *mut LogiError) {
 /// Return the ABI version this library was built with.
 #[no_mangle]
 pub extern "C" fn logi_abi_version() -> u32 {
-	LOGI_ABI_VERSION
+    LOGI_ABI_VERSION
 }
 
 /// Create a world. Validates the ABI version. Returns null on failure (and fills `err`).
@@ -187,35 +193,41 @@ pub extern "C" fn logi_abi_version() -> u32 {
 /// `LogiError` storage. The returned handle is owned by the caller — free it with [`logi_world_destroy`].
 #[no_mangle]
 pub unsafe extern "C" fn logi_world_create(desc: *const LogiInitDesc, err: *mut LogiError) -> *mut LogiWorld {
-	clear_err(err);
-	if desc.is_null() {
-		write_err(err, &FfiError::NullArg("desc"));
-		return std::ptr::null_mut();
-	}
-	// SAFETY: non-null, checked above.
-	let desc = unsafe { &*desc };
-	if desc.abi_version != LOGI_ABI_VERSION {
-		write_err(err, &FfiError::AbiMismatch { caller: desc.abi_version, library: LOGI_ABI_VERSION });
-		return std::ptr::null_mut();
-	}
+    clear_err(err);
+    if desc.is_null() {
+        write_err(err, &FfiError::NullArg("desc"));
+        return std::ptr::null_mut();
+    }
+    // SAFETY: non-null, checked above.
+    let desc = unsafe { &*desc };
+    if desc.abi_version != LOGI_ABI_VERSION {
+        write_err(
+            err,
+            &FfiError::AbiMismatch {
+                caller: desc.abi_version,
+                library: LOGI_ABI_VERSION,
+            },
+        );
+        return std::ptr::null_mut();
+    }
 
-	let config = WorldConfig {
-		fixed_step_hz: desc.fixed_step_hz,
-		deterministic_seed: desc.deterministic_seed,
-		worker_thread_count: desc.worker_thread_count,
-		flags: desc.flags,
-		high_res_actor_budget: desc.high_res_actor_budget,
-		low_res_actor_budget: desc.low_res_actor_budget,
-		instanced_mesh_budget: desc.instanced_mesh_budget,
-	};
+    let config = WorldConfig {
+        fixed_step_hz: desc.fixed_step_hz,
+        deterministic_seed: desc.deterministic_seed,
+        worker_thread_count: desc.worker_thread_count,
+        flags: desc.flags,
+        high_res_actor_budget: desc.high_res_actor_budget,
+        low_res_actor_budget: desc.low_res_actor_budget,
+        instanced_mesh_budget: desc.instanced_mesh_budget,
+    };
 
-	match catch_unwind(AssertUnwindSafe(|| Box::into_raw(Box::new(LogiWorld::new(config))))) {
-		Ok(ptr) => ptr,
-		Err(_) => {
-			write_err(err, &FfiError::Panic("logi_world_create"));
-			std::ptr::null_mut()
-		}
-	}
+    match catch_unwind(AssertUnwindSafe(|| Box::into_raw(Box::new(LogiWorld::new(config))))) {
+        Ok(ptr) => ptr,
+        Err(_) => {
+            write_err(err, &FfiError::Panic("logi_world_create"));
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// Destroy a world created by [`logi_world_create`].
@@ -225,17 +237,17 @@ pub unsafe extern "C" fn logi_world_create(desc: *const LogiInitDesc, err: *mut 
 /// this must be called on the world's owner thread.
 #[no_mangle]
 pub unsafe extern "C" fn logi_world_destroy(world: *mut LogiWorld) {
-	if world.is_null() {
-		return;
-	}
-	// §11: only the owner thread may destroy (a mutating teardown). On mismatch,
-	// refuse rather than risk dropping a !Send world cross-thread -- the C++ RAII
-	// guarantees this runs on the owner (game) thread.
-	// SAFETY: non-null (checked); came from Box::into_raw.
-	if !unsafe { &*world }.is_owner_thread() {
-		return;
-	}
-	let _ = catch_unwind(AssertUnwindSafe(|| unsafe { drop(Box::from_raw(world)) }));
+    if world.is_null() {
+        return;
+    }
+    // §11: only the owner thread may destroy (a mutating teardown). On mismatch,
+    // refuse rather than risk dropping a !Send world cross-thread -- the C++ RAII
+    // guarantees this runs on the owner (game) thread.
+    // SAFETY: non-null (checked); came from Box::into_raw.
+    if !unsafe { &*world }.is_owner_thread() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe { drop(Box::from_raw(world)) }));
 }
 
 /// Advance the simulation. The fixed-step accumulator is internal to Rust.
@@ -245,52 +257,56 @@ pub unsafe extern "C" fn logi_world_destroy(world: *mut LogiWorld) {
 /// `LogiFrameInput` whose `cameras`/`player_intents` are null or point to `camera_count`/
 /// `player_intent_count` readable elements. `err` must be null or point to writable `LogiError` storage.
 #[no_mangle]
-pub unsafe extern "C" fn logi_world_tick(world: *mut LogiWorld, input: *const LogiFrameInput, err: *mut LogiError) -> LogiTickResult {
-	clear_err(err);
-	if world.is_null() || input.is_null() {
-		write_err(err, &FfiError::NullArg(if world.is_null() { "world" } else { "input" }));
-		return LogiTickResult::empty(LOGI_ERR_NULL);
-	}
-	// §11: only the owner thread may tick (mutating).
-	// SAFETY: non-null, checked above.
-	if !unsafe { &*world }.is_owner_thread() {
-		write_err(err, &FfiError::WrongThread("logi_world_tick"));
-		return LogiTickResult::empty(LOGI_ERR_WRONG_THREAD);
-	}
+pub unsafe extern "C" fn logi_world_tick(
+    world: *mut LogiWorld,
+    input: *const LogiFrameInput,
+    err: *mut LogiError,
+) -> LogiTickResult {
+    clear_err(err);
+    if world.is_null() || input.is_null() {
+        write_err(err, &FfiError::NullArg(if world.is_null() { "world" } else { "input" }));
+        return LogiTickResult::empty(LOGI_ERR_NULL);
+    }
+    // §11: only the owner thread may tick (mutating).
+    // SAFETY: non-null, checked above.
+    if !unsafe { &*world }.is_owner_thread() {
+        write_err(err, &FfiError::WrongThread("logi_world_tick"));
+        return LogiTickResult::empty(LOGI_ERR_WRONG_THREAD);
+    }
 
-	// SAFETY: both non-null (checked). `world` is uniquely owned by the caller
-	// for this call (rule 7: not reentrant).
-	let result = catch_unwind(AssertUnwindSafe(|| {
-		let world = unsafe { &mut *world };
-		let input = unsafe { &*input };
+    // SAFETY: both non-null (checked). `world` is uniquely owned by the caller
+    // for this call (rule 7: not reentrant).
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let world = unsafe { &mut *world };
+        let input = unsafe { &*input };
 
-		let cameras: &[LogiCameraView] = if input.cameras.is_null() || input.camera_count == 0 {
-			&[]
-		} else {
-			unsafe { slice::from_raw_parts(input.cameras, input.camera_count as usize) }
-		};
-		let intents: &[LogiPlayerIntent] = if input.player_intents.is_null() || input.player_intent_count == 0 {
-			&[]
-		} else {
-			unsafe { slice::from_raw_parts(input.player_intents, input.player_intent_count as usize) }
-		};
+        let cameras: &[LogiCameraView] = if input.cameras.is_null() || input.camera_count == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(input.cameras, input.camera_count as usize) }
+        };
+        let intents: &[LogiPlayerIntent] = if input.player_intents.is_null() || input.player_intent_count == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(input.player_intents, input.player_intent_count as usize) }
+        };
 
-		world.tick(input.frame_delta_seconds, input.max_fixed_steps, cameras, intents)
-	}));
+        world.tick(input.frame_delta_seconds, input.max_fixed_steps, cameras, intents)
+    }));
 
-	match result {
-		Ok(o) => LogiTickResult {
-			fixed_steps_run: o.fixed_steps_run,
-			dropped_steps: o.dropped_steps,
-			sim_tick: o.sim_tick,
-			render_snapshot_id: o.render_snapshot_id,
-			status: LOGI_OK,
-		},
-		Err(_) => {
-			write_err(err, &FfiError::Panic("logi_world_tick"));
-			LogiTickResult::empty(LOGI_ERR_PANIC)
-		}
-	}
+    match result {
+        Ok(o) => LogiTickResult {
+            fixed_steps_run: o.fixed_steps_run,
+            dropped_steps: o.dropped_steps,
+            sim_tick: o.sim_tick,
+            render_snapshot_id: o.render_snapshot_id,
+            status: LOGI_OK,
+        },
+        Err(_) => {
+            write_err(err, &FfiError::Panic("logi_world_tick"));
+            LogiTickResult::empty(LOGI_ERR_PANIC)
+        }
+    }
 }
 
 /// Fill `out_snapshot` with a borrowed view of a render snapshot. Pass
@@ -310,68 +326,71 @@ pub unsafe extern "C" fn logi_world_tick(world: *mut LogiWorld, input: *const Lo
 /// tick or `logi_buffer_release`.
 #[no_mangle]
 pub unsafe extern "C" fn logi_world_get_render_snapshot(
-	world: *mut LogiWorld,
-	snapshot_id: u64,
-	out_snapshot: *mut LogiRenderSnapshot,
-	err: *mut LogiError,
+    world: *mut LogiWorld,
+    snapshot_id: u64,
+    out_snapshot: *mut LogiRenderSnapshot,
+    err: *mut LogiError,
 ) -> u32 {
-	clear_err(err);
-	if world.is_null() || out_snapshot.is_null() {
-		write_err(err, &FfiError::NullArg(if world.is_null() { "world" } else { "out_snapshot" }));
-		return LOGI_ERR_NULL;
-	}
-	// Default the out-param to empty.
-	// SAFETY: non-null, checked above.
-	unsafe {
-		*out_snapshot = LogiRenderSnapshot {
-			snapshot_id: 0,
-			sim_tick: 0,
-			world_origin_cm: [0.0; 3],
-			static_batch_count: 0,
-			static_batches: std::ptr::null(),
-			actor_update_count: 0,
-			actor_updates: std::ptr::null(),
-			despawn_count: 0,
-			despawns: std::ptr::null(),
-		};
-	}
+    clear_err(err);
+    if world.is_null() || out_snapshot.is_null() {
+        write_err(
+            err,
+            &FfiError::NullArg(if world.is_null() { "world" } else { "out_snapshot" }),
+        );
+        return LOGI_ERR_NULL;
+    }
+    // Default the out-param to empty.
+    // SAFETY: non-null, checked above.
+    unsafe {
+        *out_snapshot = LogiRenderSnapshot {
+            snapshot_id: 0,
+            sim_tick: 0,
+            world_origin_cm: [0.0; 3],
+            static_batch_count: 0,
+            static_batches: std::ptr::null(),
+            actor_update_count: 0,
+            actor_updates: std::ptr::null(),
+            despawn_count: 0,
+            despawns: std::ptr::null(),
+        };
+    }
 
-	let result = catch_unwind(AssertUnwindSafe(|| {
-		let world = unsafe { &*world };
-		// `snapshot_id == 0` means "latest"; otherwise it must match.
-		if snapshot_id != 0 && snapshot_id != world.snapshot_id() {
-			return None;
-		}
-		let batches = world.static_batches();
-		let actors = world.actor_updates();
-		let despawns = world.despawns();
-		Some(LogiRenderSnapshot {
-			snapshot_id: world.snapshot_id(),
-			sim_tick: world.snapshot_sim_tick(),
-			world_origin_cm: world.snapshot_world_origin(),
-			static_batch_count: batches.len() as u32,
-			static_batches: batches.as_ptr(),
-			actor_update_count: actors.len() as u32,
-			actor_updates: actors.as_ptr(),
-			despawn_count: despawns.len() as u32,
-			despawns: despawns.as_ptr(),
-		})
-	}));
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let world = unsafe { &*world };
+        // `snapshot_id == 0` means "latest"; otherwise it must match.
+        if snapshot_id != 0 && snapshot_id != world.snapshot_id() {
+            return None;
+        }
+        let batches = world.static_batches();
+        let actors = world.actor_updates();
+        let despawns = world.despawns();
+        Some(LogiRenderSnapshot {
+            snapshot_id: world.snapshot_id(),
+            sim_tick: world.snapshot_sim_tick(),
+            world_origin_cm: world.snapshot_world_origin(),
+            static_batch_count: batches.len() as u32,
+            static_batches: batches.as_ptr(),
+            actor_update_count: actors.len() as u32,
+            actor_updates: actors.as_ptr(),
+            despawn_count: despawns.len() as u32,
+            despawns: despawns.as_ptr(),
+        })
+    }));
 
-	match result {
-		Ok(Some(view)) => {
-			unsafe { *out_snapshot = view };
-			LOGI_OK
-		}
-		Ok(None) => {
-			write_err(err, &FfiError::SnapshotUnavailable(snapshot_id));
-			LOGI_ERR_SNAPSHOT
-		}
-		Err(_) => {
-			write_err(err, &FfiError::Panic("logi_world_get_render_snapshot"));
-			LOGI_ERR_PANIC
-		}
-	}
+    match result {
+        Ok(Some(view)) => {
+            unsafe { *out_snapshot = view };
+            LOGI_OK
+        }
+        Ok(None) => {
+            write_err(err, &FfiError::SnapshotUnavailable(snapshot_id));
+            LOGI_ERR_SNAPSHOT
+        }
+        Err(_) => {
+            write_err(err, &FfiError::Panic("logi_world_get_render_snapshot"));
+            LOGI_ERR_PANIC
+        }
+    }
 }
 
 /// Submit a batch of spawn commands (a controlled mutation phase). Returns the
@@ -382,39 +401,42 @@ pub unsafe extern "C" fn logi_world_get_render_snapshot(
 /// readable `LogiSpawnCommand` elements; `err` must be null or point to writable `LogiError` storage.
 #[no_mangle]
 pub unsafe extern "C" fn logi_submit_spawn_commands(
-	world: *mut LogiWorld,
-	commands: *const LogiSpawnCommand,
-	count: u32,
-	err: *mut LogiError,
+    world: *mut LogiWorld,
+    commands: *const LogiSpawnCommand,
+    count: u32,
+    err: *mut LogiError,
 ) -> u32 {
-	clear_err(err);
-	if world.is_null() || (commands.is_null() && count != 0) {
-		write_err(err, &FfiError::NullArg(if world.is_null() { "world" } else { "commands" }));
-		return 0;
-	}
-	// §11: only the owner thread may submit spawns (mutating).
-	// SAFETY: non-null, checked above.
-	if !unsafe { &*world }.is_owner_thread() {
-		write_err(err, &FfiError::WrongThread("logi_submit_spawn_commands"));
-		return 0;
-	}
-	if count == 0 {
-		return 0;
-	}
+    clear_err(err);
+    if world.is_null() || (commands.is_null() && count != 0) {
+        write_err(
+            err,
+            &FfiError::NullArg(if world.is_null() { "world" } else { "commands" }),
+        );
+        return 0;
+    }
+    // §11: only the owner thread may submit spawns (mutating).
+    // SAFETY: non-null, checked above.
+    if !unsafe { &*world }.is_owner_thread() {
+        write_err(err, &FfiError::WrongThread("logi_submit_spawn_commands"));
+        return 0;
+    }
+    if count == 0 {
+        return 0;
+    }
 
-	let result = catch_unwind(AssertUnwindSafe(|| {
-		let world = unsafe { &mut *world };
-		let cmds = unsafe { slice::from_raw_parts(commands, count as usize) };
-		world.submit_spawn_commands(cmds)
-	}));
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let world = unsafe { &mut *world };
+        let cmds = unsafe { slice::from_raw_parts(commands, count as usize) };
+        world.submit_spawn_commands(cmds)
+    }));
 
-	match result {
-		Ok(applied) => applied,
-		Err(_) => {
-			write_err(err, &FfiError::Panic("logi_submit_spawn_commands"));
-			0
-		}
-	}
+    match result {
+        Ok(applied) => applied,
+        Err(_) => {
+            write_err(err, &FfiError::Panic("logi_submit_spawn_commands"));
+            0
+        }
+    }
 }
 
 /// Retire a published snapshot buffer after Unreal has consumed it (§11 triple
@@ -426,14 +448,14 @@ pub unsafe extern "C" fn logi_submit_spawn_commands(
 /// `world` must be null or a valid handle from [`logi_world_create`], called on its owner thread.
 #[no_mangle]
 pub unsafe extern "C" fn logi_buffer_release(world: *mut LogiWorld, snapshot_id: u64) -> u32 {
-	if world.is_null() {
-		return LOGI_ERR_NULL;
-	}
-	// SAFETY: non-null, checked above.
-	let w = unsafe { &mut *world };
-	if !w.is_owner_thread() {
-		return LOGI_ERR_WRONG_THREAD;
-	}
-	let _ = w.release_snapshot(snapshot_id);
-	LOGI_OK
+    if world.is_null() {
+        return LOGI_ERR_NULL;
+    }
+    // SAFETY: non-null, checked above.
+    let w = unsafe { &mut *world };
+    if !w.is_owner_thread() {
+        return LOGI_ERR_WRONG_THREAD;
+    }
+    let _ = w.release_snapshot(snapshot_id);
+    LOGI_OK
 }

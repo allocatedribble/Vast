@@ -67,11 +67,21 @@ struct Attribution {
 /// network half is [`resolve_asset`].
 pub fn parse_endpoint(json: &str) -> Result<IonAsset, IonError> {
     let er: EndpointResponse = serde_json::from_str(json).map_err(|e| IonError::Parse(e.to_string()))?;
-    let tileset_url =
-        er.url.or_else(|| er.options.and_then(|o| o.url)).ok_or(IonError::NoTilesetUrl)?;
-    let attributions =
-        er.attributions.into_iter().map(|a| a.html).filter(|h| !h.is_empty()).collect();
-    Ok(IonAsset { tileset_url, access_token: er.access_token.unwrap_or_default(), attributions })
+    let tileset_url = er
+        .url
+        .or_else(|| er.options.and_then(|o| o.url))
+        .ok_or(IonError::NoTilesetUrl)?;
+    let attributions = er
+        .attributions
+        .into_iter()
+        .map(|a| a.html)
+        .filter(|h| !h.is_empty())
+        .collect();
+    Ok(IonAsset {
+        tileset_url,
+        access_token: er.access_token.unwrap_or_default(),
+        attributions,
+    })
 }
 
 /// Resolve an ion asset endpoint over HTTPS: `GET https://api.cesium.com/v1/assets/{asset_id}/endpoint`
@@ -104,7 +114,10 @@ mod tests {
         // The Google P3DT shape: externalType + options.url, no accessToken, the key in the URL.
         let json = r#"{"type":"3DTILES","externalType":"3DTILES","options":{"url":"https://tile.googleapis.com/v1/3dtiles/root.json?key=ABC"},"attributions":[{"html":"Google"},{"html":""}]}"#;
         let a = parse_endpoint(json).unwrap();
-        assert_eq!(a.tileset_url, "https://tile.googleapis.com/v1/3dtiles/root.json?key=ABC");
+        assert_eq!(
+            a.tileset_url,
+            "https://tile.googleapis.com/v1/3dtiles/root.json?key=ABC"
+        );
         assert!(a.access_token.is_empty());
         assert_eq!(a.attributions, vec!["Google".to_string()]); // empty html filtered out
     }

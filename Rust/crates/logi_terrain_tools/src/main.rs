@@ -11,11 +11,18 @@ fn main() {
     println!("logical tiles:         {}", r.logical_tiles);
     println!("frames:                {}", r.frames);
     println!("memory budget:         {} MiB", r.budget_bytes / mib);
-    println!("peak resident:         {} MiB  ({} tiles)", r.peak_bytes as usize / mib, r.max_resident_seen);
+    println!(
+        "peak resident:         {} MiB  ({} tiles)",
+        r.peak_bytes as usize / mib,
+        r.max_resident_seen
+    );
     println!("budget exceeded:       {} frames", r.budget_exceeded_frames);
     println!("empty-render frames:   {}  (warmup only)", r.empty_render_frames);
     println!("fallback frames:       {}", r.fallback_frames);
-    println!("max in-flight:         {}  (cap {})", r.max_in_flight_seen, p.max_in_flight);
+    println!(
+        "max in-flight:         {}  (cap {})",
+        r.max_in_flight_seen, p.max_in_flight
+    );
     println!("requests issued/done:  {} / {}", r.total_requests, r.total_completed);
     println!("evictions:             {}", r.final_telemetry.evictions);
 

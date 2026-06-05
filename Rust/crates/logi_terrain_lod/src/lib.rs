@@ -3,17 +3,14 @@
 /// Screen-space error in pixels for a feature of `geometric_error` world-units viewed at `distance`,
 /// with vertical FOV `fov_y_radians` and `viewport_height` pixels.
 #[inline]
-pub fn screen_space_error(
-    geometric_error: f64,
-    distance: f64,
-    fov_y_radians: f64,
-    viewport_height: f64,
-) -> f64 {
+pub fn screen_space_error(geometric_error: f64, distance: f64, fov_y_radians: f64, viewport_height: f64) -> f64 {
     if distance <= 1e-6 {
         return f64::INFINITY;
     }
     // FIX 4: clamp fov away from 0/PI so tan() can't go to 0 or blow up (inf/NaN SSE).
-    let t = (fov_y_radians.clamp(1e-3, std::f64::consts::PI - 1e-3) * 0.5).tan().max(1e-4);
+    let t = (fov_y_radians.clamp(1e-3, std::f64::consts::PI - 1e-3) * 0.5)
+        .tan()
+        .max(1e-4);
     let pixels_per_unit = viewport_height / (2.0 * distance * t);
     geometric_error * pixels_per_unit
 }
@@ -87,6 +84,9 @@ mod tests {
     fn coarser_sse_target_picks_lower_level() {
         let fine = desired_level(4096.0, 5000.0, 1.0, 1080.0, 1.0, 12);
         let coarse = desired_level(4096.0, 5000.0, 1.0, 1080.0, 64.0, 12);
-        assert!(fine > coarse, "smaller SSE target -> finer level: fine {fine} vs coarse {coarse}");
+        assert!(
+            fine > coarse,
+            "smaller SSE target -> finer level: fine {fine} vs coarse {coarse}"
+        );
     }
 }

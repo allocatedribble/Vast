@@ -54,8 +54,9 @@ impl Frustum {
         let u = r.cross(f); // re-orthonormalized true up
 
         // FIX 7a: clamp the FOV into (0, PI) before tan() so an out-of-range/degenerate angle can't blow up.
-        let half_v =
-            ((fov_y_radians.clamp(1e-3, std::f64::consts::PI - 1e-3)) * 0.5).tan().max(1e-4);
+        let half_v = ((fov_y_radians.clamp(1e-3, std::f64::consts::PI - 1e-3)) * 0.5)
+            .tan()
+            .max(1e-4);
         let half_h = half_v * aspect.max(1e-4);
 
         // Four frustum corner rays in world space.
@@ -67,12 +68,12 @@ impl Frustum {
         // Side planes pass through the camera; near/far are offset along forward. Normal orientation is
         // fixed afterward against a point known to be inside, so cross-product winding need not be exact.
         let mut planes = [
-            plane_through(pos, bl.cross(tl)),               // left
-            plane_through(pos, tr.cross(br)),               // right
-            plane_through(pos, tl.cross(tr)),               // top
-            plane_through(pos, br.cross(bl)),               // bottom
-            plane_with_normal(f, pos + f * near),           // near
-            plane_with_normal(-f, pos + f * far),           // far
+            plane_through(pos, bl.cross(tl)),     // left
+            plane_through(pos, tr.cross(br)),     // right
+            plane_through(pos, tl.cross(tr)),     // top
+            plane_through(pos, br.cross(bl)),     // bottom
+            plane_with_normal(f, pos + f * near), // near
+            plane_with_normal(-f, pos + f * far), // far
         ];
 
         let interior = pos + f * ((near + far) * 0.5);
@@ -100,13 +101,19 @@ impl Frustum {
 #[inline]
 fn plane_through(point: DVec3, normal: DVec3) -> Plane {
     let n = normal.try_normalize().unwrap_or(DVec3::Y);
-    Plane { normal: n, d: -n.dot(point) }
+    Plane {
+        normal: n,
+        d: -n.dot(point),
+    }
 }
 
 #[inline]
 fn plane_with_normal(normal: DVec3, point: DVec3) -> Plane {
     let n = normal.try_normalize().unwrap_or(DVec3::Z);
-    Plane { normal: n, d: -n.dot(point) }
+    Plane {
+        normal: n,
+        d: -n.dot(point),
+    }
 }
 
 /// Horizon (curvature-occlusion) culling. Parameterized by planet sphere so it is ready for the globe
@@ -124,7 +131,9 @@ impl HorizonCuller {
     }
     #[inline]
     pub fn sphere(center: DVec3, radius: f64) -> Self {
-        Self { sphere: Some((center, radius)) }
+        Self {
+            sphere: Some((center, radius)),
+        }
     }
 
     /// Is `point` visible from `camera` (not occluded by planetary curvature)? Flat world: always.

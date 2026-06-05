@@ -54,11 +54,7 @@ fn wr(b: &mut [u8], o: usize, v: f32) {
 /// right-handed) → Unreal (Z-up left-handed) by negating Y + flipping triangle winding + flipping the V
 /// texcoord, and carry the raw `jpg_bytes` through. `placement` gives the geodetic origin (used for the
 /// ECEF, applied to the mesh once the globe lane exists).
-pub fn load_building(
-    dae_xml: &str,
-    jpg_bytes: Vec<u8>,
-    placement: &Placement,
-) -> Result<BuildingMesh, SceneError> {
+pub fn load_building(dae_xml: &str, jpg_bytes: Vec<u8>, placement: &Placement) -> Result<BuildingMesh, SceneError> {
     let mesh = decode_collada(dae_xml).map_err(SceneError::Collada)?;
     let scale = mesh.unit_meters * 100.0; // document units → metres → cm
 
@@ -147,7 +143,12 @@ mod tests {
         let m = load_building(
             TRIANGLE_DAE,
             tex.clone(),
-            &Placement { longitude_deg: -75.5967, latitude_deg: 40.0387, height_m: 50.0, heading_deg: 90.0 },
+            &Placement {
+                longitude_deg: -75.5967,
+                latitude_deg: 40.0387,
+                height_m: 50.0,
+                heading_deg: 90.0,
+            },
         )
         .expect("load");
 
@@ -156,7 +157,8 @@ mod tests {
         // winding preserved (the Y-flip reflection handles UE's convention; no index reversal)
         assert_eq!(m.indices, vec![0, 1, 2]);
 
-        let rd = |o: usize| f32::from_le_bytes([m.vertices[o], m.vertices[o + 1], m.vertices[o + 2], m.vertices[o + 3]]);
+        let rd =
+            |o: usize| f32::from_le_bytes([m.vertices[o], m.vertices[o + 1], m.vertices[o + 2], m.vertices[o + 3]]);
         // vertex 0 = (0,0,0) -> (0,0,0); V flips 0 -> 1
         assert_eq!([rd(0), rd(4), rd(8)], [0.0, 0.0, 0.0]);
         assert!((rd(28) - 1.0).abs() < 1e-6);

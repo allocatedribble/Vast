@@ -129,6 +129,14 @@ impl HeightPage {
             samples.push(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
         }
 
-        Ok(Self { width, height, min_elevation, max_elevation, error_metric, hole_mask, samples })
+        Ok(Self {
+            width,
+            height,
+            min_elevation,
+            max_elevation,
+            error_metric,
+            hole_mask,
+            samples,
+        })
     }
 }

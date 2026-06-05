@@ -38,7 +38,11 @@ impl TileId {
         if self.level == 0 {
             self
         } else {
-            Self { level: self.level - 1, x: self.x >> 1, y: self.y >> 1 }
+            Self {
+                level: self.level - 1,
+                x: self.x >> 1,
+                y: self.y >> 1,
+            }
         }
     }
 
@@ -46,7 +50,11 @@ impl TileId {
     #[inline]
     pub fn children(self) -> [TileId; 4] {
         // FIX 2: guard level/coord overflow — key layout supports x,y < 2^28 (max level 27).
-        debug_assert!(self.level < 27, "children() at level {} would overflow the 28-bit x/y key field", self.level);
+        debug_assert!(
+            self.level < 27,
+            "children() at level {} would overflow the 28-bit x/y key field",
+            self.level
+        );
         let l = self.level + 1;
         let (x, y) = (self.x << 1, self.y << 1);
         [
@@ -61,7 +69,12 @@ impl TileId {
     #[inline]
     pub fn ancestor_at(self, level: u8) -> TileId {
         // FIX 3: a coarser-than-self target is a caller bug — it would silently return self.
-        debug_assert!(level <= self.level, "ancestor_at({}) above self.level {}", level, self.level);
+        debug_assert!(
+            level <= self.level,
+            "ancestor_at({}) above self.level {}",
+            level,
+            self.level
+        );
         let mut t = self;
         while t.level > level {
             t = t.parent();
@@ -76,11 +89,14 @@ impl TileId {
     pub fn key(self) -> u64 {
         // FIX 1: mask each field to its width so a large x/y can't bleed into the level or x bits,
         // and keep bit 63 free for the handle's `<< 1`.
-        debug_assert!(self.x < (1 << 28) && self.y < (1 << 28) && self.level < 64,
-            "TileId out of key range: level {} x {} y {}", self.level, self.x, self.y);
-        (((self.level as u64) & 0x3F) << 56)
-            | (((self.x as u64) & 0x0FFF_FFFF) << 28)
-            | ((self.y as u64) & 0x0FFF_FFFF)
+        debug_assert!(
+            self.x < (1 << 28) && self.y < (1 << 28) && self.level < 64,
+            "TileId out of key range: level {} x {} y {}",
+            self.level,
+            self.x,
+            self.y
+        );
+        (((self.level as u64) & 0x3F) << 56) | (((self.x as u64) & 0x0FFF_FFFF) << 28) | ((self.y as u64) & 0x0FFF_FFFF)
     }
 
     /// Inverse of [`key`] — reconstruct a tile from its packed key.

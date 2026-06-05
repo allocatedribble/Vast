@@ -66,7 +66,10 @@ fn read_n(source: &Source, idx: usize, n: usize) -> [f32; 3] {
     // Overflow-safe: `idx`/`stride`/`offset` come from attacker-controllable XML and could wrap `usize`
     // in release (silently reading a valid-but-wrong float). Treat any overflow as out-of-range → zeros,
     // matching the `.get()` miss path.
-    let base = match idx.checked_mul(stride).and_then(|b| b.checked_add(source.accessor.offset)) {
+    let base = match idx
+        .checked_mul(stride)
+        .and_then(|b| b.checked_add(source.accessor.offset))
+    {
         Some(b) => b,
         None => return [0.0; 3],
     };
@@ -80,8 +83,12 @@ fn read_n(source: &Source, idx: usize, n: usize) -> [f32; 3] {
 /// Decode a COLLADA document (its XML text) into a single concatenated mesh.
 pub fn decode_collada(xml: &str) -> Result<ColladaMesh, ColladaError> {
     let doc = Document::from_str(xml).map_err(|e| ColladaError::Parse(format!("{e:?}")))?;
-    let sources = doc.local_map::<Source>().map_err(|e| ColladaError::Parse(format!("{e:?}")))?;
-    let vertices = doc.local_map::<Vertices>().map_err(|e| ColladaError::Parse(format!("{e:?}")))?;
+    let sources = doc
+        .local_map::<Source>()
+        .map_err(|e| ColladaError::Parse(format!("{e:?}")))?;
+    let vertices = doc
+        .local_map::<Vertices>()
+        .map_err(|e| ColladaError::Parse(format!("{e:?}")))?;
 
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
@@ -114,8 +121,7 @@ pub fn decode_collada(xml: &str) -> Result<ColladaMesh, ColladaError> {
                     Semantic::Vertex => {
                         let verts = vertices.get_raw(&input.source).ok_or(ColladaError::BadSource)?;
                         let pos_input = verts.position_input();
-                        pos_source =
-                            Some(sources.get_raw(&pos_input.source).ok_or(ColladaError::BadSource)?);
+                        pos_source = Some(sources.get_raw(&pos_input.source).ok_or(ColladaError::BadSource)?);
                         v_off = Some(off);
                     }
                     Semantic::Normal => {
@@ -168,7 +174,12 @@ pub fn decode_collada(xml: &str) -> Result<ColladaMesh, ColladaError> {
     let indices = (0..positions.len() as u32).collect();
     let vertices_buf = interleave(&positions, &normals, &uvs);
 
-    Ok(ColladaMesh { vertices: vertices_buf, indices, up_axis, unit_meters })
+    Ok(ColladaMesh {
+        vertices: vertices_buf,
+        indices,
+        up_axis,
+        unit_meters,
+    })
 }
 
 #[cfg(test)]

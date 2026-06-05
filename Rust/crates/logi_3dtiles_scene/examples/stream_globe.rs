@@ -18,8 +18,7 @@ fn main() {
     let enu = EnuFrame::from_cartographic(&ellipsoid, origin);
     let camera = enu.local_to_ecef(DVec3::new(0.0, -800.0, 1500.0)); // 800 m south, 1.5 km up
 
-    let mut world =
-        TilesetWorld::new(asset.tileset_url, &root_bytes, origin, 8, 6000.0, None).expect("world");
+    let mut world = TilesetWorld::new(asset.tileset_url, &root_bytes, origin, 8, 6000.0, None).expect("world");
     println!("streaming P3DT over Manhattan (8 workers, 6 km cull)…");
 
     for step in 0..80 {
@@ -62,7 +61,10 @@ fn main() {
             let rd = |o: usize| f32::from_le_bytes([v[o], v[o + 1], v[o + 2], v[o + 3]]);
             println!(
                 "  first tile v0_cm=({:.0},{:.0},{:.0}) texture_bytes={}",
-                rd(0), rd(4), rd(8), m.texture.len()
+                rd(0),
+                rd(4),
+                rd(8),
+                m.texture.len()
             );
         }
     }

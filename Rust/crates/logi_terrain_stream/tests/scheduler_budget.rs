@@ -32,6 +32,13 @@ fn promote_budget_caps_requests_per_frame() {
     // promoted count and stays within the per-frame cap — never the larger desired-candidate set.
     let counts = engine.queue_counts();
     let total_issued: u32 = counts.iter().sum();
-    assert_eq!(u64::from(total_issued), issued, "queue_counts must sum to issued requests");
-    assert!(total_issued <= 4, "queue_counts must respect the promote cap (got {total_issued})");
+    assert_eq!(
+        u64::from(total_issued),
+        issued,
+        "queue_counts must sum to issued requests"
+    );
+    assert!(
+        total_issued <= 4,
+        "queue_counts must respect the promote cap (got {total_issued})"
+    );
 }

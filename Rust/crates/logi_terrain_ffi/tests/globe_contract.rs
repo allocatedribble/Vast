@@ -4,8 +4,8 @@
 //!   `$env:CESIUM_ION_TOKEN="<token>"; cargo test -p logi_terrain_ffi --release -- --ignored globe_streams_live`
 
 use logi_terrain::ffi::{
-    logi_globe_world_cached_bytes, logi_globe_world_create, logi_globe_world_destroy,
-    logi_globe_world_step, LogiGlobeCreateInfo, LogiGlobeFrame, LogiGlobeTile, LogiStatus,
+    logi_globe_world_cached_bytes, logi_globe_world_create, logi_globe_world_destroy, logi_globe_world_step,
+    LogiGlobeCreateInfo, LogiGlobeFrame, LogiGlobeTile, LogiStatus,
 };
 use std::mem::size_of;
 
@@ -39,7 +39,18 @@ fn globe_null_args_rejected_not_crashed() {
     // Step on a null world → InvalidHandle; never dereferenced.
     let mut frame: LogiGlobeFrame = unsafe { std::mem::zeroed() };
     assert_eq!(
-        unsafe { logi_globe_world_step(std::ptr::null_mut(), 0.0, 0.0, 0.0, 1.0, 1080.0, 16.0, &mut frame as *mut _) },
+        unsafe {
+            logi_globe_world_step(
+                std::ptr::null_mut(),
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                1080.0,
+                16.0,
+                &mut frame as *mut _,
+            )
+        },
         LogiStatus::InvalidHandle
     );
 
@@ -80,7 +91,18 @@ fn globe_streams_live() {
     let mut frame: LogiGlobeFrame = unsafe { std::mem::zeroed() };
     for _ in 0..80 {
         assert_eq!(
-            unsafe { logi_globe_world_step(world, cx, cy, cz, 60f64.to_radians(), 1080.0, 16.0, &mut frame as *mut _) },
+            unsafe {
+                logi_globe_world_step(
+                    world,
+                    cx,
+                    cy,
+                    cz,
+                    60f64.to_radians(),
+                    1080.0,
+                    16.0,
+                    &mut frame as *mut _,
+                )
+            },
             LogiStatus::Ok
         );
         std::thread::sleep(std::time::Duration::from_millis(70));
@@ -96,7 +118,10 @@ fn globe_streams_live() {
     assert_eq!(t0.vertex_stride, 32);
     assert_eq!(t0.vertices_len, t0.vertex_count as u64 * 32);
     assert!(!t0.vertices.is_null() && !t0.indices.is_null());
-    assert!(t0.texture_jpeg_len > 0 && !t0.texture_jpeg.is_null(), "P3DT tiles carry a texture");
+    assert!(
+        t0.texture_jpeg_len > 0 && !t0.texture_jpeg.is_null(),
+        "P3DT tiles carry a texture"
+    );
 
     // Null out-frame is rejected on a valid world.
     assert_eq!(

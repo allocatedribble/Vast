@@ -59,7 +59,9 @@ pub struct Tile {
 impl Tile {
     /// The tile's local transform as a `glam` matrix (identity if absent).
     pub fn matrix(&self) -> DMat4 {
-        self.transform.map(|a| DMat4::from_cols_array(&a)).unwrap_or(DMat4::IDENTITY)
+        self.transform
+            .map(|a| DMat4::from_cols_array(&a))
+            .unwrap_or(DMat4::IDENTITY)
     }
 
     /// Resolve refinement, inheriting the parent's when this tile doesn't specify one. (The spec requires
@@ -111,7 +113,9 @@ impl Content {
     /// Whether this content points at another `tileset.json` (an external tileset to graft in).
     pub fn is_external_tileset(&self) -> bool {
         let path = self.uri.split(['?', '#']).next().unwrap_or(&self.uri);
-        path.rsplit('.').next().is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        path.rsplit('.')
+            .next()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
     }
 }
 

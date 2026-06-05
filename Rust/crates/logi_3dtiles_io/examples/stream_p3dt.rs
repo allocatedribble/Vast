@@ -25,7 +25,10 @@ fn main() {
     let token = std::env::var("CESIUM_ION_TOKEN").expect("set CESIUM_ION_TOKEN");
 
     let asset = logi_3dtiles_ion::resolve_asset(2275207, &token).expect("ion resolve");
-    println!("1. ion resolved → tileset root ({} attributions)", asset.attributions.len());
+    println!(
+        "1. ion resolved → tileset root ({} attributions)",
+        asset.attributions.len()
+    );
 
     let root_bytes = logi_3dtiles_io::http_get(&asset.tileset_url).expect("fetch root.json");
     println!("2. root.json fetched: {} bytes", root_bytes.len());

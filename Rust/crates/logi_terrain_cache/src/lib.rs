@@ -153,8 +153,7 @@ mod tests {
         let mut evicted = Vec::new();
 
         // Track the intended byte cost per id, then derive the resident set from what survived.
-        let inserts: [(u32, usize); 6] =
-            [(0, 300), (1, 300), (2, 300), (0, 250), (3, 400), (4, 200)];
+        let inserts: [(u32, usize); 6] = [(0, 300), (1, 300), (2, 300), (0, 250), (3, 400), (4, 200)];
         let mut resident: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
         for &(id, bytes) in &inserts {
             cache.insert(tile(id), id, bytes, &mut evicted);
@@ -165,7 +164,11 @@ mod tests {
         }
 
         let expected: usize = resident.values().sum();
-        assert_eq!(cache.bytes_used(), expected, "byte counter must equal sum of resident bytes");
+        assert_eq!(
+            cache.bytes_used(),
+            expected,
+            "byte counter must equal sum of resident bytes"
+        );
         assert_eq!(cache.len(), resident.len());
         assert!(cache.bytes_used() <= cache.budget());
         assert!(!cache.over_budget());

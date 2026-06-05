@@ -123,7 +123,8 @@ impl Subtree {
 
     /// Is the tile at local `(level, x, y[, z])` available in this subtree?
     pub fn is_tile_available(&self, level: u32, x: u32, y: u32, z: u32) -> bool {
-        self.tile_availability.get(bit_index(level, self.morton(x, y, z), self.child_count))
+        self.tile_availability
+            .get(bit_index(level, self.morton(x, y, z), self.child_count))
     }
 
     /// Is content `content_index` available at local `(level, x, y[, z])`?
@@ -214,8 +215,7 @@ pub fn parse_subtree(bytes: &[u8], child_count: u32) -> Result<Subtree, Implicit
     let bin_end = bin_start.checked_add(bin_len).ok_or(ImplicitError::UnexpectedEof)?;
     let binary = bytes.get(bin_start..bin_end).ok_or(ImplicitError::UnexpectedEof)?;
 
-    let meta: SubtreeJson =
-        serde_json::from_slice(json).map_err(|e| ImplicitError::Json(e.to_string()))?;
+    let meta: SubtreeJson = serde_json::from_slice(json).map_err(|e| ImplicitError::Json(e.to_string()))?;
 
     // Resolve a single availability: a constant, or a bitstream sliced from the internal buffer.
     let resolve = |a: &AvailabilityJson| -> Result<Availability, ImplicitError> {
@@ -230,7 +230,9 @@ pub fn parse_subtree(bytes: &[u8], child_count: u32) -> Result<Subtree, Implicit
             return Err(ImplicitError::ExternalBufferUnsupported);
         }
         let start = view.byte_offset as usize;
-        let end = start.checked_add(view.byte_length as usize).ok_or(ImplicitError::BadBufferView)?;
+        let end = start
+            .checked_add(view.byte_length as usize)
+            .ok_or(ImplicitError::BadBufferView)?;
         let slice = binary.get(start..end).ok_or(ImplicitError::BadBufferView)?;
         Ok(Availability::Bitstream(slice.to_vec()))
     };
@@ -243,7 +245,12 @@ pub fn parse_subtree(bytes: &[u8], child_count: u32) -> Result<Subtree, Implicit
         Some(OneOrMany::Many(v)) => v.iter().map(resolve).collect::<Result<_, _>>()?,
     };
 
-    Ok(Subtree { child_count, tile_availability, content_availability, child_subtree_availability })
+    Ok(Subtree {
+        child_count,
+        tile_availability,
+        content_availability,
+        child_subtree_availability,
+    })
 }
 
 fn read_u64(bytes: &[u8], at: usize) -> Result<u64, ImplicitError> {

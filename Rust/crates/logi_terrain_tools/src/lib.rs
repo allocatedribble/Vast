@@ -18,11 +18,11 @@ pub struct StressParams {
 impl Default for StressParams {
     fn default() -> Self {
         Self {
-            world_size: 4_000_000.0, // 4,000 km square
-            max_level: 9,            // 512 x 512 = 262,144 leaf tiles (>= 100k)
+            world_size: 4_000_000.0,       // 4,000 km square
+            max_level: 9,                  // 512 x 512 = 262,144 leaf tiles (>= 100k)
             budget_bytes: 8 * 1024 * 1024, // 8 MiB HARD budget
             max_in_flight: 256,
-            window_radius: 6,        // 13x13 window
+            window_radius: 6, // 13x13 window
             frames_per_leg: 400,
         }
     }

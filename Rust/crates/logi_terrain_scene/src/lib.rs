@@ -32,7 +32,11 @@ pub type LogiBufferHandle = u64;
 fn tile_buffer_handle(tile: TileId, kind: u32) -> LogiBufferHandle {
     // FIX 6: the `<< 1` steals the top bit for `kind`; a key with bit 63 set would silently lose it
     // (and `buffer_view`'s `>> 1` could not recover the tile). Catch such keys in debug builds.
-    debug_assert!(tile.key() < (1u64 << 63), "tile key {} overflows handle on << 1", tile.key());
+    debug_assert!(
+        tile.key() < (1u64 << 63),
+        "tile key {} overflows handle on << 1",
+        tile.key()
+    );
     (tile.key() << 1) | (kind as u64)
 }
 
@@ -58,7 +62,11 @@ pub struct LogiStreamingBudget {
 
 impl LogiStreamingBudget {
     pub fn defaults() -> Self {
-        Self { memory_budget_bytes: 64 * 1024 * 1024, max_in_flight: 512, _reserved: 0 }
+        Self {
+            memory_budget_bytes: 64 * 1024 * 1024,
+            max_in_flight: 512,
+            _reserved: 0,
+        }
     }
 }
 
@@ -77,7 +85,12 @@ impl LogiWorldCreateInfo {
         // HEIGHT_PAGE_RES (17) samples per edge. At 16384 m / 2^8 = 64 m tiles -> 4 m sample spacing —
         // ample from altitude, coarse for a ground-level view. Raising it adds finer tiles (more detail)
         // at the cost of more resident tiles/memory; lowering it is coarser + cheaper. Clamped to <= 20.
-        Self { world_size: 16_384.0, budget: LogiStreamingBudget::defaults(), max_level: 8, _reserved: 0 }
+        Self {
+            world_size: 16_384.0,
+            budget: LogiStreamingBudget::defaults(),
+            max_level: 8,
+            _reserved: 0,
+        }
     }
 }
 
@@ -263,19 +276,19 @@ const _: () = {
 
 const VERTEX_STRIDE: u32 = geo::VERTEX_STRIDE as u32;
 const HEIGHT_PAGE_RES: u16 = 17; // FIX 7: fixed N (=17) samples per tile edge regardless of level/size
-// Resident-tile budget. Must stay >= the kernel's MAX_SELECTED so a single frame's selection never
-// forces live-tile eviction. This is THE single resident cap for the whole pipeline: the C++ renderer's
-// MaxSections / MaxNaniteTiles MUST be >= this (it holds every tile the kernel keeps resident). Keep all
-// three (here, stream MAX_SELECTED, and LogiTerrainSubsystem.cpp) in sync — they describe one budget.
+                                 // Resident-tile budget. Must stay >= the kernel's MAX_SELECTED so a single frame's selection never
+                                 // forces live-tile eviction. This is THE single resident cap for the whole pipeline: the C++ renderer's
+                                 // MaxSections / MaxNaniteTiles MUST be >= this (it holds every tile the kernel keeps resident). Keep all
+                                 // three (here, stream MAX_SELECTED, and LogiTerrainSubsystem.cpp) in sync — they describe one budget.
 const MESH_CACHE_CAP: usize = 4096; // decoded per-tile meshes (count cap)
-// Byte budget for the decoded-mesh cache — bounds memory regardless of count, since tiles vary in
-// geometry (and skirts add ~50% indices). Evicted together with MESH_CACHE_CAP, whichever binds first.
+                                    // Byte budget for the decoded-mesh cache — bounds memory regardless of count, since tiles vary in
+                                    // geometry (and skirts add ~50% indices). Evicted together with MESH_CACHE_CAP, whichever binds first.
 const MESH_BYTE_BUDGET: usize = 128 * 1024 * 1024; // 128 MiB of decoded mesh
-// Terrain relief (amplitude) is the SHARED canonical constant `logi_terrain_procgen::DEFAULT_AMPLITUDE_M`
-// (250 m) — the SAME value the sim's gameplay sampler uses. Do not re-declare a local copy here.
-// FIX 2: frame ring depth. Max in-flight frames the host may hold; it MUST release a frame within RING
-// steps of receiving it, else step() reuses the slot and the host reads silently-stale data. The C++
-// host releases each frame the SAME tick it acquires it (1 in flight), so 4 is ample headroom (was 8).
+                                                   // Terrain relief (amplitude) is the SHARED canonical constant `logi_terrain_procgen::DEFAULT_AMPLITUDE_M`
+                                                   // (250 m) — the SAME value the sim's gameplay sampler uses. Do not re-declare a local copy here.
+                                                   // FIX 2: frame ring depth. Max in-flight frames the host may hold; it MUST release a frame within RING
+                                                   // steps of receiving it, else step() reuses the slot and the host reads silently-stale data. The C++
+                                                   // host releases each frame the SAME tick it acquires it (1 in flight), so 4 is ample headroom (was 8).
 const RING: usize = 4;
 
 /// A decoded, displaced per-tile mesh (procgen height page -> displaced grid). Unique per tile, so it
@@ -379,8 +392,10 @@ impl LogiTerrainWorld {
     }
 
     pub fn set_budget(&mut self, budget: LogiStreamingBudget) {
-        self.engine
-            .set_budget(budget.memory_budget_bytes as usize, budget.max_in_flight.max(1) as usize);
+        self.engine.set_budget(
+            budget.memory_budget_bytes as usize,
+            budget.max_in_flight.max(1) as usize,
+        );
     }
 
     /// Ensure a decoded, displaced mesh exists for `tile` (procgen height page -> displaced grid).
@@ -393,13 +408,28 @@ impl LogiTerrainWorld {
         }
         let (cx, cz) = self.stream_world.tile_center(tile);
         let ts = self.stream_world.tile_size_at(tile.level);
-        let page = self.heights.height_page(cx - ts * 0.5, cz - ts * 0.5, ts, HEIGHT_PAGE_RES);
+        let page = self
+            .heights
+            .height_page(cx - ts * 0.5, cz - ts * 0.5, ts, HEIGHT_PAGE_RES);
         let (min_elevation, max_elevation) = (page.min_elevation, page.max_elevation);
-        let MeshData { vertices, indices, vertex_count, index_count } = height_mesh(&page, ts as f32);
+        let MeshData {
+            vertices,
+            indices,
+            vertex_count,
+            index_count,
+        } = height_mesh(&page, ts as f32);
         self.mesh_bytes += vertices.len() + indices.len(); // keep the running byte total in sync (see evict_meshes)
         self.tile_meshes.insert(
             tile,
-            TileMesh { vertices, indices, vertex_count, index_count, min_elevation, max_elevation, last_used: frame },
+            TileMesh {
+                vertices,
+                indices,
+                vertex_count,
+                index_count,
+                min_elevation,
+                max_elevation,
+                last_used: frame,
+            },
         );
     }
 
@@ -429,9 +459,9 @@ impl LogiTerrainWorld {
             return;
         }
         let live = self.next_frame_id.wrapping_sub(1); // frame just built; its tiles are pinned
-        // Tiles referenced by any still-live ring frame: the host may hold zero-copy pointers into their
-        // mesh bytes until it releases that frame, so they must outlive eviction (FIX M4). Reuse the
-        // scratch set — no per-call allocation on the churn path.
+                                                       // Tiles referenced by any still-live ring frame: the host may hold zero-copy pointers into their
+                                                       // mesh bytes until it releases that frame, so they must outlive eviction (FIX M4). Reuse the
+                                                       // scratch set — no per-call allocation on the churn path.
         self.evict_pinned.clear();
         for slot in &self.frames {
             if slot.frame_id == 0 {
@@ -480,7 +510,10 @@ impl LogiTerrainWorld {
         // the single pipeline-wide resident cap being silently exceeded.
         debug_assert!(
             (self.tile_meshes.len() <= MESH_CACHE_CAP && self.mesh_bytes <= MESH_BYTE_BUDGET)
-                || self.tile_meshes.iter().all(|(t, m)| m.last_used == live || self.evict_pinned.contains(t)),
+                || self
+                    .tile_meshes
+                    .iter()
+                    .all(|(t, m)| m.last_used == live || self.evict_pinned.contains(t)),
             "evict_meshes left the mesh cache over budget while an evictable (un-pinned, non-live) mesh remained"
         );
         self.evict_candidates = candidates; // restore the scratch (now with capacity) for reuse

@@ -3,8 +3,7 @@
 
 fn main() {
     let token = std::env::var("CESIUM_ION_TOKEN").expect("set CESIUM_ION_TOKEN");
-    let asset_id: u64 =
-        std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(2275207);
+    let asset_id: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(2275207);
 
     match logi_3dtiles_ion::resolve_asset(asset_id, &token) {
         Ok(a) => {

@@ -28,7 +28,11 @@ pub struct Cartographic {
 impl Cartographic {
     #[inline]
     pub const fn new(longitude: f64, latitude: f64, height: f64) -> Self {
-        Self { longitude, latitude, height }
+        Self {
+            longitude,
+            latitude,
+            height,
+        }
     }
 
     /// From degrees — a convenience for human-authored placements (e.g. KML `<longitude>/<latitude>`).
@@ -70,7 +74,11 @@ impl Ellipsoid {
     pub fn from_radii(x: f64, y: f64, z: f64) -> Self {
         let radii = DVec3::new(x, y, z);
         let radii_squared = radii * radii;
-        Self { radii, radii_squared, one_over_radii_squared: DVec3::ONE / radii_squared }
+        Self {
+            radii,
+            radii_squared,
+            one_over_radii_squared: DVec3::ONE / radii_squared,
+        }
     }
 
     /// Unit geodetic surface normal at an ECEF point (the local "up"). For points off the surface this
@@ -130,8 +138,7 @@ impl Ellipsoid {
             if func.abs() <= 1e-12 {
                 break;
             }
-            let denominator =
-                x2 * (xm2 * xm) * oors.x + y2 * (ym2 * ym) * oors.y + z2 * (zm2 * zm) * oors.z;
+            let denominator = x2 * (xm2 * xm) * oors.x + y2 * (ym2 * ym) * oors.y + z2 * (zm2 * zm) * oors.z;
             correction = func / (-2.0 * denominator);
         }
         DVec3::new(position.x * xm, position.y * ym, position.z * zm)
@@ -157,7 +164,11 @@ impl EnuFrame {
         let east = DVec3::new(-c.longitude.sin(), c.longitude.cos(), 0.0);
         let north = up.cross(east);
         let enu_to_ecef = DMat3::from_cols(east, north, up);
-        Self { origin_ecef, enu_to_ecef, ecef_to_enu: enu_to_ecef.transpose() }
+        Self {
+            origin_ecef,
+            enu_to_ecef,
+            ecef_to_enu: enu_to_ecef.transpose(),
+        }
     }
 
     /// Build the ENU frame at the geodetic location of an ECEF point.
@@ -216,7 +227,8 @@ mod tests {
             let back = e.cartesian_to_cartographic(ecef);
             assert!((back.longitude - c.longitude).abs() <= 1e-11, "lon {c:?} -> {back:?}");
             assert!((back.latitude - c.latitude).abs() <= 1e-11, "lat {c:?} -> {back:?}");
-            assert!((back.height - c.height).abs() <= 1e-4, "h {c:?} -> {back:?}"); // 0.1 mm
+            assert!((back.height - c.height).abs() <= 1e-4, "h {c:?} -> {back:?}");
+            // 0.1 mm
         }
     }
 
@@ -233,7 +245,7 @@ mod tests {
         assert!(north.dot(up).abs() <= 1e-12);
         assert!(up.dot(east).abs() <= 1e-12);
         assert!((east.cross(north) - up).length() <= 1e-12, "not right-handed"); // E×N = U
-        // "up" is exactly the geodetic surface normal at the origin's lon/lat.
+                                                                                 // "up" is exactly the geodetic surface normal at the origin's lon/lat.
         assert!((up - geodetic_surface_normal_cartographic(c.longitude, c.latitude)).length() <= 1e-15);
     }
 
@@ -242,7 +254,7 @@ mod tests {
         let e = Ellipsoid::wgs84();
         let f = EnuFrame::from_cartographic(&e, Cartographic::from_degrees(10.0, 50.0, 0.0));
         assert!(f.ecef_to_local(f.origin_ecef).length() <= 1e-9); // origin → ENU (0,0,0)
-        // 100 m along ENU +Z is 100 m up the surface normal.
+                                                                  // 100 m along ENU +Z is 100 m up the surface normal.
         let up_ecef = f.local_to_ecef(DVec3::new(0.0, 0.0, 100.0));
         let up_normal = e.geodetic_surface_normal(f.origin_ecef);
         assert!((up_ecef - (f.origin_ecef + up_normal * 100.0)).length() <= 1e-6);

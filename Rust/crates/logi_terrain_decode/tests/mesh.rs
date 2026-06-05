@@ -20,8 +20,16 @@ fn height_mesh_has_expected_shape_and_relief() {
     let perim = 2 * n + 2 * n - 4;
     assert_eq!(mesh.vertex_count, (n * n + perim) as u32);
     assert_eq!(mesh.index_count, ((n - 1) * (n - 1) * 6 + perim * 12) as u32);
-    assert_eq!(mesh.vertices.len(), (n * n + perim) * 32, "32-byte interleaved vertices");
-    assert_eq!(mesh.indices.len(), ((n - 1) * (n - 1) * 6 + perim * 12) * 4, "u32 indices");
+    assert_eq!(
+        mesh.vertices.len(),
+        (n * n + perim) * 32,
+        "32-byte interleaved vertices"
+    );
+    assert_eq!(
+        mesh.indices.len(),
+        ((n - 1) * (n - 1) * 6 + perim * 12) * 4,
+        "u32 indices"
+    );
 
     // The mesh must actually be displaced: the y channel (bytes 4..8 of each 32-byte vertex) varies.
     let mut min_y = f32::INFINITY;
@@ -49,6 +57,9 @@ fn height_mesh_has_expected_shape_and_relief() {
             mesh.vertices[at + 2],
             mesh.vertices[at + 3],
         ]);
-        assert!(y < min_y, "skirt vertex {v} must drop below the surface (y={y}, surface min={min_y})");
+        assert!(
+            y < min_y,
+            "skirt vertex {v} must drop below the surface (y={y}, surface min={min_y})"
+        );
     }
 }

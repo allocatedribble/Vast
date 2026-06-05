@@ -125,8 +125,7 @@ pub fn evaluate(
     // FIX L1: overflow-safe geometric-error halving (matches logi_terrain_lod FIX 5) — `1u64 << level`
     // would overflow past level 63; `0.5^level` cannot.
     let ge = ctx.base_geometric_error * 0.5f64.powi(candidate.level as i32);
-    let screen_error_score =
-        screen_space_error(ge, dist, ctx.fov_y_radians, ctx.viewport_height).min(64.0) as f32;
+    let screen_error_score = screen_space_error(ge, dist, ctx.fov_y_radians, ctx.viewport_height).min(64.0) as f32;
 
     // Coarser ancestors covering a fallback hole rank up (preserves coarse-first / parent fallback).
     let parent_fallback_risk = if is_fallback {

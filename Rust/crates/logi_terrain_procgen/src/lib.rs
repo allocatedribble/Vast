@@ -17,7 +17,8 @@ fn mix64(mut h: u64) -> u64 {
 
 #[inline]
 fn lattice(xi: i64, zi: i64, seed: u64) -> f64 {
-    let h = mix64(seed ^ (xi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (zi as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
+    let h =
+        mix64(seed ^ (xi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (zi as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
     // map to [-1, 1] (FIX 11: stay in f64)
     (h as f64 / u64::MAX as f64) * 2.0 - 1.0
 }

@@ -51,11 +51,7 @@ pub struct DecodedGltf {
 
 /// Interleave attribute arrays into the 32-byte vertex layout. A missing normal defaults to `+Z` and a
 /// missing uv to `(0,0)`.
-pub fn interleave(
-    positions: &[[f32; 3]],
-    normals: Option<&[[f32; 3]]>,
-    uvs: Option<&[[f32; 2]]>,
-) -> Vec<u8> {
+pub fn interleave(positions: &[[f32; 3]], normals: Option<&[[f32; 3]]>, uvs: Option<&[[f32; 2]]>) -> Vec<u8> {
     let mut out = Vec::with_capacity(positions.len() * 32);
     for (i, p) in positions.iter().enumerate() {
         let n = normals.and_then(|a| a.get(i)).copied().unwrap_or([0.0, 0.0, 1.0]);
@@ -111,12 +107,7 @@ fn decode_mesh_primitives(
 }
 
 /// Recursively walk a node, accumulating the world transform, and decode every mesh it carries.
-fn walk_node(
-    node: gltf::Node,
-    parent_world: glam::Mat4,
-    blob: Option<&[u8]>,
-    out: &mut Vec<DecodedPrimitive>,
-) {
+fn walk_node(node: gltf::Node, parent_world: glam::Mat4, blob: Option<&[u8]>, out: &mut Vec<DecodedPrimitive>) {
     let world = parent_world * glam::Mat4::from_cols_array_2d(&node.transform().matrix());
     if let Some(mesh) = node.mesh() {
         decode_mesh_primitives(mesh, world.to_cols_array_2d(), blob, out);
@@ -162,9 +153,10 @@ pub fn decode_glb(bytes: &[u8]) -> Result<DecodedGltf, GltfError> {
                             data: b.get(start..end).ok_or(GltfError::BadBufferView)?.to_vec(),
                         }
                     }
-                    gltf::buffer::Source::Uri(_) => {
-                        EmbeddedImage { mime_type: mime_type.to_string(), data: Vec::new() }
-                    }
+                    gltf::buffer::Source::Uri(_) => EmbeddedImage {
+                        mime_type: mime_type.to_string(),
+                        data: Vec::new(),
+                    },
                 }
             }
             // External/data URIs are deferred (the IO layer would fetch/decode them).

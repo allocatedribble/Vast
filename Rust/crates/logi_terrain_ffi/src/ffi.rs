@@ -6,8 +6,8 @@ use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
 
 use logi_terrain_scene::{
-    LogiBufferHandle, LogiBufferView, LogiCameraState, LogiFrameId, LogiFramePacket,
-    LogiStreamingBudget, LogiTerrainWorld, LogiWorldCreateInfo,
+    LogiBufferHandle, LogiBufferView, LogiCameraState, LogiFrameId, LogiFramePacket, LogiStreamingBudget,
+    LogiTerrainWorld, LogiWorldCreateInfo,
 };
 
 /// Status codes returned across the boundary. Matches `LogiStatus` (int32) in `logi_terrain.h`.
@@ -334,8 +334,7 @@ pub unsafe extern "C" fn logi_building_load(
     jpg_path: *const c_char,
     placement: *const LogiPlacement,
 ) -> *mut LogiBuilding {
-    let result =
-        panic::catch_unwind(AssertUnwindSafe(|| building_load_impl(dae_path, jpg_path, placement)));
+    let result = panic::catch_unwind(AssertUnwindSafe(|| building_load_impl(dae_path, jpg_path, placement)));
     match result {
         Ok(Some(b)) => Box::into_raw(Box::new(b)),
         _ => {
@@ -515,7 +514,10 @@ fn globe_create_impl(
         info.max_tile_distance_m,
         cache,
     ) {
-        Ok(world) => Some(LogiGlobeWorld { world, frame_tiles: Vec::new() }),
+        Ok(world) => Some(LogiGlobeWorld {
+            world,
+            frame_tiles: Vec::new(),
+        }),
         Err(e) => {
             set_last_error(format!("logi_globe_world_create: {e:?}"));
             None
@@ -525,10 +527,7 @@ fn globe_create_impl(
 
 /// Build the optional persistent disk cache from the FFI budget + dir. Returns `None` (no cache) when the
 /// budget is 0, the dir is null/empty, or the cache can't be opened — the last case logs but still streams.
-fn build_globe_cache(
-    budget: u64,
-    cache_dir: *const c_char,
-) -> Option<std::sync::Arc<logi_3dtiles_io::DiskCache>> {
+fn build_globe_cache(budget: u64, cache_dir: *const c_char) -> Option<std::sync::Arc<logi_3dtiles_io::DiskCache>> {
     if budget == 0 || cache_dir.is_null() {
         return None;
     }
@@ -539,7 +538,9 @@ fn build_globe_cache(
     match logi_3dtiles_io::DiskCache::open(dir, budget) {
         Ok(c) => Some(std::sync::Arc::new(c)),
         Err(e) => {
-            set_last_error(format!("globe disk cache open '{dir}': {e} (streaming without a cache)"));
+            set_last_error(format!(
+                "globe disk cache open '{dir}': {e} (streaming without a cache)"
+            ));
             None
         }
     }
@@ -561,8 +562,7 @@ pub unsafe extern "C" fn logi_globe_world_create(
     ion_token: *const c_char,
     cache_dir: *const c_char,
 ) -> *mut LogiGlobeWorld {
-    let result =
-        panic::catch_unwind(AssertUnwindSafe(|| globe_create_impl(info, ion_token, cache_dir)));
+    let result = panic::catch_unwind(AssertUnwindSafe(|| globe_create_impl(info, ion_token, cache_dir)));
     match result {
         Ok(Some(w)) => Box::into_raw(Box::new(w)),
         Ok(None) => std::ptr::null_mut(), // globe_create_impl already set a specific last_error

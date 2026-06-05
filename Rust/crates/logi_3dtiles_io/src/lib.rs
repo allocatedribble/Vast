@@ -60,7 +60,13 @@ pub struct SyntheticSource {
 impl SyntheticSource {
     /// Latencies in `1..=10` ticks, payloads in `256..=4351` bytes.
     pub fn new() -> Self {
-        Self { pending: HashMap::new(), min_latency: 1, latency_range: 10, min_bytes: 256, bytes_range: 4096 }
+        Self {
+            pending: HashMap::new(),
+            min_latency: 1,
+            latency_range: 10,
+            min_bytes: 256,
+            bytes_range: 4096,
+        }
     }
 
     fn latency_for(&self, id: RequestId) -> u64 {
@@ -91,15 +97,22 @@ impl TileContentSource for SyntheticSource {
     }
 
     fn poll_completed(&mut self, now_tick: u64, out: &mut Vec<Loaded>) {
-        let mut done: Vec<RequestId> =
-            self.pending.iter().filter(|(_, (ready, _))| *ready <= now_tick).map(|(id, _)| *id).collect();
+        let mut done: Vec<RequestId> = self
+            .pending
+            .iter()
+            .filter(|(_, (ready, _))| *ready <= now_tick)
+            .map(|(id, _)| *id)
+            .collect();
         // Deterministic completion order: `HashMap` iteration order is randomized per run, which would
         // make a budgeted/order-sensitive consumer non-reproducible even though every payload is a pure
         // function of its id. Sort by id so a replay is byte- AND order-identical.
         done.sort_unstable();
         for id in done {
             let (_, len) = self.pending.remove(&id).unwrap_or((0, 0));
-            out.push(Loaded { id, bytes: synthetic_payload(id, len) });
+            out.push(Loaded {
+                id,
+                bytes: synthetic_payload(id, len),
+            });
         }
     }
 
@@ -139,8 +152,11 @@ pub fn resolve_url(base: &str, content_uri: &str) -> Result<String, FetchError> 
     // are unaffected.
     if joined.origin() == base_url.origin() {
         let have: HashSet<String> = joined.query_pairs().map(|(k, _)| k.into_owned()).collect();
-        let carry: Vec<(String, String)> =
-            base_url.query_pairs().into_owned().filter(|(k, _)| !have.contains(k)).collect();
+        let carry: Vec<(String, String)> = base_url
+            .query_pairs()
+            .into_owned()
+            .filter(|(k, _)| !have.contains(k))
+            .collect();
         if !carry.is_empty() {
             let mut q = joined.query_pairs_mut();
             for (k, v) in &carry {
@@ -155,7 +171,9 @@ pub fn resolve_url(base: &str, content_uri: &str) -> Result<String, FetchError> 
 pub fn http_get(url: &str) -> Result<Vec<u8>, FetchError> {
     let resp = ureq::get(url).call().map_err(|e| FetchError::Http(e.to_string()))?;
     let mut bytes = Vec::new();
-    resp.into_reader().read_to_end(&mut bytes).map_err(|e| FetchError::Http(e.to_string()))?;
+    resp.into_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| FetchError::Http(e.to_string()))?;
     Ok(bytes)
 }
 
@@ -273,7 +291,16 @@ impl DiskCache {
             lru.insert(tick, key);
             total = total.saturating_add(size);
         }
-        Ok(Self { dir, budget: budget_bytes, idx: Mutex::new(CacheIndex { entries, lru, total, tick }) })
+        Ok(Self {
+            dir,
+            budget: budget_bytes,
+            idx: Mutex::new(CacheIndex {
+                entries,
+                lru,
+                total,
+                tick,
+            }),
+        })
     }
 
     /// Cached bytes for `url` if present (bumping LRU recency); reads the file outside the index lock.
@@ -367,7 +394,12 @@ impl HttpSource {
                 }
             });
         }
-        Self { req_tx, done_rx, in_flight: HashSet::new(), cache }
+        Self {
+            req_tx,
+            done_rx,
+            in_flight: HashSet::new(),
+            cache,
+        }
     }
 
     /// Bytes currently resident in the disk cache (0 if no cache).
@@ -413,8 +445,7 @@ mod http_tests {
         assert!(u.starts_with("https://tile.googleapis.com/v1/3dtiles/x.glb?"), "{u}");
         assert!(u.contains("session=XYZ") && u.contains("key=ABC"), "{u}");
         // ion direct: a path-relative content URI resolves against the tileset.json dir + carries the token.
-        let u =
-            resolve_url("https://assets.cesium.com/1/tileset.json?access_token=T", "0/0.b3dm").unwrap();
+        let u = resolve_url("https://assets.cesium.com/1/tileset.json?access_token=T", "0/0.b3dm").unwrap();
         assert_eq!(u, "https://assets.cesium.com/1/0/0.b3dm?access_token=T");
         // a child URI that already has the param isn't duplicated.
         let u = resolve_url("https://h/r.json?key=A", "/c.glb?key=B").unwrap();
@@ -482,7 +513,10 @@ mod tests {
         // Relative child → same origin → token is carried (the normal streaming case).
         let rel = resolve_url(base, "0/0/0.b3dm").unwrap();
         assert!(rel.starts_with("https://assets.cesium.com/1/0/0/0.b3dm"));
-        assert!(rel.contains("access_token=SECRET"), "relative child must keep the token");
+        assert!(
+            rel.contains("access_token=SECRET"),
+            "relative child must keep the token"
+        );
 
         // Same-host absolute child → same origin → token carried.
         let same = resolve_url(base, "https://assets.cesium.com/other/x.glb").unwrap();
@@ -495,7 +529,10 @@ mod tests {
 
         // Different port is a different origin too.
         let other_port = resolve_url(base, "https://assets.cesium.com:8443/x.glb").unwrap();
-        assert!(!other_port.contains("SECRET"), "different port is cross-origin: {other_port}");
+        assert!(
+            !other_port.contains("SECRET"),
+            "different port is cross-origin: {other_port}"
+        );
     }
 
     #[test]

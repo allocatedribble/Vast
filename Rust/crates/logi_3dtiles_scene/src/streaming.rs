@@ -104,8 +104,7 @@ impl TilesetWorld {
         max_tile_distance: f64,
         cache: Option<Arc<DiskCache>>,
     ) -> Result<Self, StreamError> {
-        let tileset =
-            parse_tileset(root_tileset_bytes).map_err(|e| StreamError::Tileset(e.to_string()))?;
+        let tileset = parse_tileset(root_tileset_bytes).map_err(|e| StreamError::Tileset(e.to_string()))?;
         let ellipsoid = Ellipsoid::wgs84();
         let enu = EnuFrame::from_cartographic(&ellipsoid, origin);
         Ok(Self {
@@ -149,18 +148,19 @@ impl TilesetWorld {
         let root_bytes = logi_3dtiles_io::http_get(&asset.tileset_url)
             .map_err(|e| StreamError::Tileset(format!("root fetch: {e:?}")))?;
         let origin = Cartographic::from_degrees(longitude_deg, latitude_deg, height_m);
-        Self::new(asset.tileset_url, &root_bytes, origin, workers, max_tile_distance, cache)
+        Self::new(
+            asset.tileset_url,
+            &root_bytes,
+            origin,
+            workers,
+            max_tile_distance,
+            cache,
+        )
     }
 
     /// Advance one step: drain completed fetches (decode glTF / graft tilesets), run the SSE + distance
     /// traversal, request new loads, and return the renderable frame (a render list).
-    pub fn step(
-        &mut self,
-        camera_ecef: DVec3,
-        fov_y_radians: f64,
-        viewport_height: f64,
-        max_sse: f64,
-    ) -> GlobeFrame {
+    pub fn step(&mut self, camera_ecef: DVec3, fov_y_radians: f64, viewport_height: f64, max_sse: f64) -> GlobeFrame {
         self.frame_counter += 1;
         self.drain_completed();
 
@@ -224,7 +224,10 @@ impl TilesetWorld {
         }
         self.evict_decoded(&current);
 
-        GlobeFrame { origin_ecef: self.enu.origin_ecef.to_array(), tiles }
+        GlobeFrame {
+            origin_ecef: self.enu.origin_ecef.to_array(),
+            tiles,
+        }
     }
 
     /// Drop off-screen decoded tiles once the resident set exceeds `max_decoded`, oldest (`last_seen`)
@@ -323,7 +326,11 @@ impl TilesetWorld {
             };
             // Classify on the PATH extension, not a substring of the whole URL: a `.glb` tile's signed
             // query (`?session=…&key=…`) can contain ".json" and would be mis-sent to the tileset parser.
-            let kind = if is_tileset_uri(uri) { ContentKind::Tileset } else { ContentKind::Glb };
+            let kind = if is_tileset_uri(uri) {
+                ContentKind::Tileset
+            } else {
+                ContentKind::Glb
+            };
             let base = self.base_for(&lt.path).to_string();
             let Ok(full) = logi_3dtiles_io::resolve_url(&base, uri) else {
                 continue;
@@ -331,7 +338,8 @@ impl TilesetWorld {
             let id = self.next_id;
             self.next_id += 1;
             self.source.request(id, &full, 0);
-            self.in_flight.insert(id, (lt.path.clone(), kind, lt.world_transform, full));
+            self.in_flight
+                .insert(id, (lt.path.clone(), kind, lt.world_transform, full));
         }
     }
 
@@ -424,12 +432,22 @@ impl TilesetWorld {
         if vertices.is_empty() {
             return None;
         }
-        let texture =
-            g.images.into_iter().map(|im| im.data).find(|d| !d.is_empty()).unwrap_or_default();
+        let texture = g
+            .images
+            .into_iter()
+            .map(|im| im.data)
+            .find(|d| !d.is_empty())
+            .unwrap_or_default();
         let bounds_center = [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, (mn[2] + mx[2]) * 0.5];
-        let bounds_radius =
-            0.5 * ((mx[0] - mn[0]).powi(2) + (mx[1] - mn[1]).powi(2) + (mx[2] - mn[2]).powi(2)).sqrt();
-        Some(DecodedTile { vertices, indices, texture, bounds_center, bounds_radius, last_seen: 0 })
+        let bounds_radius = 0.5 * ((mx[0] - mn[0]).powi(2) + (mx[1] - mn[1]).powi(2) + (mx[2] - mn[2]).powi(2)).sqrt();
+        Some(DecodedTile {
+            vertices,
+            indices,
+            texture,
+            bounds_center,
+            bounds_radius,
+            last_seen: 0,
+        })
     }
 }
 
@@ -440,7 +458,9 @@ impl TilesetWorld {
 /// happens to contain ".json" isn't misclassified.
 fn is_tileset_uri(uri: &str) -> bool {
     let path = uri.split(['?', '#']).next().unwrap_or(uri);
-    path.rsplit('.').next().is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    path.rsplit('.')
+        .next()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
 }
 
 fn tile_at_mut<'a>(root: &'a mut Tile, path: &[u32]) -> Option<&'a mut Tile> {

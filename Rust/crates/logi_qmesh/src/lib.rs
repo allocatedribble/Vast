@@ -344,7 +344,15 @@ pub fn parse(bytes: &[u8]) -> Result<QuantizedMeshTile, QmError> {
 
     let extensions = read_extensions(&mut r)?;
 
-    Ok(QuantizedMeshTile { header, u, v, height, indices, edges, extensions })
+    Ok(QuantizedMeshTile {
+        header,
+        u,
+        v,
+        height,
+        indices,
+        edges,
+        extensions,
+    })
 }
 
 // ---- tiling -> geodetic bounds --------------------------------------------------------------------
@@ -369,7 +377,12 @@ pub fn tile_bounds_geodetic(z: u32, x: u32, y: u32) -> GeodeticBounds {
     let d_lat = PI / pow; // 180° / 2^z
     let west = -PI + (x as f64) * d_lon;
     let south = -FRAC_PI_2 + (y as f64) * d_lat;
-    GeodeticBounds { west, south, east: west + d_lon, north: south + d_lat }
+    GeodeticBounds {
+        west,
+        south,
+        east: west + d_lon,
+        north: south + d_lat,
+    }
 }
 
 // ---- geodetic -> ECEF mesh ------------------------------------------------------------------------
@@ -458,7 +471,11 @@ fn compute_vertex_normals(positions: &[DVec3], raw_indices: &[u32]) -> Vec<DVec3
         normals[c] += face;
     }
     for n in &mut normals {
-        *n = if n.length_squared() > 0.0 { n.normalize() } else { DVec3::Z };
+        *n = if n.length_squared() > 0.0 {
+            n.normalize()
+        } else {
+            DVec3::Z
+        };
     }
     normals
 }
@@ -658,18 +675,16 @@ mod tests {
         assert_eq!(mesh.positions.len(), 4);
         assert_eq!(mesh.indices, vec![0, 1, 2, 1, 3, 2]);
         // vertex 0 is u=v=0 (the SW corner) at the min height.
-        let expected_sw = e.cartographic_to_cartesian(Cartographic::new(
-            bounds.west,
-            bounds.south,
-            header.min_height as f64,
-        ));
-        assert!((mesh.positions[0] - expected_sw).length() <= 1e-6, "{:?}", mesh.positions[0]);
+        let expected_sw =
+            e.cartographic_to_cartesian(Cartographic::new(bounds.west, bounds.south, header.min_height as f64));
+        assert!(
+            (mesh.positions[0] - expected_sw).length() <= 1e-6,
+            "{:?}",
+            mesh.positions[0]
+        );
         // vertex 3 is u=v=32767 (the NE corner).
-        let expected_ne = e.cartographic_to_cartesian(Cartographic::new(
-            bounds.east,
-            bounds.north,
-            header.min_height as f64,
-        ));
+        let expected_ne =
+            e.cartographic_to_cartesian(Cartographic::new(bounds.east, bounds.north, header.min_height as f64));
         assert!((mesh.positions[3] - expected_ne).length() <= 1e-6);
         // computed normals are unit and point away from the geocenter (outward up).
         for (p, n) in mesh.positions.iter().zip(&mesh.normals) {

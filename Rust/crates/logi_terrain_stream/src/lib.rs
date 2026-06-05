@@ -57,7 +57,12 @@ pub struct SyntheticProvider {
 
 impl SyntheticProvider {
     pub fn new(base_latency: u64, jitter: u64) -> Self {
-        Self { base_latency, jitter, pending: BTreeMap::new(), in_flight: 0 }
+        Self {
+            base_latency,
+            jitter,
+            pending: BTreeMap::new(),
+            in_flight: 0,
+        }
     }
 
     fn latency_for(&self, id: TileId) -> u64 {
@@ -108,7 +113,12 @@ pub struct World {
 
 impl World {
     pub fn new(world_size: f64, max_level: u8, base_geometric_error: f64) -> Self {
-        Self { world_size, max_level, base_geometric_error, height_amplitude: 0.0 }
+        Self {
+            world_size,
+            max_level,
+            base_geometric_error,
+            height_amplitude: 0.0,
+        }
     }
 
     /// Set the max terrain relief (meters) so view-culling bounds enclose displaced geometry.
@@ -156,7 +166,11 @@ impl World {
     #[inline]
     fn side(&self, level: u8) -> u32 {
         // FIX L2: guard the `1u32 << level` shift (sibling of TileId::side) — `level >= 32` overflows.
-        debug_assert!(level < 32, "World::side at level {} overflows the 32-bit `1u32 << level` shift", level);
+        debug_assert!(
+            level < 32,
+            "World::side at level {} overflows the 32-bit `1u32 << level` shift",
+            level
+        );
         1u32 << level
     }
     #[inline]
@@ -426,12 +440,8 @@ impl<P: Provider> StreamEngine<P> {
                 // (refine early); receding/static (motion≈0 => future==current) => unchanged.
                 let future = camera + motion * self.cfg.prefetch_lead;
                 let dist = camera.distance(center).min(future.distance(center)).max(1.0);
-                let sse = logi_terrain_lod::screen_space_error(
-                    ge,
-                    dist,
-                    self.view_fov_y_radians,
-                    self.view_viewport_height,
-                );
+                let sse =
+                    logi_terrain_lod::screen_space_error(ge, dist, self.view_fov_y_radians, self.view_viewport_height);
                 // Bias the threshold by last frame's decision: a refined tile holds until SSE falls a
                 // dead-band below target; a coarse tile refines at the target (so a fresh engine with an
                 // empty prev_refined reproduces the old stateless threshold exactly).
@@ -502,7 +512,8 @@ impl<P: Provider> StreamEngine<P> {
         self.provider.poll_completed(self.tick, &mut self.completed);
         for i in 0..self.completed.len() {
             let (id, bytes) = self.completed[i];
-            self.cache.insert(id, Page { size_bytes: bytes }, bytes, &mut self.evicted);
+            self.cache
+                .insert(id, Page { size_bytes: bytes }, bytes, &mut self.evicted);
             self.in_flight.remove(&id);
             self.telemetry.requests_completed += 1;
         }
@@ -595,7 +606,9 @@ impl<P: Provider> StreamEngine<P> {
         // by descending score within a class, so critical fallbacks always issue before Speculative.
         self.candidates.sort_by(|a, b| {
             (a.2 as usize).cmp(&(b.2 as usize)).then_with(|| {
-                b.1.total().partial_cmp(&a.1.total()).unwrap_or(std::cmp::Ordering::Equal)
+                b.1.total()
+                    .partial_cmp(&a.1.total())
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
         });
         if let Some(top) = self.candidates.first() {
@@ -668,7 +681,10 @@ mod view_tests {
         for t in desired {
             let (c, r) = world.tile_bounds(t);
             let ahead = (c - camera).dot(fwd);
-            assert!(ahead >= -r - 1.0, "tile behind the camera leaked in: ahead={ahead}, radius={r}");
+            assert!(
+                ahead >= -r - 1.0,
+                "tile behind the camera leaked in: ahead={ahead}, radius={r}"
+            );
         }
     }
 
@@ -703,7 +719,11 @@ mod view_tests {
         let mut eng = StreamEngine::new(cfg, SyntheticProvider::new(2, 8));
         assert_eq!(eng.cache().budget(), bytes, "engine starts at the exact byte budget");
         eng.set_budgets(eng.budgets());
-        assert_eq!(eng.cache().budget(), bytes, "round-tripping budgets must not floor the byte budget");
+        assert_eq!(
+            eng.cache().budget(),
+            bytes,
+            "round-tripping budgets must not floor the byte budget"
+        );
         // Idempotent under repetition.
         eng.set_budgets(eng.budgets());
         assert_eq!(eng.cache().budget(), bytes);
@@ -714,7 +734,14 @@ mod view_tests {
         // A view-aware selection should mix levels (fine near, coarse far), not a single flat ring.
         let world = World::new(16384.0, 10, 4096.0);
         let mut eng = engine();
-        eng.set_view(Vec3::new(0.2, -0.6, 1.0), Vec3::new(0.0, 1.0, 0.0), 1.0, 1920.0, 1080.0, 2.0);
+        eng.set_view(
+            Vec3::new(0.2, -0.6, 1.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            1.0,
+            1920.0,
+            1080.0,
+            2.0,
+        );
         let camera = DVec3::new(0.0, 500.0, -2000.0);
         eng.update(&world, camera, DVec3::default());
         let levels: HashSet<u8> = eng.desired().iter().map(|t| t.level).collect();
