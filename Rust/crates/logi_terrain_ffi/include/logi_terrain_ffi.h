@@ -29,168 +29,13 @@ typedef int32_t LogiStatus;
 #define LOGI_TERRAIN_INTERNAL       (-4)
 #define LOGI_TERRAIN_ABI_MISMATCH   (-5)
 
-#define LOGI_INDEX_FORMAT_U16 0u
-#define LOGI_INDEX_FORMAT_U32 1u
-#define LOGI_BUFFER_KIND_VERTEX 0u
-#define LOGI_BUFFER_KIND_INDEX  1u
-
-typedef uint64_t LogiFrameId;
-typedef uint64_t LogiBufferHandle;
-typedef struct LogiTerrainWorld LogiTerrainWorld; /* opaque */
-
-/* glam-typed vectors, byte-identical to Unity.Mathematics float3 / double3. */
-typedef struct LogiVec3 {
-    float x, y, z;          /* f32 render-local (glam Vec3 ↔ float3) */
-} LogiVec3;
-
-typedef struct LogiDVec3 {
-    double x, y, z;         /* f64 world / planet-scale (glam DVec3 ↔ double3) */
-} LogiDVec3;
-
-typedef struct LogiBoundingSphere {
-    LogiVec3 center;        /* render-local (f32) */
-    float    radius;
-} LogiBoundingSphere;
-
-typedef struct LogiCameraState {
-    LogiDVec3 position;     /* f64 world */
-    LogiVec3  forward;      /* f32 unit direction */
-    LogiVec3  up;
-    float     fov_y_radians;
-    float     viewport_width;
-    float     viewport_height;
-    float     sse_target_pixels;
-} LogiCameraState;
-
-typedef struct LogiStreamingBudget {
-    uint64_t memory_budget_bytes;
-    uint32_t max_in_flight;
-    uint32_t _reserved;
-} LogiStreamingBudget;
-
-typedef struct LogiWorldCreateInfo {
-    double              world_size;
-    LogiStreamingBudget budget;
-    uint32_t            max_level;
-    uint32_t            _reserved;
-} LogiWorldCreateInfo;
-
-typedef struct LogiLocalFrame {
-    LogiDVec3 origin;       /* f64 world point Unity treats as local zero */
-} LogiLocalFrame;
-
-typedef struct LogiBufferView {
-    const uint8_t* data;
-    uint64_t       byte_length;
-    uint32_t       element_stride;
-    uint32_t       kind;
-} LogiBufferView;
-
-typedef struct LogiTerrainPatchDraw {
-    uint64_t           patch_handle;
-    LogiBufferHandle   vertex_buffer;
-    LogiBufferHandle   index_buffer;
-    LogiBoundingSphere bounds;
-    LogiVec3           local_position;  /* f32, relative to local_frame.origin */
-    float              geometric_error;
-    uint32_t           lod;
-    uint32_t           vertex_count;
-    uint32_t           vertex_stride;
-    uint32_t           index_count;
-    uint32_t           index_format;
-    uint32_t           material_id;
-    uint32_t           _reserved;
-} LogiTerrainPatchDraw;
-
-typedef struct LogiUploadCommand {
-    uint64_t       page_handle;
-    const uint8_t* data;
-    uint64_t       byte_length;
-    uint32_t       slot;
-    uint32_t       kind;
-} LogiUploadCommand;
-
-typedef struct LogiInstanceBatchDraw {
-    LogiBufferHandle mesh_handle;
-    const uint8_t*   instance_data;
-    uint32_t         instance_count;
-    uint32_t         instance_stride;
-    uint32_t         material_id;
-    uint32_t         _reserved;
-} LogiInstanceBatchDraw;
-
-typedef struct LogiDecalBatchDraw {
-    const uint8_t* data;
-    uint32_t       count;
-    uint32_t       material_id;
-} LogiDecalBatchDraw;
-
-typedef struct LogiColliderCommand {
-    uint64_t       patch_handle;
-    const uint8_t* data;
-    uint64_t       byte_length;
-    uint32_t       kind;
-    uint32_t       _reserved;
-} LogiColliderCommand;
-
-typedef struct LogiAttributionEntry {
-    const uint8_t* text;
-    uint32_t       text_len;
-    uint32_t       source_id;
-} LogiAttributionEntry;
-
-typedef struct LogiTerrainTelemetry {
-    uint64_t frames;
-    uint64_t bytes_resident;
-    uint64_t peak_bytes_resident;
-    uint64_t cache_hits;
-    uint64_t cache_misses;
-    uint64_t evictions;
-    uint64_t requests_issued;
-    uint64_t requests_completed;
-    uint64_t fallbacks_used;
-    uint32_t resident_tiles;
-    uint32_t in_flight;
-} LogiTerrainTelemetry;
-
-typedef struct LogiFramePacket {
-    uint64_t       frame_id;
-    LogiLocalFrame local_frame;
-
-    const LogiTerrainPatchDraw*  terrain_patches;
-    const LogiUploadCommand*     material_page_uploads;
-    const LogiUploadCommand*     height_page_uploads;
-    const LogiInstanceBatchDraw* instance_batches;
-    const LogiDecalBatchDraw*    decal_batches;
-    const LogiColliderCommand*   collider_commands;
-    const LogiAttributionEntry*  attributions;
-
-    uint32_t terrain_patch_count;
-    uint32_t material_page_upload_count;
-    uint32_t height_page_upload_count;
-    uint32_t instance_batch_count;
-    uint32_t decal_batch_count;
-    uint32_t collider_command_count;
-    uint32_t attribution_count;
-    uint32_t _pad;
-
-    LogiTerrainTelemetry telemetry;
-} LogiFramePacket;
-
-/* --- Entry points (see src/ffi.rs) --- */
+/* --- Shared terrain-DLL entry points ---
+ * The ABI-version + last-error accessors below are SHARED by the globe / baked / building lanes (all one
+ * logi_terrain.dll). The old streaming synthetic-terrain world (LogiTerrainWorld / LogiFramePacket /
+ * logi_terrain_world_*) was RETIRED in the one-engine merge — the baked + procedural lanes (logi_baked_*,
+ * see below) are the single terrain engine now. */
 
 uint32_t   logi_terrain_abi_version(void);
-
-LogiTerrainWorld* logi_terrain_world_create(const LogiWorldCreateInfo* info);
-void       logi_terrain_world_destroy(LogiTerrainWorld* world);
-
-LogiStatus logi_terrain_world_set_camera(LogiTerrainWorld* world, const LogiCameraState* camera);
-LogiStatus logi_terrain_world_set_budget(LogiTerrainWorld* world, const LogiStreamingBudget* budget);
-
-LogiStatus logi_terrain_world_step(LogiTerrainWorld* world, double delta_seconds, LogiFrameId* out_frame_id);
-LogiStatus logi_terrain_world_get_frame_packet(LogiTerrainWorld* world, LogiFrameId frame_id, LogiFramePacket* out_packet);
-LogiStatus logi_terrain_world_acquire_buffer_view(LogiTerrainWorld* world, LogiBufferHandle handle, LogiBufferView* out_view);
-void       logi_terrain_world_release_frame(LogiTerrainWorld* world, LogiFrameId frame_id);
 
 size_t     logi_terrain_last_error_message(uint8_t* buf, size_t buf_len);
 
@@ -307,13 +152,44 @@ typedef struct LogiBakedFrame {
 typedef struct LogiBakedCreateInfo {
     uint32_t meshing_mode;     /* the meshing toggle: 0 = uniform grid, 1 = adaptive TIN */
     float    tin_max_error_m;  /* TIN max vertical error (metres); ignored when uniform */
+    float    skirt_depth_m;    /* downward edge-skirt depth (metres); 0 = none (hides cross-tile cracks) */
 } LogiBakedCreateInfo;
+
+/* Procedural-world params (the one-engine procedural lane): build terrain from the canonical fractal field
+ * gameplay shares — no store on disk. seed==0 => the canonical gameplay field; else a custom world. The AOI
+ * is the 2*radius_m square at the origin (lon/lat degrees, height metres), a pyramid of levels 0..leaf_level
+ * at grid_n^2 samples/tile. Meshing fields mirror LogiBakedCreateInfo. */
+typedef struct LogiBakedProceduralInfo {
+    uint64_t seed;
+    double   origin_lon_deg;
+    double   origin_lat_deg;
+    double   origin_height_m;
+    double   radius_m;
+    uint32_t leaf_level;
+    uint32_t grid_n;
+    uint32_t meshing_mode;     /* the meshing toggle: 0 = uniform grid, 1 = adaptive TIN */
+    float    tin_max_error_m;  /* TIN max vertical error (metres); ignored when uniform */
+    float    skirt_depth_m;    /* downward edge-skirt depth (metres); 0 = none */
+} LogiBakedProceduralInfo;
 
 /* Open a baked store directory (UTF-8 path) with the meshing mode in `info` (NULL = uniform). Blocking
  * (reads + triangulates the AOI) — call off the render thread. Returns NULL on a null/non-UTF-8 path or an
  * open/decode failure. */
 LogiBakedWorld* logi_baked_world_create(const char* store_dir_utf8, const LogiBakedCreateInfo* info);
+/* Create a PROCEDURAL terrain world (no store on disk): generate the SSE-LOD pyramid from the canonical
+ * fractal field. Identical handle to a store-backed world (step/select/get_frame/destroy). Blocking — call
+ * off the render thread. Returns NULL on a null `info` or a build failure. */
+LogiBakedWorld* logi_baked_world_create_procedural(const LogiBakedProceduralInfo* info);
 LogiStatus      logi_baked_world_get_frame(const LogiBakedWorld* world, LogiBakedFrame* out_frame);
+/* Camera-driven frame: distance-culls to tiles within `max_distance_cm` of the camera (Unreal cm; <= 0 =
+ * no cull). Returned tiles are valid until destroy or the next step/get_frame on this world. */
+LogiStatus      logi_baked_world_step(LogiBakedWorld* world, float camera_x_cm, float camera_y_cm,
+                                      float camera_z_cm, float max_distance_cm, LogiBakedFrame* out_frame);
+/* SSE-LOD frame: descends the baked pyramid, coarse-far / fine-near, refining by screen-space error
+ * (sse_target_px). Use this for a pyramid store (a single-level store renders everything). */
+LogiStatus      logi_baked_world_select(LogiBakedWorld* world, float camera_x_cm, float camera_y_cm,
+                                        float camera_z_cm, float fov_y_radians, float viewport_height,
+                                        float sse_target_px, LogiBakedFrame* out_frame);
 void            logi_baked_world_destroy(LogiBakedWorld* world);
 
 #ifdef __cplusplus

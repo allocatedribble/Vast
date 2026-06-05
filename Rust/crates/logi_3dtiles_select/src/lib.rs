@@ -19,6 +19,11 @@ use logi_geospatial::{Cartographic, Ellipsoid};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+// One screen-space-error model for the whole engine: reuse the kernel's canonical implementation
+// (`logi_terrain_lod`) instead of a second copy here. Same formula, with its degenerate-FOV/zero-distance
+// clamps. The 3D-Tiles selection traversal below calls it exactly as the quadtree streamer does.
+pub use logi_terrain_lod::screen_space_error;
+
 /// The per-frame view + LOD parameters that drive selection (camera in ECEF, plan §9.4).
 #[derive(Clone, Copy, Debug)]
 pub struct SelectParams {
@@ -47,16 +52,6 @@ pub struct Selection {
     pub render: Vec<SelectedTile>,
     /// Selected tiles whose content isn't loaded yet — request these.
     pub load: Vec<SelectedTile>,
-}
-
-/// The same SSE model as `logi_terrain_lod` and 3D Tiles: `geometricError · height / (2 · distance ·
-/// tan(fovY/2))`.
-#[inline]
-pub fn screen_space_error(geometric_error: f64, distance: f64, fov_y_radians: f64, viewport_height: f64) -> f64 {
-    // Clamp `tan(fovY/2)` to a tiny positive: a degenerate `fov_y_radians` (0, or ≥ π) would otherwise
-    // divide by zero → inf/NaN, and a NaN SSE silently disables refinement. Real FOVs are inside (0, π).
-    let half_fov_tan = (fov_y_radians * 0.5).tan().max(1e-6);
-    geometric_error * viewport_height / (2.0 * distance * half_fov_tan)
 }
 
 /// Conservatively bound a tile's bounding volume by an ECEF sphere `(center, radius)`. `box`/`sphere`

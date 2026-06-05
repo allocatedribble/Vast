@@ -9,3 +9,4 @@ publish = false
 glam = { workspace = true }
 logi_geospatial = { path = "../logi_geospatial" }
 logi_3dtiles_tileset = { path = "../logi_3dtiles_tileset" }
+logi_terrain_lod = { path = "../logi_terrain_lod" }

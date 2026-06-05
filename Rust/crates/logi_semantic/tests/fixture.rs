@@ -18,8 +18,8 @@ fn reads_python_baked_store() {
     let m = store.manifest();
     assert_eq!(m.format_version, 1);
     assert_eq!(m.tiling.grid_n, 9);
-    assert_eq!(m.tiles.len(), 4, "leaf_level 1 → 2x2 tiles");
-    assert_eq!(store.tile_ids().len(), 4);
+    assert_eq!(m.tiles.len(), 5, "pyramid: level 0 root + 4 level-1 tiles");
+    assert_eq!(store.tile_ids().len(), 5);
 
     // Every tile decodes (CRC-32 validated inside) and triangulates to the expected mesh shape.
     let n = m.tiling.grid_n as usize;
@@ -55,8 +55,8 @@ fn manifest_origin_ecef_matches_engine_geodesy() {
 #[test]
 fn baked_world_loads_all_tiles_into_ue_space() {
     let world = BakedWorld::open(FIXTURE).expect("open baked world");
-    assert_eq!(world.tile_count(), 4);
-    // Origin sits on the globe (~Earth radius from the geocentre).
+    assert_eq!(world.tile_count(), 5); // pyramid: 1 root + 4 leaves
+                                       // Origin sits on the globe (~Earth radius from the geocentre).
     let o = world.origin_ecef();
     let r = (o[0] * o[0] + o[1] * o[1] + o[2] * o[2]).sqrt();
     assert!((r - 6_369_000.0).abs() < 40_000.0, "origin radius {r}");
@@ -66,6 +66,18 @@ fn baked_world_loads_all_tiles_into_ue_space() {
         assert_eq!(t.mesh.indices.len(), 8 * 8 * 6);
         assert!(t.mesh.bounds_radius > 0.0);
     }
+}
+
+#[test]
+fn sse_select_coarsens_far_and_refines_near() {
+    let mut world = BakedWorld::open(FIXTURE).expect("open baked world");
+    // 50 km up → the root's screen-space error is tiny → just the coarse level-0 tile.
+    let far = world.select([0.0, 0.0, 5_000_000.0], 1.0, 1080.0, 16.0);
+    assert_eq!(far, vec![TileId::new(0, 0, 0)], "far → the coarse root only");
+    // At the surface with a tight SSE target → refines to the 4 level-1 leaves.
+    let near = world.select([0.0, 0.0, 50.0], 1.0, 1080.0, 1.0);
+    assert_eq!(near.len(), 4, "near → the 4 leaves");
+    assert!(near.iter().all(|t| t.level == 1), "near leaves are level 1");
 }
 
 #[test]

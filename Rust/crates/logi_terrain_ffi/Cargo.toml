@@ -11,11 +11,11 @@ name = "logi_terrain"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-logi_terrain_core = { path = "../logi_terrain_core" }
-logi_terrain_scene = { path = "../logi_terrain_scene" }
-# M1 (ADR-0009): the AGI_HQ building loader, exposed additively alongside the terrain world.
+# M1 (ADR-0009): the AGI_HQ building loader, exposed additively alongside the globe/baked lanes.
 logi_3dtiles_scene = { path = "../logi_3dtiles_scene" }
 # M2 globe: the persistent on-disk tile cache (DiskCache), built here so an open failure degrades cleanly.
 logi_3dtiles_io = { path = "../logi_3dtiles_io" }
 # HE-0 (ADR-0011): the baked semantic-tile world (open store -> render meshes), exposed additively.
 logi_semantic = { path = "../logi_semantic" }
+# Procedural-terrain origin (lon/lat/height) → ECEF for the one-engine procedural lane.
+logi_geospatial = { path = "../logi_geospatial" }

@@ -5,7 +5,7 @@
     "radius_m": 200.0
   },
   "bake_tool": "logi_bake 0.1.0",
-  "config_hash": "fcbd341adf68c5bd10e4aa5328aa89187b8d5dc7449d0967fb9accdef939d8d9",
+  "config_hash": "e3333d92c6120a0aa9975b48d26adb4e64e654662ff0d9fe00a8d2652f1e7961",
   "crs": {
     "horizontal": "ENU tangent plane at origin (EPSG:4326 origin)",
     "vertical": "WGS84 ellipsoidal (synthetic)"
@@ -35,12 +35,23 @@
     "height_max_m": 28.02920913696289,
     "height_min_m": 11.712711334228516,
     "rejected": 0,
-    "tile_count": 4
+    "tile_count": 5
   },
   "seed": 42,
   "tiles": [
     {
+      "file": "tiles/L0_X0_Y0.lst",
+      "geometric_error": 15.992593765258789,
+      "height_max": 27.705305099487305,
+      "height_min": 11.712711334228516,
+      "level": 0,
+      "sha256": "0dd3e53622215e56c5532871f5916745d91b4072deb7cb2db7da35bc5d832c0e",
+      "x": 0,
+      "y": 0
+    },
+    {
       "file": "tiles/L1_X0_Y0.lst",
+      "geometric_error": 7.9962968826293945,
       "height_max": 27.384912490844727,
       "height_min": 11.712711334228516,
       "level": 1,
@@ -50,6 +61,7 @@
     },
     {
       "file": "tiles/L1_X1_Y0.lst",
+      "geometric_error": 7.9962968826293945,
       "height_max": 28.02920913696289,
       "height_min": 12.70694351196289,
       "level": 1,
@@ -59,6 +71,7 @@
     },
     {
       "file": "tiles/L1_X0_Y1.lst",
+      "geometric_error": 7.9962968826293945,
       "height_max": 27.384912490844727,
       "height_min": 11.712711334228516,
       "level": 1,
@@ -68,6 +81,7 @@
     },
     {
       "file": "tiles/L1_X1_Y1.lst",
+      "geometric_error": 7.9962968826293945,
       "height_max": 28.02920913696289,
       "height_min": 12.70694351196289,
       "level": 1,
@@ -77,6 +91,7 @@
     }
   ],
   "tiling": {
+    "base_geometric_error": 15.992593765258789,
     "grid_n": 9,
     "leaf_level": 1,
     "root_size_m": 400.0

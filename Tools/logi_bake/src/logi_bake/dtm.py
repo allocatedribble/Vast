@@ -5,6 +5,7 @@ acquire/ground-filter stages of plan §3.B; it raises a clear error until that l
 
 from __future__ import annotations
 
+import math
 from typing import Protocol
 
 MASK64 = (1 << 64) - 1
@@ -50,23 +51,79 @@ class SyntheticDtm:
 
 
 class LidarDtm:
-    """Real DTM from USGS 3DEP QL2 LiDAR (plan §3.B). Guarded stub: requires the `[lidar]` extra + the
-    acquire/ground-filter implementation."""
+    """Real DTM from a LiDAR point cloud (LAZ) via **PDAL** (plan §3.B): SMRF ground classification → a
+    regular DTM grid (min-Z per cell ≈ bare earth) → bilinear sample, converting NAVD88 orthometric →
+    WGS84 ellipsoidal with `undulation_m` (the geoid, §geo). Needs the `[lidar]` extra (pdal, numpy).
 
-    def __init__(self, *_args: object, **_kwargs: object) -> None:
-        raise NotImplementedError(
-            "The LiDAR DTM path is not implemented for HE-0. Install the real-data deps "
-            "(`pip install -e .[lidar]`) and implement plan §3.B (PDAL ground filter → DTM). "
-            "Use --generator synthetic for the HE-0 vertical slice."
-        )
+    Prerequisite: the point cloud must already be in the **AOI ENU frame** (metres, East/North, origin at
+    the AOI centre) — the acquire stage (plan §3.A: reproject from the source CRS + recentre) arranges
+    this. Until that stage + real data exist, instantiating without PDAL raises a clear error."""
 
-    def height(self, east_m: float, north_m: float) -> float:  # pragma: no cover - stub
-        raise NotImplementedError
+    def __init__(self, laz_path: str, undulation_m: float = 0.0, cell_m: float = 1.0) -> None:
+        try:
+            import numpy  # noqa: F401
+            import pdal  # noqa: F401
+        except ImportError as exc:
+            raise NotImplementedError(
+                "The LiDAR DTM path needs the [lidar] extra (`pip install -e .[lidar]`); PDAL/numpy not "
+                "found. Use --generator synthetic for the HE-0 vertical slice."
+            ) from exc
+        self._undulation = undulation_m
+        self._cell = cell_m
+        self._build(laz_path)
+
+    def _build(self, laz_path: str) -> None:
+        import json
+
+        import numpy as np
+        import pdal
+
+        # SMRF (Simple Morphological Filter) classifies ground; keep class 2 (ground) only.
+        pipeline = {
+            "pipeline": [
+                str(laz_path),
+                {"type": "filters.smrf"},
+                {"type": "filters.range", "limits": "Classification[2:2]"},
+            ]
+        }
+        p = pdal.Pipeline(json.dumps(pipeline))
+        p.execute()
+        pts = p.arrays[0]
+        x = np.asarray(pts["X"], dtype=float)
+        y = np.asarray(pts["Y"], dtype=float)
+        z = np.asarray(pts["Z"], dtype=float)
+        if x.size == 0:
+            raise ValueError("LiDAR ground filter returned no points")
+        self._x0, self._y0 = float(x.min()), float(y.min())
+        self._cols = max(2, int(math.ceil((x.max() - self._x0) / self._cell)) + 1)
+        self._rows = max(2, int(math.ceil((y.max() - self._y0) / self._cell)) + 1)
+        grid = np.full((self._rows, self._cols), np.nan)
+        ci = np.clip(((x - self._x0) / self._cell).astype(int), 0, self._cols - 1)
+        ri = np.clip(((y - self._y0) / self._cell).astype(int), 0, self._rows - 1)
+        for r, c, zz in zip(ri, ci, z):
+            if np.isnan(grid[r, c]) or zz < grid[r, c]:
+                grid[r, c] = zz  # min-Z per cell ≈ bare earth
+        # Fill empty cells with the global mean (production: rasterio.fill.fillnodata / IDW).
+        mean_z = float(np.nanmean(grid))
+        grid[np.isnan(grid)] = mean_z
+        self._grid = grid
+
+    def height(self, east_m: float, north_m: float) -> float:
+        fc = (east_m - self._x0) / self._cell
+        fr = (north_m - self._y0) / self._cell
+        c0 = max(0, min(self._cols - 2, int(math.floor(fc))))
+        r0 = max(0, min(self._rows - 2, int(math.floor(fr))))
+        tc, tr = fc - c0, fr - r0
+        g = self._grid
+        top = g[r0][c0] * (1 - tc) + g[r0][c0 + 1] * tc
+        bot = g[r0 + 1][c0] * (1 - tc) + g[r0 + 1][c0 + 1] * tc
+        ortho = float(top * (1 - tr) + bot * tr)
+        return ortho + self._undulation  # NAVD88 orthometric → WGS84 ellipsoidal
 
 
-def make_dtm(generator: str, seed: int) -> Dtm:
+def make_dtm(generator: str, seed: int, laz_path: str = "", undulation_m: float = 0.0) -> Dtm:
     if generator == "synthetic":
-        return SyntheticDtm(seed)
+        return SyntheticDtm(seed)  # already ellipsoidal; undulation not applied
     if generator == "lidar":
-        return LidarDtm()
+        return LidarDtm(laz_path, undulation_m)
     raise ValueError(f"unknown generator {generator!r}")

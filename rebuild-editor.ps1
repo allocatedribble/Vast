@@ -26,7 +26,9 @@ $sw = [Diagnostics.Stopwatch]::StartNew()
 # ---- Paths -------------------------------------------------------------------
 $Project  = "C:\Users\premi\work\LogiUE\LogiUE.uproject"
 $RustDir  = "C:\Users\premi\work\LogiUE\Rust"
-$RustOut  = Join-Path $RustDir "target\release"
+# The EDITOR target dir (matches Build.cs RustOutDir = target/ue-editor/release): the C++ links its import
+# lib + runs its DLL from here. Build + stage THIS, not the default target/release.
+$RustOut  = Join-Path $RustDir "target\ue-editor\release"
 $Binaries = "C:\Users\premi\work\LogiUE\Plugins\LogiBevy\Binaries\Win64"
 $Engine   = "C:\Program Files\Epic Games\UE_5.8\Engine"
 $Editor   = Join-Path $Engine "Binaries\Win64\UnrealEditor.exe"
@@ -87,9 +89,12 @@ if ($running) {
 # ---- 2) Build the Rust cdylibs ----------------------------------------------
 # The editor target needs logi_ffi built WITH the editor_inspector feature (matches Build.cs).
 Step 2 "Building Rust (logi_ffi +editor_inspector, logi_terrain)..."
-& cargo build --release --manifest-path "$RustDir\Cargo.toml" -p logi_ffi --features editor_inspector
+# Build into the EDITOR target dir (target/ue-editor) — the exact dir Build.cs links the import lib from
+# and stages the runtime DLL. UBT's own cargo pre-step is SKIPPED on cached incremental builds, which left
+# a stale import lib missing newly-added exports -> LNK2019; building it here keeps the link lib fresh.
+& cargo build --release --manifest-path "$RustDir\Cargo.toml" -p logi_ffi --features editor_inspector --target-dir "$RustDir\target\ue-editor"
 if ($LASTEXITCODE -ne 0) { throw "cargo build (logi_ffi) failed." }
-& cargo build --release --manifest-path "$RustDir\Cargo.toml" -p logi_terrain_ffi
+& cargo build --release --manifest-path "$RustDir\Cargo.toml" -p logi_terrain_ffi --target-dir "$RustDir\target\ue-editor"
 if ($LASTEXITCODE -ne 0) { throw "cargo build (logi_terrain_ffi) failed." }
 # Stage fresh DLLs into the editor's binary dir (UBT's RuntimeDependencies copy is skipped on
 # incremental builds, which is exactly how the Rust DLL went stale during our session).

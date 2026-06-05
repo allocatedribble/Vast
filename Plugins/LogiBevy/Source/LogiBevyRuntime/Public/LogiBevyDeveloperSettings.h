@@ -190,4 +190,60 @@ public:
 	/** Displacement magnitude (cm) fed to the material's "DisplacementScale" parameter. */
 	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Baked Terrain Displacement Scale (cm)", ClampMin = 0.0, EditCondition = "bBakedTerrainNaniteDisplacement"))
 	float BakedTerrainDisplacementScale = 20.0f;
+
+	/** Edge-skirt depth (m): a downward wall on each tile's border hides cross-tile cracks (esp. with TIN,
+	 *  whose neighbouring tiles can pick different edge vertices). 0 = no skirt. Passed to Rust at bake-world
+	 *  creation. */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Baked Terrain Skirt Depth (m)", ClampMin = 0.0))
+	float BakedTerrainSkirtDepthM = 2.0f;
+
+	/** Camera streaming cull radius (m): baked tiles farther than this from the camera aren't drawn (tiles
+	 *  appear/disappear as you move). 0 = no cull. NOTE: superseded by SSE-LOD selection below for pyramid
+	 *  stores (far tiles coarsen rather than vanish); kept for single-level stores. */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Baked Terrain Max Distance (m)", ClampMin = 0.0))
+	float BakedTerrainMaxDistanceM = 0.0f;
+
+	/** Screen-space-error target (pixels) for the baked tile **pyramid** LOD: LOWER pulls finer tiles near
+	 *  the camera (more detail + more tiles); coarse tiles are used far away. 16 = balanced. A pyramid bake
+	 *  (logi_bake emits levels 0..leaf) is required for LOD; a single-level store just renders everything. */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Baked Terrain SSE Target (px)", ClampMin = 1.0, ClampMax = 256.0))
+	float BakedTerrainSse = 16.0f;
+
+	/** Max NEW baked tiles to build per step (throttle so the first frame that resolves the near-set, or a
+	 *  Nanite re-encode burst, never spikes the frame; remaining tiles stay selected in Rust and build on
+	 *  later steps -- self-healing). Mirrors the globe lane's per-step build budget. */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Baked Terrain Builds Per Step", ClampMin = 1, ClampMax = 64))
+	int32 BakedTerrainBuildsPerStep = 8;
+
+	/** Generate terrain PROCEDURALLY from the canonical fractal field (the surface gameplay stands on)
+	 *  instead of opening a baked store on disk — the one-engine procedural lane (the old terrain renderer's
+	 *  role). Same SSE-LOD + meshing + build-budget path as a store. */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Baked Terrain: Procedural (no store)"))
+	bool bBakedTerrainProcedural = false;
+
+	/** Procedural field seed (0 = the canonical gameplay field, so the rendered terrain matches the sim
+	 *  surface). */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Procedural Seed (0 = canonical)", EditCondition = "bBakedTerrainProcedural"))
+	int32 BakedTerrainProceduralSeed = 0;
+
+	/** Procedural AOI origin latitude (degrees). */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Procedural Origin Latitude", EditCondition = "bBakedTerrainProcedural"))
+	double BakedTerrainProceduralOriginLatitude = 39.643178;
+
+	/** Procedural AOI origin longitude (degrees). */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Procedural Origin Longitude", EditCondition = "bBakedTerrainProcedural"))
+	double BakedTerrainProceduralOriginLongitude = -75.617567;
+
+	/** Procedural AOI radius (metres): the world is the 2*radius square centred on the origin. */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Procedural Radius (m)", ClampMin = 1.0, EditCondition = "bBakedTerrainProcedural"))
+	double BakedTerrainProceduralRadiusM = 1609.34;
+
+	/** Procedural pyramid leaf level (depth): levels 0..leaf, 4^level tiles each. Bounded + eager, so keep
+	 *  modest (cap 10) until the lazy-stream path lands. */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Procedural Leaf Level", ClampMin = 0, ClampMax = 10, EditCondition = "bBakedTerrainProcedural"))
+	int32 BakedTerrainProceduralLeafLevel = 4;
+
+	/** Procedural samples per tile edge (grid_n): grid_n^2 heightfield samples per tile. */
+	UPROPERTY(EditAnywhere, config, Category = "Semantic Tiles (HE / ADR-0011)", meta = (DisplayName = "Procedural Grid N", ClampMin = 2, ClampMax = 513, EditCondition = "bBakedTerrainProcedural"))
+	int32 BakedTerrainProceduralGridN = 33;
 };

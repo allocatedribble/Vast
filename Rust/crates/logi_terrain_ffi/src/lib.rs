@@ -1,7 +1,9 @@
 //! The C-ABI boundary crate. Compiles to `logi_terrain.{dll,so,dylib}` — the library Unity loads.
 //!
-//! Thin by design (ADR-0001): it wraps the `LogiTerrainWorld` runtime object from `logi_terrain_scene` and
-//! exposes the stable C ABI in `include/logi_terrain.h`. See `runtime-model.md` for the object model.
+//! Thin by design: exposes the stable C ABI in `include/logi_terrain_ffi.h` for the **baked + procedural
+//! terrain** lanes (`ffi_baked` — the one terrain engine), the **globe** + **building** lanes (`ffi`), and
+//! the shared ABI-version / last-error accessors. (The old streaming `LogiTerrainWorld` from
+//! `logi_terrain_scene` was retired in the one-engine merge.)
 //!
 //! The exported `extern "C"` entry points take raw pointers from the C caller and are therefore declared
 //! `unsafe`; each pointer use is wrapped in an explicit `unsafe` block so it is individually auditable.

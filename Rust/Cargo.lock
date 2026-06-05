@@ -945,6 +945,7 @@ dependencies = [
  "glam",
  "logi_3dtiles_tileset",
  "logi_geospatial",
+ "logi_terrain_lod",
 ]
 
 [[package]]
@@ -1028,6 +1029,8 @@ version = "0.1.0"
 dependencies = [
  "logi_3dtiles_io",
  "logi_geospatial",
+ "logi_terrain_lod",
+ "logi_terrain_procgen",
  "serde",
  "serde_json",
  "thiserror",
@@ -1044,41 +1047,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "logi_terrain_cache"
-version = "0.1.0"
-dependencies = [
- "logi_terrain_core",
-]
-
-[[package]]
-name = "logi_terrain_core"
-version = "0.1.0"
-dependencies = [
- "glam",
-]
-
-[[package]]
-name = "logi_terrain_decode"
-version = "0.1.0"
-dependencies = [
- "logi_terrain_geo",
- "logi_terrain_pack",
-]
-
-[[package]]
 name = "logi_terrain_ffi"
 version = "0.1.0"
 dependencies = [
  "logi_3dtiles_io",
  "logi_3dtiles_scene",
+ "logi_geospatial",
  "logi_semantic",
- "logi_terrain_core",
- "logi_terrain_scene",
 ]
-
-[[package]]
-name = "logi_terrain_geo"
-version = "0.1.0"
 
 [[package]]
 name = "logi_terrain_lod"
@@ -1093,36 +1069,6 @@ name = "logi_terrain_procgen"
 version = "0.1.0"
 dependencies = [
  "logi_terrain_pack",
-]
-
-[[package]]
-name = "logi_terrain_scene"
-version = "0.1.0"
-dependencies = [
- "glam",
- "logi_terrain_core",
- "logi_terrain_decode",
- "logi_terrain_geo",
- "logi_terrain_procgen",
- "logi_terrain_stream",
-]
-
-[[package]]
-name = "logi_terrain_stream"
-version = "0.1.0"
-dependencies = [
- "glam",
- "logi_terrain_cache",
- "logi_terrain_core",
- "logi_terrain_lod",
-]
-
-[[package]]
-name = "logi_terrain_tools"
-version = "0.1.0"
-dependencies = [
- "logi_terrain_core",
- "logi_terrain_stream",
 ]
 
 [[package]]

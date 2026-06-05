@@ -3,6 +3,7 @@
 #include "LogiGlobeSubsystem.h"
 #include "LogiBevyTypes.h"
 #include "LogiBevyDeveloperSettings.h"
+#include "LogiTileRenderShared.h" // FLogiStreamView/LogiResolveStreamView/LogiBuildTileSection (shared)
 #include "Engine/World.h"
 #include "Engine/GameViewportClient.h"
 #include "GameFramework/Actor.h"
@@ -33,54 +34,9 @@ bool LogiBevy_IsTerrainAbiOk();
 namespace
 {
 #if LOGI_BEVY_HAVE_TERRAIN
-	// The streamed camera viewpoint + lens for SSE-driven tile selection.
-	struct FGlobeView
-	{
-		FVector Loc = FVector::ZeroVector; // Unreal cm (ENU origin pinned at world 0,0,0)
-		float FovY = 1.05f;                // vertical FOV (radians)
-		float ViewportHeight = 1080.0f;
-	};
-
-	// View point for streaming: the PIE/game player camera, else (editor, no PIE) the active
-	// level-viewport — so the globe streams in the editor viewport just like the terrain lane.
-	bool GetGlobeView(UWorld* World, FGlobeView& Out)
-	{
-		float ViewportWidth = 1920.0f;
-		auto FovYFromHorizontal = [&](float HFovDeg)
-		{
-			if (HFovDeg <= 1.0f) { return; }
-			const float Aspect = ViewportWidth / FMath::Max(Out.ViewportHeight, 1.0f);
-			Out.FovY = 2.0f * FMath::Atan(FMath::Tan(FMath::DegreesToRadians(HFovDeg) * 0.5f) / FMath::Max(Aspect, 0.001f));
-		};
-
-		if (APlayerController* PC = World->GetFirstPlayerController())
-		{
-			FRotator Rot;
-			PC->GetPlayerViewPoint(Out.Loc, Rot);
-			if (UGameViewportClient* VPC = World->GetGameViewport())
-			{
-				FVector2D Sz;
-				VPC->GetViewportSize(Sz);
-				if (Sz.X > 0 && Sz.Y > 0) { ViewportWidth = static_cast<float>(Sz.X); Out.ViewportHeight = static_cast<float>(Sz.Y); }
-			}
-			if (PC->PlayerCameraManager) { FovYFromHorizontal(PC->PlayerCameraManager->GetFOVAngle()); }
-			return true;
-		}
-#if WITH_EDITOR
-		if (GCurrentLevelEditingViewportClient != nullptr)
-		{
-			Out.Loc = GCurrentLevelEditingViewportClient->GetViewLocation();
-			if (FViewport* VP = GCurrentLevelEditingViewportClient->Viewport)
-			{
-				const FIntPoint Sz = VP->GetSizeXY();
-				if (Sz.X > 0 && Sz.Y > 0) { ViewportWidth = static_cast<float>(Sz.X); Out.ViewportHeight = static_cast<float>(Sz.Y); }
-			}
-			FovYFromHorizontal(GCurrentLevelEditingViewportClient->ViewFOV);
-			return true;
-		}
-#endif
-		return false;
-	}
+	// The streaming viewpoint (FLogiStreamView + LogiResolveStreamView) and the proc-mesh section builder
+	// (LogiBuildTileSection) now live in LogiTileRenderShared — shared with the baked-terrain lane instead
+	// of a per-subsystem copy. The globe-specific helpers (ion token, tile-texture decode) follow.
 
 	// Cesium ion token, read transiently: CESIUM_ION_TOKEN env var first (headless/CI), else the gitignored
 	// <Project>/Intermediate/CesiumIonToken.txt. Never committed config.
@@ -129,48 +85,6 @@ namespace
 		}
 		Tex->UpdateResource();
 		return Tex;
-	}
-
-	// Build one procedural-mesh section from a tile's interleaved 32-byte vertices (pos f3, normal f3, uv
-	// f2) + u32 indices. The Rust globe lane already emits Unreal render space (cm, Z-up LH) with correct
-	// winding (negate-North reflection), so copy positions/normals straight in — no Y<->Z swap, no index
-	// reversal (the building lane's hard-won lesson; doing either back-face-culls the whole tile).
-	void BuildGlobeSection(UProceduralMeshComponent* Mesh, int32 Section, const LogiGlobeTile& T)
-	{
-		const uint32 Stride = T.vertex_stride;
-		if (Stride < 32 || T.vertices == nullptr || T.indices == nullptr) { return; }
-		const uint32 VCount = FMath::Min<uint32>(T.vertex_count, static_cast<uint32>(T.vertices_len / Stride));
-
-		TArray<FVector> Positions;
-		TArray<FVector> Normals;
-		TArray<FVector2D> UVs;
-		Positions.Reserve(VCount);
-		Normals.Reserve(VCount);
-		UVs.Reserve(VCount);
-		for (uint32 v = 0; v < VCount; ++v)
-		{
-			const float* F = reinterpret_cast<const float*>(T.vertices + static_cast<uint64>(v) * Stride);
-			Positions.Add(FVector(F[0], F[1], F[2])); // already cm, Z-up LH
-			Normals.Add(FVector(F[3], F[4], F[5]));
-			UVs.Add(FVector2D(F[6], F[7]));
-		}
-
-		const uint32* IData = reinterpret_cast<const uint32*>(T.indices);
-		TArray<int32> Triangles;
-		Triangles.Reserve(T.index_count);
-		for (uint32 t = 0; t + 3 <= T.index_count; t += 3)
-		{
-			const uint32 I0 = IData[t];
-			const uint32 I1 = IData[t + 1];
-			const uint32 I2 = IData[t + 2];
-			if (I0 >= VCount || I1 >= VCount || I2 >= VCount) { continue; }
-			Triangles.Add(static_cast<int32>(I0));
-			Triangles.Add(static_cast<int32>(I1));
-			Triangles.Add(static_cast<int32>(I2));
-		}
-
-		Mesh->CreateMeshSection_LinearColor(Section, Positions, Triangles, Normals, UVs,
-			TArray<FLinearColor>(), TArray<FProcMeshTangent>(), /*bCreateCollision=*/false);
 	}
 
 	// Read the FFI's last-error message into an FString (UTF-8, not NUL-terminated — terminate it here).
@@ -384,8 +298,8 @@ void ULogiGlobeSubsystem::Tick(float DeltaTime)
 		return;
 	}
 
-	FGlobeView View;
-	if (!GetGlobeView(World, View))
+	FLogiStreamView View;
+	if (!LogiResolveStreamView(World, View))
 	{
 		return; // no viewport this tick
 	}
@@ -425,7 +339,8 @@ void ULogiGlobeSubsystem::Tick(float DeltaTime)
 		--BuildBudget;
 
 		const int32 Section = (FreeSections.Num() > 0) ? FreeSections.Pop(EAllowShrinking::No) : NextSection++;
-		BuildGlobeSection(Mesh, Section, T);
+		LogiBuildTileSection(Mesh, Section, T.vertices, T.vertex_stride, T.vertices_len, T.vertex_count,
+			T.indices, T.index_count);
 
 		FGlobeTileEntry Entry;
 		Entry.Section = Section;

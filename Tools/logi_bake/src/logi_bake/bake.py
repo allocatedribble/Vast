@@ -14,14 +14,25 @@ from . import BAKE_TOOL, MANIFEST_FORMAT_VERSION, __version__
 from .config import BakeConfig
 from .dtm import Dtm, make_dtm
 from .lst import encode_tile, f32
-from .geo import cartographic_to_cartesian
-from .tiling import Tile, leaf_tiles
+from .geo import GeoidModel, cartographic_to_cartesian
+from .tiling import Tile, pyramid_tiles
 
 
 def _sample_tile(dtm: Dtm, tile: Tile, grid_n: int) -> list[float]:
     """Sample the DTM on the tile's `grid_n × grid_n` grid, row-major south→north, west→east, each value
-    rounded to f32 so the stored bytes are canonical."""
+    rounded to f32 so the stored bytes are canonical. Uses the source's vectorized `heights_grid` (one
+    batched reprojection for the whole tile) when it offers one — the real sources do — else a per-sample
+    fallback (the synthetic/LiDAR sources, kept scalar so their bytes stay canonical)."""
     step = tile.size_m / (grid_n - 1)
+    grid_fn = getattr(dtm, "heights_grid", None)
+    if grid_fn is not None:
+        import numpy as np
+
+        easts = tile.origin_e + np.arange(grid_n) * step
+        norths = tile.origin_n + np.arange(grid_n) * step
+        ee, nn = np.meshgrid(easts, norths)  # ee[j,i]=easts[i], nn[j,i]=norths[j] → row-major j,i
+        zz = np.asarray(grid_fn(ee, nn), dtype=float).reshape(-1)
+        return [f32(float(v)) for v in zz]
     heights: list[float] = []
     for j in range(grid_n):
         north = tile.origin_n + j * step
@@ -39,11 +50,29 @@ def bake(cfg: BakeConfig, out_dir: Path) -> dict[str, Any]:
     tiles_dir.mkdir(parents=True, exist_ok=True)
 
     origin_ecef = cartographic_to_cartesian(cfg.lon_deg, cfg.lat_deg, cfg.origin_height_m)
-    dtm = make_dtm(cfg.generator, cfg.seed)
+    # Vertical datum: real LiDAR is NAVD88 orthometric → convert to WGS84 ellipsoidal via the geoid
+    # undulation at the AOI centre (≈constant over a 1-mile AOI). Synthetic heights are already ellipsoidal.
+    real = cfg.generator in ("lidar", "terrarium", "dem")
+    if real:
+        geoid = GeoidModel.from_gtx(cfg.geoid_gtx_path) if cfg.geoid_gtx_path else GeoidModel.constant(cfg.geoid_undulation_m)
+        undulation_m = geoid.undulation(cfg.lat_deg, cfg.lon_deg)
+    else:
+        undulation_m = 0.0
+    if cfg.generator == "terrarium":
+        from .acquire import TerrariumDem
+
+        dtm = TerrariumDem(cfg.lat_deg, cfg.lon_deg, cfg.radius_m, cfg.zoom, undulation_m)
+    elif cfg.generator == "dem":
+        from .acquire import GeoTiffDem
+
+        dtm = GeoTiffDem(cfg.dem_path, cfg.lat_deg, cfg.lon_deg, undulation_m)
+    else:
+        dtm = make_dtm(cfg.generator, cfg.seed, cfg.laz_path, undulation_m)
 
     tiles_meta: list[dict[str, Any]] = []
     g_min, g_max = math.inf, -math.inf
-    for tile in leaf_tiles(cfg.radius_m, cfg.leaf_level):
+    base_ge = 1.0  # the root tile's relief; geometric error halves per level (the SSE-LOD pyramid)
+    for tile in pyramid_tiles(cfg.radius_m, cfg.leaf_level):
         heights = _sample_tile(dtm, tile, cfg.grid_n)
         data = encode_tile(
             tile.level, tile.x, tile.y, cfg.grid_n, tile.origin_e, tile.origin_n, tile.size_m, heights
@@ -52,6 +81,8 @@ def bake(cfg: BakeConfig, out_dir: Path) -> dict[str, Any]:
         (tiles_dir / name).write_bytes(data)
         h_min, h_max = min(heights), max(heights)
         g_min, g_max = min(g_min, h_min), max(g_max, h_max)
+        if tile.level == 0:
+            base_ge = max(h_max - h_min, 1.0)  # coarse-first ⇒ set on the root tile
         tiles_meta.append(
             {
                 "level": tile.level,
@@ -61,6 +92,7 @@ def bake(cfg: BakeConfig, out_dir: Path) -> dict[str, Any]:
                 "sha256": hashlib.sha256(data).hexdigest(),
                 "height_min": h_min,
                 "height_max": h_max,
+                "geometric_error": base_ge * (0.5**tile.level),
             }
         )
 
@@ -81,12 +113,23 @@ def bake(cfg: BakeConfig, out_dir: Path) -> dict[str, Any]:
             "horizontal": "ENU tangent plane at origin (EPSG:4326 origin)",
             "vertical": "WGS84 ellipsoidal (synthetic)",
         },
-        "tiling": {"root_size_m": 2.0 * cfg.radius_m, "leaf_level": cfg.leaf_level, "grid_n": cfg.grid_n},
-        "vertical_datum": {
-            "source": "none (synthetic ellipsoidal)",
-            "conversion": "identity",
-            "residual_gate_cm": 5.0,
+        "tiling": {
+            "root_size_m": 2.0 * cfg.radius_m,
+            "leaf_level": cfg.leaf_level,
+            "grid_n": cfg.grid_n,
+            "base_geometric_error": base_ge,
         },
+        "vertical_datum": (
+            {
+                "source": f"{cfg.generator} (orthometric)",
+                "geoid": cfg.geoid_gtx_path or f"constant N={cfg.geoid_undulation_m:.4f} m",
+                "undulation_m": undulation_m,
+                "conversion": "ellipsoidal = orthometric + N",
+                "residual_gate_cm": 5.0,
+            }
+            if real
+            else {"source": "none (synthetic ellipsoidal)", "conversion": "identity", "residual_gate_cm": 5.0}
+        ),
         "provenance": [
             {"source": cfg.generator, "version": __version__, "license": "n/a", "acquired": "deterministic"}
         ],

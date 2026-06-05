@@ -27,8 +27,8 @@ namespace
 	bool GLogiTerrainAbiOk = true;
 }
 
-// Defined here (the module owns the load + ABI check); declared in LogiTerrainWorld.h so the
-// terrain bridge can refuse to enter the DLL when the loaded ABI does not match the header.
+// Defined here (the module owns the terrain-DLL load + ABI check). The globe + baked-terrain subsystems
+// forward-declare this locally and consult it before any terrain-DLL call (the exports are delay-loaded).
 bool LogiBevy_IsTerrainAbiOk()
 {
 	return GLogiTerrainAbiOk;

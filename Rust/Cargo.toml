@@ -12,18 +12,12 @@ members = [
 	"crates/logi_sim",
 	"crates/logi_render_extract",
 	"crates/logi_schema",
-	# Terrain kernel (ADR-0007), ported from the prior Unity Logi workspace.
-	"crates/logi_terrain_core",
-	"crates/logi_terrain_geo",
-	"crates/logi_terrain_pack",
-	"crates/logi_terrain_cache",
-	"crates/logi_terrain_decode",
-	"crates/logi_terrain_procgen",
-	"crates/logi_terrain_lod",
-	"crates/logi_terrain_stream",
-	"crates/logi_terrain_scene",
-	"crates/logi_terrain_ffi",
-	"crates/logi_terrain_tools",
+	# Terrain kernel (ADR-0007): the SHARED field/LOD/pack kept after the one-engine merge retired the old
+	# streaming synthetic renderer (logi_terrain_scene/stream/cache/decode/geo/core/tools — deleted).
+	"crates/logi_terrain_pack",    # fractal pack tables (procgen depends on it)
+	"crates/logi_terrain_procgen", # canonical TerrainHeights field (gameplay + render share it)
+	"crates/logi_terrain_lod",     # screen_space_error (shared by semantic + 3dtiles select)
+	"crates/logi_terrain_ffi",     # the C ABI cdylib (baked/procedural/globe/building)
 	# 3D Tiles / real-world terrain stack (Milestone F, ADR-0009).
 	"crates/logi_geospatial",
 	"crates/logi_qmesh",

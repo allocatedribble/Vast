@@ -18,15 +18,25 @@ class Tile:
     size_m: float  # square tile extent, metres
 
 
-def leaf_tiles(radius_m: float, leaf_level: int) -> list[Tile]:
-    """The `2^leaf_level × 2^leaf_level` leaf tiles tiling the `2·radius` bbox, in (y, x) row-major order
+def leaf_tiles(radius_m: float, level: int) -> list[Tile]:
+    """The `2^level × 2^level` tiles tiling the `2·radius` bbox at one level, in (y, x) row-major order
     (south→north, west→east) — matching the heightfield sample order."""
-    per_side = 1 << leaf_level
+    per_side = 1 << level
     size = (2.0 * radius_m) / per_side
     tiles: list[Tile] = []
     for y in range(per_side):
         for x in range(per_side):
             origin_e = -radius_m + x * size
             origin_n = -radius_m + y * size
-            tiles.append(Tile(leaf_level, x, y, origin_e, origin_n, size))
+            tiles.append(Tile(level, x, y, origin_e, origin_n, size))
+    return tiles
+
+
+def pyramid_tiles(radius_m: float, leaf_level: int) -> list[Tile]:
+    """Every tile of the quadtree pyramid (levels 0..leaf_level) — one coarse root through the fine leaves,
+    coarse-first. Each level samples the same AOI at double the previous resolution; the runtime SSE
+    selector picks the coarsest level that meets the screen-space-error target per region."""
+    tiles: list[Tile] = []
+    for level in range(leaf_level + 1):
+        tiles.extend(leaf_tiles(radius_m, level))
     return tiles

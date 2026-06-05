@@ -21,7 +21,12 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--leaf-level", type=int, default=3, help="quadtree leaf level (2^level tiles/side)")
     b.add_argument("--grid-n", type=int, default=65, help="heightfield samples per tile side")
     b.add_argument("--seed", type=int, default=42, help="deterministic bake seed")
-    b.add_argument("--generator", choices=["synthetic", "lidar"], default="synthetic")
+    b.add_argument("--generator", choices=["synthetic", "terrarium", "dem", "lidar"], default="synthetic")
+    b.add_argument("--zoom", type=int, default=14, help="terrarium tile zoom (generator=terrarium)")
+    b.add_argument("--dem", type=str, default="", help="DEM GeoTIFF path (generator=dem)")
+    b.add_argument("--laz", type=str, default="", help="LiDAR LAZ path (generator=lidar)")
+    b.add_argument("--geoid-undulation", type=float, default=0.0, help="constant geoid N (m) for real DEMs")
+    b.add_argument("--geoid-gtx", type=str, default="", help="NOAA GEOID18 .gtx grid (overrides constant)")
     b.add_argument("--out", type=Path, required=True, help="output store directory")
 
     args = parser.parse_args(argv)
@@ -35,6 +40,11 @@ def main(argv: list[str] | None = None) -> int:
             grid_n=args.grid_n,
             seed=args.seed,
             generator=args.generator,
+            laz_path=args.laz,
+            dem_path=args.dem,
+            zoom=args.zoom,
+            geoid_undulation_m=args.geoid_undulation,
+            geoid_gtx_path=args.geoid_gtx,
         )
         manifest = bake(cfg, args.out)
         qa = manifest["qa"]

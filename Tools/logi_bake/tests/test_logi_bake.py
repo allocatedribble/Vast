@@ -10,7 +10,15 @@ from pathlib import Path
 
 from logi_bake.bake import bake
 from logi_bake.config import BakeConfig
-from logi_bake.geo import WGS84_SEMI_MAJOR_AXIS, WGS84_SEMI_MINOR_AXIS, cartographic_to_cartesian
+from logi_bake.dtm import make_dtm
+from logi_bake.geo import (
+    WGS84_SEMI_MAJOR_AXIS,
+    WGS84_SEMI_MINOR_AXIS,
+    GeoidModel,
+    cartographic_to_cartesian,
+    datum_residual_cm,
+    orthometric_to_ellipsoidal,
+)
 from logi_bake.lst import LST_VERSION, decode_tile, encode_tile, f32
 from logi_bake.tiling import leaf_tiles
 
@@ -74,8 +82,12 @@ class BakeGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             m = bake(self.CFG, Path(d))
             self.assertEqual(m["format_version"], 1)
-            self.assertEqual(m["qa"]["tile_count"], 4)  # 2^1 squared
-            self.assertEqual(len(m["tiles"]), 4)
+            self.assertEqual(m["qa"]["tile_count"], 5)  # pyramid: level 0 (1) + level 1 (4)
+            self.assertEqual(len(m["tiles"]), 5)
+            self.assertEqual({t["level"] for t in m["tiles"]}, {0, 1}, "pyramid has both levels")
+            self.assertTrue(all("geometric_error" in t for t in m["tiles"]))
+            ge = {t["level"]: t["geometric_error"] for t in m["tiles"]}
+            self.assertAlmostEqual(ge[1], ge[0] * 0.5, msg="geometric error halves per level")
             # origin ECEF agrees with the same geodesy the engine uses.
             ex, ey, ez = cartographic_to_cartesian(self.CFG.lon_deg, self.CFG.lat_deg, 0.0)
             self.assertAlmostEqual(m["origin"]["ecef"][0], ex, places=3)
@@ -103,6 +115,38 @@ class BakeGateTests(unittest.TestCase):
                 (Path(d2) / "manifest.json").read_bytes(),
                 "manifest not reproducible",
             )
+
+
+class DatumTests(unittest.TestCase):
+    """The HE-0 vertical-datum (NAVD88 orthometric → WGS84 ellipsoidal) conversion + ≤5 cm gate."""
+
+    def test_constant_geoid_and_conversion(self) -> None:
+        g = GeoidModel.constant(-34.0)
+        self.assertEqual(g.undulation(39.643, -75.617), -34.0)
+        # 50 m orthometric + N(-34) = 16 m ellipsoidal
+        self.assertAlmostEqual(orthometric_to_ellipsoidal(50.0, g.undulation(39.6, -75.6)), 16.0)
+
+    def test_grid_geoid_bilinear(self) -> None:
+        # 2x2 grid over lat/lon [0..1]: corners g(0,0)=0 g(0,1)=10 g(1,0)=20 g(1,1)=30.
+        g = GeoidModel.from_grid(0.0, 0.0, 1.0, 1.0, 2, 2, [0.0, 10.0, 20.0, 30.0])
+        self.assertAlmostEqual(g.undulation(0.0, 0.0), 0.0)
+        self.assertAlmostEqual(g.undulation(1.0, 1.0), 30.0)
+        self.assertAlmostEqual(g.undulation(0.5, 0.5), 15.0)  # centre = mean
+        self.assertAlmostEqual(g.undulation(0.0, 0.5), 5.0)
+
+    def test_residual_gate(self) -> None:
+        self.assertAlmostEqual(datum_residual_cm(16.00, 16.03), 3.0)
+        self.assertTrue(datum_residual_cm(16.00, 16.03) <= 5.0)
+        self.assertFalse(datum_residual_cm(16.00, 16.10) <= 5.0)
+
+    def test_lidar_path_needs_deps(self) -> None:
+        # PDAL/numpy aren't installed here → a clear NotImplementedError (not a silent bad bake).
+        with self.assertRaises(NotImplementedError):
+            make_dtm("lidar", 0, laz_path="nonexistent.laz", undulation_m=-34.0)
+
+    def test_config_lidar_requires_laz(self) -> None:
+        with self.assertRaises(ValueError):
+            BakeConfig(lat_deg=39.6, lon_deg=-75.6, radius_m=100.0, generator="lidar")
 
 
 if __name__ == "__main__":

@@ -45,6 +45,9 @@ pub struct ManifestTile {
     pub height_min: f32,
     #[serde(default)]
     pub height_max: f32,
+    /// Geometric error (metres) for SSE-LOD selection (= root relief · 0.5^level). 0 on a single-level store.
+    #[serde(default)]
+    pub geometric_error: f32,
 }
 
 /// The store manifest (subset this crate needs; unknown fields are ignored).

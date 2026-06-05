@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod field;
 pub mod format;
 pub mod mesh;
 pub mod store;
@@ -25,10 +26,11 @@ pub mod world;
 #[cfg(feature = "voxel")]
 pub mod voxel;
 
+pub use field::{sample_tile, HeightField, HeightFieldSdf, SignedDistanceField, TerrainHeights};
 pub use format::{SemanticTile, LST_VERSION};
 pub use mesh::{triangulate, triangulate_enu, MeshingMode, TerrainMesh, VERTEX_STRIDE};
 pub use store::{BakedStore, BakedTileSource, Manifest, MANIFEST_FORMAT_VERSION};
-pub use world::{BakedRenderTile, BakedWorld};
+pub use world::{within_cull_distance, BakedRenderTile, BakedWorld};
 
 /// A tile in the baked local quadtree: `level` (0 = the single root over the AOI bbox), `x`/`y` in
 /// `0..2^level` (`x` = east, `y` = north). The `.lst` filename is `L{level}_X{x}_Y{y}.lst`.
@@ -53,6 +55,17 @@ impl TileId {
     /// The tile's filename within the store (`tiles/` subdir).
     pub fn file_name(self) -> String {
         format!("L{}_X{}_Y{}.lst", self.level, self.x, self.y)
+    }
+
+    /// The four quadtree children (one level finer): `(2x,2y)`, `(2x+1,2y)`, `(2x,2y+1)`, `(2x+1,2y+1)`.
+    pub fn children(self) -> [TileId; 4] {
+        let (l, x, y) = (self.level + 1, self.x * 2, self.y * 2);
+        [
+            TileId::new(l, x, y),
+            TileId::new(l, x + 1, y),
+            TileId::new(l, x, y + 1),
+            TileId::new(l, x + 1, y + 1),
+        ]
     }
 }
 

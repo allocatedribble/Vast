@@ -36,6 +36,7 @@
 
 #![allow(dead_code, unused_variables)]
 
+use crate::field::SignedDistanceField; // shared with the heightfield lane (field.rs)
 use crate::mesh::TerrainMesh;
 
 /// Status of the voxel lane. Returned by every entry point until the lane is implemented.
@@ -43,12 +44,6 @@ use crate::mesh::TerrainMesh;
 pub enum VoxelError {
     /// The voxel lane is a WIP skeleton — see the module docs / ADR-0012.
     NotImplemented,
-}
-
-/// A signed-distance field: negative inside the surface, positive outside, ~unit-gradient near it.
-pub trait SignedDistanceField {
-    /// SDF value at a world position (metres).
-    fn distance(&self, x: f32, y: f32, z: f32) -> f32;
 }
 
 /// One resident voxel chunk: a cubic SDF grid (`res³` samples) anchored at `origin` (ENU metres) with the
@@ -106,7 +101,7 @@ mod tests {
 
     struct FlatGround;
     impl SignedDistanceField for FlatGround {
-        fn distance(&self, _x: f32, _y: f32, z: f32) -> f32 {
+        fn distance(&self, _x: f64, _y: f64, z: f64) -> f64 {
             z // ground plane at z = 0
         }
     }

@@ -4,12 +4,13 @@
 //! lanes use ([`super::format`] is south→north, west→east row-major).
 //!
 //! Two meshers, selected by [`MeshingMode`] (the meshing toggle):
-//! - **Uniform** — every grid sample becomes a vertex (`grid_n²` verts, `2·(grid_n-1)²` tris). Simple,
-//!   any `grid_n ≥ 2`.
+//! - **Uniform** — every grid sample becomes a vertex. Any `grid_n ≥ 2`.
 //! - **TIN** — an adaptive **right-triangulated irregular network** (RTIN / "martini": dense on slopes,
-//!   sparse on flats) driven by a max vertical error, cutting vertex count a lot at equal fidelity. Needs
-//!   `grid_n = 2^k + 1`; falls back to Uniform otherwise. Deterministic, crack-free *within* a tile (cross-
-//!   tile edges rely on the same skirt mitigation the uniform lane plans).
+//!   sparse on flats) driven by a max vertical error. Needs `grid_n = 2^k + 1`; falls back to Uniform.
+//!
+//! Both can append a downward **skirt** (a vertical wall hanging from the tile's perimeter) to hide
+//! cross-tile T-junction cracks — TIN tiles are crack-free internally but neighbouring tiles can pick
+//! different edge vertices. Skirts are wound outward (their reflected UE faces point away from the tile).
 
 use crate::format::SemanticTile;
 
@@ -43,8 +44,7 @@ impl TerrainMesh {
 
     /// ENU metres → Unreal render space (cm, Z-up LH): scale ×100 and negate North (Y). The negation is a
     /// reflection that *also* flips triangle winding into Unreal's front-face convention, so `indices`
-    /// pass through unchanged (reversing them would double-flip and back-face-cull the tile — the rule the
-    /// globe/building lanes already follow). Normals negate North too (direction; no scale).
+    /// pass through unchanged (the globe/building lanes' rule). Normals negate North too (no scale).
     pub fn to_ue_cm(&self) -> TerrainMesh {
         let mut vertices = self.vertices.clone();
         for v in 0..self.vertex_count() {
@@ -72,6 +72,22 @@ impl TerrainMesh {
     }
 }
 
+/// An un-packed vertex carrying its grid coordinate (so skirts can find the perimeter).
+#[derive(Clone, Copy)]
+struct RawVert {
+    pos: [f32; 3],
+    normal: [f32; 3],
+    uv: [f32; 2],
+    gx: u32,
+    gy: u32,
+}
+
+/// An un-packed mesh: vertices (with grid coords) + index triangles, before skirts/packing.
+struct RawMesh {
+    verts: Vec<RawVert>,
+    indices: Vec<u32>,
+}
+
 #[inline]
 fn push_vertex(buf: &mut Vec<u8>, p: [f32; 3], n: [f32; 3], uv: [f32; 2]) {
     for f in p {
@@ -86,8 +102,7 @@ fn push_vertex(buf: &mut Vec<u8>, p: [f32; 3], n: [f32; 3], uv: [f32; 2]) {
 }
 
 /// Unit surface normal at grid sample `(x, y)` from a central difference of the heightfield
-/// (forward/backward at edges). Shared by both meshers so normals are identical regardless of
-/// triangulation. `step` is the metric spacing between samples.
+/// (forward/backward at edges). Shared by both meshers so normals match regardless of triangulation.
 fn normal_at(heights: &[f32], size: usize, step: f32, x: usize, y: usize) -> [f32; 3] {
     let h = |i: usize, j: usize| heights[j * size + i];
     let xl = x.saturating_sub(1);
@@ -103,28 +118,36 @@ fn normal_at(heights: &[f32], size: usize, step: f32, x: usize, y: usize) -> [f3
     [n[0] * inv, n[1] * inv, n[2] * inv]
 }
 
-/// Triangulate a tile with the chosen [`MeshingMode`]. `Tin` falls back to `Uniform` when the grid is not
-/// `2^k + 1`.
-pub fn triangulate(tile: &SemanticTile, mode: MeshingMode) -> TerrainMesh {
-    match mode {
-        MeshingMode::Uniform => triangulate_enu(tile),
-        MeshingMode::Tin { max_error_m } => triangulate_tin(tile, max_error_m).unwrap_or_else(|| triangulate_enu(tile)),
-    }
+/// Triangulate a tile with the chosen [`MeshingMode`], optionally appending a `skirt_depth_m` skirt
+/// (0 = none). `Tin` falls back to `Uniform` when the grid is not `2^k + 1`.
+pub fn triangulate(tile: &SemanticTile, mode: MeshingMode, skirt_depth_m: f32) -> TerrainMesh {
+    let size = tile.grid_n as usize;
+    let raw = match mode {
+        MeshingMode::Uniform => raw_uniform(tile),
+        MeshingMode::Tin { max_error_m } => raw_tin(tile, max_error_m).unwrap_or_else(|| raw_uniform(tile)),
+    };
+    pack(raw, size, skirt_depth_m)
 }
 
-/// Uniform triangulation to ENU metres (East = +X, North = +Y, Up = +Z; right-handed). Vertices are the
-/// grid samples; triangles are CCW-from-above (outward normal +Up) — [`TerrainMesh::to_ue_cm`] applies the
-/// reflection that flips them into Unreal's convention.
+/// Uniform triangulation (no skirt). Vertices are the grid samples; triangles CCW-from-above (+Up).
 pub fn triangulate_enu(tile: &SemanticTile) -> TerrainMesh {
+    pack(raw_uniform(tile), tile.grid_n as usize, 0.0)
+}
+
+/// Adaptive **RTIN** triangulation at `max_error_m` (no skirt). `None` if the grid is not `2^k + 1`.
+pub fn triangulate_tin(tile: &SemanticTile, max_error_m: f32) -> Option<TerrainMesh> {
+    let size = tile.grid_n as usize;
+    raw_tin(tile, max_error_m).map(|raw| pack(raw, size, 0.0))
+}
+
+fn raw_uniform(tile: &SemanticTile) -> RawMesh {
     let n = tile.grid_n as usize;
     let span = (n as f64 - 1.0).max(1.0);
     let step = (tile.size_m / span) as f32;
     let oe = tile.origin_e as f32;
     let on = tile.origin_n as f32;
 
-    let mut vertices = Vec::with_capacity(n * n * VERTEX_STRIDE);
-    let mut mn = [f32::MAX; 3];
-    let mut mx = [f32::MIN; 3];
+    let mut verts = Vec::with_capacity(n * n);
     for j in 0..n {
         for i in 0..n {
             let e = oe + i as f32 * step;
@@ -132,15 +155,15 @@ pub fn triangulate_enu(tile: &SemanticTile) -> TerrainMesh {
             let up = tile.heights[j * n + i];
             let normal = normal_at(&tile.heights, n, step, i, j);
             let uv = [i as f32 / span as f32, j as f32 / span as f32];
-            push_vertex(&mut vertices, [e, north, up], normal, uv);
-            for k in 0..3 {
-                let val = [e, north, up][k];
-                mn[k] = mn[k].min(val);
-                mx[k] = mx[k].max(val);
-            }
+            verts.push(RawVert {
+                pos: [e, north, up],
+                normal,
+                uv,
+                gx: i as u32,
+                gy: j as u32,
+            });
         }
     }
-
     let mut indices = Vec::with_capacity((n - 1) * (n - 1) * 6);
     let idx = |i: usize, j: usize| (j * n + i) as u32;
     for j in 0..n - 1 {
@@ -149,34 +172,20 @@ pub fn triangulate_enu(tile: &SemanticTile) -> TerrainMesh {
             let b = idx(i + 1, j);
             let c = idx(i, j + 1);
             let d = idx(i + 1, j + 1);
-            // Two CCW-from-above triangles per quad (both with +Up normal).
-            indices.extend_from_slice(&[a, b, c, b, d, c]);
+            indices.extend_from_slice(&[a, b, c, b, d, c]); // two CCW-from-above tris
         }
     }
-
-    TerrainMesh {
-        vertices,
-        indices,
-        bounds_center: bounds_center(mn, mx),
-        bounds_radius: bounds_radius(mn, mx),
-    }
+    RawMesh { verts, indices }
 }
 
-/// Adaptive **RTIN** (right-triangulated irregular network, the "martini" scheme) at a max vertical
-/// `max_error_m`. Returns `None` if the grid is not `2^k + 1` (so the caller falls back to uniform).
-/// Deterministic + crack-free within the tile; triangles are CCW-from-above (matching the uniform lane).
-pub fn triangulate_tin(tile: &SemanticTile, max_error_m: f32) -> Option<TerrainMesh> {
+fn raw_tin(tile: &SemanticTile, max_error_m: f32) -> Option<RawMesh> {
     let size = tile.grid_n as usize;
     let tile_size = size.checked_sub(1)?;
-    // RTIN requires a power-of-two tile size (grid_n = 2^k + 1) and at least a 2x2 cell tile.
     if tile_size < 2 || (tile_size & (tile_size - 1)) != 0 {
-        return None;
+        return None; // RTIN needs grid_n = 2^k + 1 and a >= 2x2 cell tile
     }
-
     let coords = rtin_coords(size);
     let errors = rtin_errors(&tile.heights, size, &coords);
-
-    // Extract the adaptive triangle set (grid-space vertices + index triangles).
     let mut st = TinExtract {
         errors: &errors,
         size,
@@ -189,14 +198,11 @@ pub fn triangulate_tin(tile: &SemanticTile, max_error_m: f32) -> Option<TerrainM
     st.process(0, 0, max, max, max, 0);
     st.process(max, max, 0, 0, 0, max);
 
-    // Build the render mesh from the selected grid vertices (normals from the full heightfield).
     let span = (size as f64 - 1.0).max(1.0);
     let step = (tile.size_m / span) as f32;
     let oe = tile.origin_e as f32;
     let on = tile.origin_n as f32;
-    let mut vertices = Vec::with_capacity(st.verts.len() * VERTEX_STRIDE);
-    let mut mn = [f32::MAX; 3];
-    let mut mx = [f32::MIN; 3];
+    let mut verts = Vec::with_capacity(st.verts.len());
     for &(gx, gy) in &st.verts {
         let (xi, yi) = (gx as usize, gy as usize);
         let e = oe + gx as f32 * step;
@@ -204,20 +210,116 @@ pub fn triangulate_tin(tile: &SemanticTile, max_error_m: f32) -> Option<TerrainM
         let up = tile.heights[yi * size + xi];
         let normal = normal_at(&tile.heights, size, step, xi, yi);
         let uv = [gx as f32 / span as f32, gy as f32 / span as f32];
-        push_vertex(&mut vertices, [e, north, up], normal, uv);
+        verts.push(RawVert {
+            pos: [e, north, up],
+            normal,
+            uv,
+            gx,
+            gy,
+        });
+    }
+    Some(RawMesh {
+        verts,
+        indices: st.tris,
+    })
+}
+
+/// Append skirts (if `skirt_depth_m > 0`), compute bounds, and pack to the interleaved 32-byte buffer.
+fn pack(mut raw: RawMesh, size: usize, skirt_depth_m: f32) -> TerrainMesh {
+    if skirt_depth_m > 0.0 && raw.verts.len() >= 4 {
+        append_skirt(&mut raw.verts, &mut raw.indices, size, skirt_depth_m);
+    }
+    let mut vertices = Vec::with_capacity(raw.verts.len() * VERTEX_STRIDE);
+    let mut mn = [f32::MAX; 3];
+    let mut mx = [f32::MIN; 3];
+    for v in &raw.verts {
+        push_vertex(&mut vertices, v.pos, v.normal, v.uv);
         for k in 0..3 {
-            let val = [e, north, up][k];
-            mn[k] = mn[k].min(val);
-            mx[k] = mx[k].max(val);
+            mn[k] = mn[k].min(v.pos[k]);
+            mx[k] = mx[k].max(v.pos[k]);
         }
     }
-
-    Some(TerrainMesh {
+    TerrainMesh {
         vertices,
-        indices: st.tris,
+        indices: raw.indices,
         bounds_center: bounds_center(mn, mx),
         bounds_radius: bounds_radius(mn, mx),
-    })
+    }
+}
+
+/// The tile's boundary vertices as one **CCW-from-above** loop (SW→SE→NE→NW). Corners belong to the
+/// south/north runs; the east/west runs hold only strictly-interior edge vertices, so the loop has no
+/// duplicates. (TIN always emits the 4 corners — they're the base-triangle vertices.)
+fn perimeter_loop(verts: &[RawVert], size: usize) -> Vec<u32> {
+    let maxc = (size - 1) as u32;
+    let mut south: Vec<(u32, u32)> = Vec::new(); // (gx, index), gy==0
+    let mut east: Vec<(u32, u32)> = Vec::new(); // (gy, index), gx==max, interior
+    let mut north: Vec<(u32, u32)> = Vec::new(); // (gx, index), gy==max
+    let mut west: Vec<(u32, u32)> = Vec::new(); // (gy, index), gx==0, interior
+    for (i, v) in verts.iter().enumerate() {
+        let i = i as u32;
+        if v.gy == 0 {
+            south.push((v.gx, i));
+        } else if v.gy == maxc {
+            north.push((v.gx, i));
+        } else if v.gx == maxc {
+            east.push((v.gy, i));
+        } else if v.gx == 0 {
+            west.push((v.gy, i));
+        }
+    }
+    south.sort_by_key(|&(g, _)| g); // SW → SE
+    east.sort_by_key(|&(g, _)| g); // SE+1 → NE-1
+    north.sort_by_key(|&(g, _)| std::cmp::Reverse(g)); // NE → NW
+    west.sort_by_key(|&(g, _)| std::cmp::Reverse(g)); // NW-1 → SW+1
+    let mut out = Vec::with_capacity(south.len() + east.len() + north.len() + west.len());
+    out.extend(south.into_iter().map(|(_, i)| i));
+    out.extend(east.into_iter().map(|(_, i)| i));
+    out.extend(north.into_iter().map(|(_, i)| i));
+    out.extend(west.into_iter().map(|(_, i)| i));
+    out
+}
+
+/// Append a downward skirt around the tile perimeter. For each perimeter vertex it adds a twin dropped by
+/// `depth`, then stitches outward-facing quads. Winding `(a, b', b) + (a, a', b')` over a CCW-from-above
+/// loop yields normals pointing away from the tile centre (verified by `skirt_triangle_normals_point_outward`).
+fn append_skirt(verts: &mut Vec<RawVert>, indices: &mut Vec<u32>, size: usize, depth: f32) {
+    let loop_top = perimeter_loop(verts, size);
+    let n = loop_top.len();
+    if n < 2 {
+        return;
+    }
+    let (mut ce, mut cn) = (0.0f32, 0.0f32);
+    for &vi in &loop_top {
+        ce += verts[vi as usize].pos[0];
+        cn += verts[vi as usize].pos[1];
+    }
+    ce /= n as f32;
+    cn /= n as f32;
+
+    let base = verts.len() as u32;
+    for &vi in &loop_top {
+        let top = verts[vi as usize];
+        let pos = [top.pos[0], top.pos[1], top.pos[2] - depth];
+        let (dx, dy) = (top.pos[0] - ce, top.pos[1] - cn);
+        let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+        let normal = [dx / len, dy / len, 0.0]; // outward horizontal
+        verts.push(RawVert {
+            pos,
+            normal,
+            uv: top.uv,
+            gx: top.gx,
+            gy: top.gy,
+        });
+    }
+    for i in 0..n {
+        let j = (i + 1) % n; // closed loop
+        let a = loop_top[i];
+        let b = loop_top[j];
+        let ap = base + i as u32;
+        let bp = base + j as u32;
+        indices.extend_from_slice(&[a, bp, b, a, ap, bp]);
+    }
 }
 
 #[inline]
@@ -230,12 +332,8 @@ fn bounds_radius(mn: [f32; 3], mx: [f32; 3]) -> f32 {
 }
 
 // ---- RTIN / martini -------------------------------------------------------------------------------
-// Port of Mapbox's "martini" (RTIN) terrain mesher: an implicit bin-tree of right triangles over a
-// (2^k+1)² grid. `rtin_coords` precomputes each triangle's hypotenuse endpoints; `rtin_errors` walks the
-// tree smallest-first accumulating each triangle's mid-edge approximation error into a per-sample array;
-// extraction descends from the two base triangles, subdividing only where the error exceeds the budget.
+// Port of Mapbox's "martini" (RTIN): an implicit bin-tree of right triangles over a (2^k+1)² grid.
 
-/// Hypotenuse endpoints `(ax, ay, bx, by)` for every triangle in the implicit bin-tree.
 fn rtin_coords(size: usize) -> Vec<i32> {
     let tile_size = (size - 1) as i32;
     let num_triangles = (tile_size as usize) * (tile_size as usize) * 2 - 2;
@@ -280,8 +378,6 @@ fn rtin_coords(size: usize) -> Vec<i32> {
     coords
 }
 
-/// Per-sample max approximation error (metres), smallest triangles first so parents fold in their
-/// children's error.
 fn rtin_errors(terrain: &[f32], size: usize, coords: &[i32]) -> Vec<f32> {
     let tile_size = size - 1;
     let num_triangles = tile_size * tile_size * 2 - 2;
@@ -292,7 +388,7 @@ fn rtin_errors(terrain: &[f32], size: usize, coords: &[i32]) -> Vec<f32> {
         let (ax, ay, bx, by) = (coords[k], coords[k + 1], coords[k + 2], coords[k + 3]);
         let mx = (ax + bx) >> 1;
         let my = (ay + by) >> 1;
-        let cx = mx + my - ay; // right-angle apex (90° rotation of the hypotenuse midpoint)
+        let cx = mx + my - ay; // right-angle apex
         let cy = my + ax - mx;
         let interp = (terrain[ay as usize * size + ax as usize] + terrain[by as usize * size + bx as usize]) * 0.5;
         let middle = my as usize * size + mx as usize;
@@ -334,7 +430,6 @@ impl TinExtract<'_> {
     fn process(&mut self, ax: i32, ay: i32, bx: i32, by: i32, cx: i32, cy: i32) {
         let mx = (ax + bx) >> 1;
         let my = (ay + by) >> 1;
-        // Subdivide while the hypotenuse is longer than one cell AND the mid-edge error exceeds budget.
         if (ax - cx).abs() + (ay - cy).abs() > 1 && self.errors[my as usize * self.size + mx as usize] > self.max_error
         {
             self.process(cx, cy, ax, ay, mx, my);
@@ -343,8 +438,7 @@ impl TinExtract<'_> {
             let ia = self.vid(ax, ay);
             let ib = self.vid(bx, by);
             let ic = self.vid(cx, cy);
-            // martini emits (a, b, c) which is CW in our (East, North) frame; flip to (a, c, b) so every
-            // tri is CCW-from-above (+Up), matching the uniform lane → to_ue_cm's reflection is correct.
+            // Flip martini's (a,b,c) to (a,c,b) so every tri is CCW-from-above (+Up), matching uniform.
             self.tris.extend_from_slice(&[ia, ic, ib]);
         }
     }
@@ -366,7 +460,6 @@ mod tests {
             read_f32(&m.vertices, o + 8),
         ]
     }
-    /// Signed area of a triangle in the (East, North) plane; > 0 ⇒ CCW-from-above.
     fn signed_area_en(m: &TerrainMesh, t: usize) -> f32 {
         let a = vpos(m, m.indices[t * 3]);
         let b = vpos(m, m.indices[t * 3 + 1]);
@@ -374,14 +467,13 @@ mod tests {
         0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]))
     }
     fn peak_tile(size: u32) -> SemanticTile {
-        // A localized central bump so flat regions can merge under TIN.
         let n = size as usize;
         let c = (n as f32 - 1.0) * 0.5;
         let heights: Vec<f32> = (0..n * n)
             .map(|k| {
                 let (i, j) = ((k % n) as f32, (k / n) as f32);
                 let d = ((i - c).powi(2) + (j - c).powi(2)).sqrt();
-                (20.0 - d).max(0.0) // a cone peak in the middle
+                (20.0 - d).max(0.0)
             })
             .collect();
         SemanticTile::new(TileId::new(0, 0, 0), size, 0.0, 0.0, (size as f64 - 1.0) * 4.0, heights).unwrap()
@@ -433,11 +525,15 @@ mod tests {
         let t = peak_tile(9);
         assert_eq!(triangulate_enu(&t), triangulate_enu(&t));
         assert_eq!(triangulate_tin(&t, 0.5), triangulate_tin(&t, 0.5));
+        assert_eq!(
+            triangulate(&t, MeshingMode::Tin { max_error_m: 0.5 }, 2.0),
+            triangulate(&t, MeshingMode::Tin { max_error_m: 0.5 }, 2.0)
+        );
     }
 
     #[test]
     fn tin_flat_field_collapses_to_two_triangles() {
-        let n = 9u32; // 2^3 + 1
+        let n = 9u32;
         let t = SemanticTile::new(TileId::new(0, 0, 0), n, 0.0, 0.0, 32.0, vec![7.0; (n * n) as usize]).unwrap();
         let m = triangulate_tin(&t, 0.1).expect("pow2 grid");
         assert_eq!(m.vertex_count(), 4, "flat tile → 4 corner verts");
@@ -446,19 +542,13 @@ mod tests {
 
     #[test]
     fn tin_error_threshold_is_monotone_and_below_uniform() {
-        let t = peak_tile(33); // 2^5 + 1
+        let t = peak_tile(33);
         let uniform = triangulate_enu(&t).vertex_count();
         let coarse = triangulate_tin(&t, 4.0).unwrap().vertex_count();
         let fine = triangulate_tin(&t, 0.25).unwrap().vertex_count();
         assert!(coarse <= fine, "higher error ⇒ fewer/equal verts ({coarse} <= {fine})");
-        assert!(
-            fine <= uniform,
-            "TIN never exceeds the uniform vertex count ({fine} <= {uniform})"
-        );
-        assert!(
-            coarse < uniform,
-            "a coarse TIN actually saves verts ({coarse} < {uniform})"
-        );
+        assert!(fine <= uniform, "TIN never exceeds uniform ({fine} <= {uniform})");
+        assert!(coarse < uniform, "a coarse TIN saves verts ({coarse} < {uniform})");
     }
 
     #[test]
@@ -474,10 +564,65 @@ mod tests {
 
     #[test]
     fn tin_falls_back_for_non_power_of_two_grid() {
-        // grid_n = 4 → tile_size 3 (not 2^k): triangulate_tin returns None; the dispatcher uses uniform.
         let t = peak_tile(4);
         assert!(triangulate_tin(&t, 0.5).is_none());
-        let m = triangulate(&t, MeshingMode::Tin { max_error_m: 0.5 });
+        let m = triangulate(&t, MeshingMode::Tin { max_error_m: 0.5 }, 0.0);
         assert_eq!(m.vertex_count(), 16, "fell back to the uniform 4x4 mesh");
+    }
+
+    #[test]
+    fn skirt_adds_walls_below_surface() {
+        let t = peak_tile(5);
+        let plain = triangulate(&t, MeshingMode::Uniform, 0.0);
+        let skirted = triangulate(&t, MeshingMode::Uniform, 3.0);
+        // 5x5 perimeter = 16 vertices → 16 skirt twins, 16 skirt quads (32 tris).
+        assert_eq!(skirted.vertex_count(), plain.vertex_count() + 16);
+        assert_eq!(skirted.indices.len(), plain.indices.len() + 16 * 6);
+        // Skirt twins sit `depth` below the perimeter tops.
+        let zof = |m: &TerrainMesh, vi: usize| read_f32(&m.vertices, vi * VERTEX_STRIDE + 8);
+        let orig = plain.vertex_count();
+        let min_top = (0..orig).map(|v| zof(&skirted, v)).fold(f32::MAX, f32::min);
+        let min_skirt = (orig..skirted.vertex_count())
+            .map(|v| zof(&skirted, v))
+            .fold(f32::MAX, f32::min);
+        assert!(min_skirt <= min_top - 3.0 + 1e-3, "skirt dropped by depth");
+    }
+
+    #[test]
+    fn skirt_triangle_normals_point_outward() {
+        // Flat tile → vertical skirt walls; every skirt face must point away from the tile centre.
+        let n = 5u32;
+        let t = SemanticTile::new(TileId::new(0, 0, 0), n, 0.0, 0.0, 40.0, vec![10.0; (n * n) as usize]).unwrap();
+        let m = triangulate(&t, MeshingMode::Uniform, 2.0);
+        let orig = (n * n) as usize;
+        let center = [20.0f32, 20.0f32]; // origin 0, size 40 → centre (20, 20)
+        let mut checked = 0;
+        for tri in 0..m.indices.len() / 3 {
+            let (i0, i1, i2) = (
+                m.indices[tri * 3] as usize,
+                m.indices[tri * 3 + 1] as usize,
+                m.indices[tri * 3 + 2] as usize,
+            );
+            if i0 < orig && i1 < orig && i2 < orig {
+                continue; // a surface triangle
+            }
+            let a = vpos(&m, m.indices[tri * 3]);
+            let b = vpos(&m, m.indices[tri * 3 + 1]);
+            let c = vpos(&m, m.indices[tri * 3 + 2]);
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let nrm = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            let horiz = (nrm[0] * nrm[0] + nrm[1] * nrm[1]).sqrt();
+            assert!(horiz > nrm[2].abs(), "skirt normal mostly horizontal (tri {tri})");
+            let cx = (a[0] + b[0] + c[0]) / 3.0 - center[0];
+            let cy = (a[1] + b[1] + c[1]) / 3.0 - center[1];
+            assert!(nrm[0] * cx + nrm[1] * cy > 0.0, "skirt tri {tri} must face outward");
+            checked += 1;
+        }
+        assert!(checked >= 32, "expected 16 skirt quads = 32 tris, checked {checked}");
     }
 }
