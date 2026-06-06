@@ -37,6 +37,9 @@ bool LogiResolveStreamView(UWorld* World, FLogiStreamView& Out)
 	{
 		FRotator Rot;
 		PC->GetPlayerViewPoint(Out.Loc, Rot);
+		const FQuat Q = Rot.Quaternion();
+		Out.Dir = Q.GetForwardVector(); // camera forward + up (unit) → globe fetch priority + view frustum
+		Out.Up = Q.GetUpVector();
 		if (UGameViewportClient* VPC = World->GetGameViewport())
 		{
 			FVector2D Sz;
@@ -50,6 +53,11 @@ bool LogiResolveStreamView(UWorld* World, FLogiStreamView& Out)
 	if (GCurrentLevelEditingViewportClient != nullptr)
 	{
 		Out.Loc = GCurrentLevelEditingViewportClient->GetViewLocation();
+		{
+			const FQuat Q = GCurrentLevelEditingViewportClient->GetViewRotation().Quaternion();
+			Out.Dir = Q.GetForwardVector(); // camera forward + up → fetch priority + view frustum
+			Out.Up = Q.GetUpVector();
+		}
 		if (FViewport* VP = GCurrentLevelEditingViewportClient->Viewport)
 		{
 			const FIntPoint Sz = VP->GetSizeXY();

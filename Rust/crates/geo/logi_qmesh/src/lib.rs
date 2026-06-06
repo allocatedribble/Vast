@@ -50,7 +50,10 @@ pub fn oct_decode(x: u8, y: u8) -> DVec3 {
         nx = (1.0 - ny.abs()) * sign_not_zero(old_nx);
         ny = (1.0 - old_nx.abs()) * sign_not_zero(ny);
     }
-    DVec3::new(nx, ny, nz).normalize()
+    // try_normalize (not normalize): a degenerate zero vector → +Z instead of a NaN normal. The fold
+    // above makes a true zero unreachable for valid u8 inputs, but this hardens against any future
+    // snorm-range change silently feeding NaN into ECEF lighting.
+    DVec3::new(nx, ny, nz).try_normalize().unwrap_or(DVec3::Z)
 }
 
 #[inline]
@@ -311,10 +314,14 @@ fn read_extensions(r: &mut Reader) -> Result<Extensions, QmError> {
         match id {
             1 => ext.oct_normals = Some(payload),
             2 => {
-                ext.water_mask = Some(match payload.first() {
-                    Some(&b) if len == 1 => WaterMask::Uniform(b),
-                    _ => WaterMask::Grid(payload),
-                });
+                // Spec: a uniform water mask is exactly 1 byte; a non-uniform mask is exactly
+                // 256*256 = 65536 bytes. Any other length is malformed — leave the mask absent rather than
+                // emit a wrongly-sized `Grid` a consumer would misindex (land rendered as water, or panic).
+                ext.water_mask = match len {
+                    1 => payload.first().copied().map(WaterMask::Uniform),
+                    65_536 => Some(WaterMask::Grid(payload)),
+                    _ => None,
+                };
             }
             4 => {
                 // payload = u32 jsonLength + json[jsonLength]; extensionLength == 4 + jsonLength. Read the

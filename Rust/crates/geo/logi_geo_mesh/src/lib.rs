@@ -50,6 +50,12 @@ pub fn ue_cm_to_enu(p: [f64; 3]) -> DVec3 {
 /// diagonal formula. The caller is responsible for guarding a degenerate (empty / non-finite) box.
 #[inline]
 pub fn aabb_to_sphere(mn: [f32; 3], mx: [f32; 3]) -> ([f32; 3], f32) {
+    // Caller contract (see doc): the box must be non-empty and finite. Make a violation loud in dev — an
+    // inverted/empty box (e.g. an unfilled `+INF..-INF` accumulator) yields a NaN/∞ radius otherwise.
+    debug_assert!(
+        mx[0] >= mn[0] && mx[1] >= mn[1] && mx[2] >= mn[2],
+        "aabb_to_sphere: inverted/empty box (mn={mn:?}, mx={mx:?})"
+    );
     let center = [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, (mn[2] + mx[2]) * 0.5];
     let radius = 0.5 * ((mx[0] - mn[0]).powi(2) + (mx[1] - mn[1]).powi(2) + (mx[2] - mn[2]).powi(2)).sqrt();
     (center, radius)

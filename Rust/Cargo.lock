@@ -928,6 +928,8 @@ dependencies = [
 name = "logi_3dtiles_scene"
 version = "0.1.0"
 dependencies = [
+ "bevy_ecs",
+ "bevy_tasks",
  "bytemuck",
  "glam",
  "logi_3dtiles_io",

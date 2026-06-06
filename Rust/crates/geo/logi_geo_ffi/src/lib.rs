@@ -17,4 +17,8 @@ pub mod ffi_baked;
 /// ABI version of the C boundary. The C++ bridge must verify `logi_geo_abi_version()` matches before any other call.
 /// v2 = the `LogiTerrainWorld` runtime model (was v1 `logi_kernel_*`).
 /// v3 = glam-typed boundary: f32 local render data (Vec3/Mat4 ↔ Unreal FVector/FMatrix), f64 origin only.
-pub const LOGI_ABI_VERSION: u32 = 3;
+/// v4 = `logi_globe_world_set_view`/`_step` carry the camera **forward** direction (3 f64) for the
+///      view-direction fetch priority (plan §9.2 step 7).
+/// v5 = globe `set_view` takes a `LogiGlobeView` struct (camera basis + aspect) for the view frustum
+///      (frustum-aware streaming LOD, §9.2); the deprecated `logi_globe_world_step` shim is removed.
+pub const LOGI_ABI_VERSION: u32 = 5;

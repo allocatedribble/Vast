@@ -13,6 +13,51 @@ fragments are shells: they mirror Rust-owned state and capture player intent, an
 Unreal calls Rust across a narrow C ABI; **Rust never calls Unreal; no Unreal types cross the boundary.**
 See [`AGENTS.md`](AGENTS.md) § 1 and [ADR-0005](Docs/Architecture/ADR-0005-Bevy-ECS-Authority.md).
 
+## Bring full effort and invention
+
+Two dispositions are out of bounds on this project: **laziness** and **timidity** — see
+[`AGENTS.md`](AGENTS.md) § 1D for the law. In practice:
+
+- **Don't be lazy — finish the whole job.** Solve the actual problem, not its nearest symptom: fix the
+  cause, then sweep for its siblings; handle the edge cases and error paths, not just the happy path. Read
+  the code that proves a claim before you make it, and verify a task (build / run / test) before calling it
+  done. If answering honestly needs ten files or a throwaway experiment, do that.
+- **Be creative — experiment in the name of progress.** This is a frontier build; propose the bold
+  approach, prototype rival designs, and let measurement decide. Spikes are cheap and welcome — keep them
+  isolated, benchmark against the budgets, then land the winner at production grade or delete it.
+- **Ambition respects the law, it doesn't dodge it.** Creativity is a better solution *inside* the
+  constraints (§1 architecture, the §1A craft bar, YAGNI) — or a proposed **ADR** when the constraint
+  itself is what's blocking progress, never an exception smuggled into a commit. When bold and simple
+  disagree, the tie-breaker is the North Star: pick what still works — and still ships — at a million agents.
+
+## Reduce the order, then the instruction count
+
+Efficiency is a design criterion here, not an afterthought — see [`AGENTS.md`](AGENTS.md) § 1E.
+
+- **Know the big-O of every loop and call you write** (time *and* space) and the `n` it runs over. At a
+  million agents and a streamed planet, `O(n²)` over the agent set does not ship — reach for the hash set,
+  the spatial index, the sort-then-sweep, the precomputed lookup, and pick the data structure that makes
+  the hot operation `O(1)` / `O(log n)`. This is correctness at scale, not premature optimization.
+- **On profiled hot paths, minimize both the count and the cost of instructions.** Real latency is
+  `instructions × cycles + stalls`, and at scale the stalls (cache misses, branch mispredicts) dominate —
+  so hoist invariants out of loops, lay data out contiguously for the cache, keep inner loops
+  branch-predictable and allocation-free, and avoid div / sqrt / alloc / virtual dispatch there. Let the
+  compiler vectorize (iterator chains over manual indexing) and *verify the win* on the flamegraph or in
+  the asm — never assume.
+- **Picture serial code as lanes of traffic — less traffic flows faster.** Each chain of *dependent*
+  lines (each waiting on the one before) is one lane and its operations are cars; latency is when the
+  last car on the longest lane — the *critical path* — clears. So take work off the road entirely (the
+  cheapest car is the one you never drive — §1A / YAGNI), shorten the critical path (fewer dependent
+  steps), then widen to more lanes by breaking false dependencies — across systems (the parallel
+  executor; never serialize for "simplicity") and within a core (a superscalar issues independent
+  instructions side by side, SIMD several per lane). The caveat the profiler enforces: it's traffic *per
+  lane*, not raw line count, that sets latency — two independent accumulators can *add* instructions yet
+  finish sooner than one jammed chain.
+- **Right time for each.** Get the *order* right everywhere (cheap, universal); spend *instruction-level*
+  effort only where the profiler points (§1B — measure first). On cold paths, readability wins. The best
+  solution is the lowest-order one, with the fewest and cheapest instructions, that a teammate can still
+  read.
+
 ## Architecture decision records (read before designing)
 
 - [ADR-0005 — Bevy ECS Authority](Docs/Architecture/ADR-0005-Bevy-ECS-Authority.md) — **the current law.**
@@ -36,6 +81,11 @@ See [`AGENTS.md`](AGENTS.md) § 1 and [ADR-0005](Docs/Architecture/ADR-0005-Bevy
   param-procedural buildings) over the ADR-0009 path. ML stays offline; the runtime stays lean; render data
   is non-authoritative (promote to coarse for gameplay, ADR-0007). Subsumes the reserved ADR-0010 (foliage).
   Plan in [Docs/Plans/Hero-Location-Semantic-Enrichment.md](Docs/Plans/Hero-Location-Semantic-Enrichment.md).
+- [ADR-0012 — Poll-Based FFI / Decoupled Sim Thread](Docs/Architecture/ADR-0012-Poll-Based-FFI-Decoupled-Sim-Thread.md) —
+  **amends ADR-0005's owner-thread.** The FFI `step` becomes a `poll`: the gameplay sim and the Geo stream
+  loop advance on **Rust-owned threads**, and Unreal (on its game thread) only pushes view/input and pulls
+  the latest retained snapshot. Geo runs fully async (ADR-0007); gameplay stays fixed-step deterministic.
+  Plan in [Docs/Plans/Async-Sim-Decoupling-and-Geo-Performance.md](Docs/Plans/Async-Sim-Decoupling-and-Geo-Performance.md).
 - [ADR-0001 — Mass-First Unreal](Docs/Architecture/ADR-0001-Mass-First-Unreal.md) — **superseded in part**
   by ADR-0005. Its Determinism section and the "Unreal is a shell" principle still hold.
 - [ADR-0002 — Rust Terrain Kernel](Docs/Architecture/ADR-0002-Rust-Terrain-Kernel.md) — terrain truth in

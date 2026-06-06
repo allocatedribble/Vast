@@ -61,7 +61,10 @@ def bake(cfg: BakeConfig, out_dir: Path) -> dict[str, Any]:
     if cfg.generator == "terrarium":
         from .acquire import TerrariumDem
 
-        dtm = TerrariumDem(cfg.lat_deg, cfg.lon_deg, cfg.radius_m, cfg.zoom, undulation_m)
+        # Cache downloaded source tiles next to the stores (shared across re-bakes; offline reproducibility,
+        # plan §3.A). Not part of BakeConfig — it never changes the output, only avoids re-downloading.
+        cache_dir = out_dir.parent / "_cache" / "terrarium"
+        dtm = TerrariumDem(cfg.lat_deg, cfg.lon_deg, cfg.radius_m, cfg.zoom, undulation_m, cache_dir)
     elif cfg.generator == "dem":
         from .acquire import GeoTiffDem
 

@@ -1,6 +1,6 @@
 # Plugins/McpAutomationBridge
 
-Editor-only Unreal Engine 5.0-5.8 Preview plugin. Version source is `McpAutomationBridge.uplugin` (`VersionName` currently `0.1.4`). It provides the WebSocket automation bridge used by the TypeScript server and an optional native MCP HTTP/SSE endpoint.
+Editor-only Unreal Engine 5.0-5.8 Preview plugin. Version source is `McpAutomationBridge.uplugin` (`VersionName` currently `0.5.30`). It provides the WebSocket automation bridge used by the TypeScript server and an optional native MCP HTTP/SSE endpoint.
 
 ## STRUCTURE
 ```

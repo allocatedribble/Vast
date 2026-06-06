@@ -29,6 +29,7 @@
 #include "McpAutomationBridgeHelpers.h"
 #include "McpAutomationBridgeGlobals.h"
 #include "McpHandlerUtils.h"
+#include "ProfilingDebugging/TraceAuxiliary.h"
 
 // -----------------------------------------------------------------------------
 // Engine Includes
@@ -94,6 +95,40 @@ bool UMcpAutomationBridgeSubsystem::HandleInsightsAction(
                     TEXT("INVALID_CHANNELS"));
                 return true;
             }
+        }
+
+        bool bTraceAlreadyActive = false;
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3)
+        bTraceAlreadyActive = FTraceAuxiliary::IsConnected();
+#endif
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5)
+        const FTraceAuxiliary::ETraceSystemStatus TraceStatus = FTraceAuxiliary::GetTraceSystemStatus();
+        bTraceAlreadyActive = bTraceAlreadyActive ||
+            TraceStatus == FTraceAuxiliary::ETraceSystemStatus::TracingToServer ||
+            TraceStatus == FTraceAuxiliary::ETraceSystemStatus::TracingToFile;
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7)
+        bTraceAlreadyActive = bTraceAlreadyActive ||
+            TraceStatus == FTraceAuxiliary::ETraceSystemStatus::TracingToCustomRelay;
+#endif
+#endif
+        if (bTraceAlreadyActive)
+        {
+            TSharedPtr<FJsonObject> Result = McpHandlerUtils::CreateResultObject();
+            Result->SetStringField(TEXT("action"), TEXT("manage_insights"));
+            Result->SetStringField(TEXT("subAction"), TEXT("start_session"));
+            Result->SetStringField(TEXT("traceAction"), TEXT("start_trace"));
+            Result->SetStringField(TEXT("status"), TEXT("already_started"));
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3)
+            Result->SetStringField(TEXT("destination"), FTraceAuxiliary::GetTraceDestinationString());
+#endif
+            if (bHasChannels)
+            {
+                Result->SetStringField(TEXT("channels"), Channels);
+            }
+
+            SendAutomationResponse(RequestingSocket, RequestId, true,
+                TEXT("Trace session already active."), Result);
+            return true;
         }
 
         // Guard GEngine before Exec call

@@ -29,6 +29,8 @@ public:
 				TEXT("resume"),
 				TEXT("eject"),
 				TEXT("possess"),
+				TEXT("set_view_target"),
+				TEXT("set_game_view_target"),
 				TEXT("set_game_speed"),
 				TEXT("set_fixed_delta_time"),
 				TEXT("set_camera"),
@@ -88,7 +90,9 @@ public:
 			.String(TEXT("levelPath"), TEXT("Level asset path."))
 			.String(TEXT("path"), TEXT("Path to a directory."))
 			.String(TEXT("actorName"), TEXT("Name of the actor."))
+			.String(TEXT("objectPath"), TEXT("Object path alias for actorName."))
 			.String(TEXT("name"), TEXT("Name identifier."))
+			.Number(TEXT("blendTime"), TEXT("Blend time in seconds for set_view_target."))
 			.String(TEXT("mode"), TEXT("Editor mode for set_editor_mode, or screenshot source: editor_viewport, game_viewport, full_editor_window."))
 			.Bool(TEXT("returnBase64"), TEXT("Return PNG image data as base64 when supported. Defaults to true for full_editor_window and game_viewport modes."))
 			.Bool(TEXT("includeMetadata"), TEXT("Attach caller-provided metadata to the response."))

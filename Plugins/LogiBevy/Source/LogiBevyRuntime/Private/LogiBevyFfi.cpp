@@ -74,7 +74,7 @@ public:
 
 #if PLATFORM_WINDOWS && LOGI_BEVY_HAVE_GEO
 		// Sibling of the logi_ffi load (not nested under HAVE_RUST) so the terrain feature
-		// keys on LOGI_BEVY_HAVE_GEO alone — matching ULogiBakedGeoSubsystem's gating.
+		// keys on LOGI_BEVY_HAVE_GEO alone — matching the Geo terrain/globe/building gating.
 		{
 			// Terrain kernel DLL (ADR-0007), loaded the same way as logi_ffi.dll.
 			FString TerrainPath = TEXT("logi_geo.dll");

@@ -345,9 +345,20 @@ pub fn extract_render_snapshot(
     // Deterministic order: sort by id. The committed set advances only on publish
     // (see `RenderSnapshotResource::commit`), so this is recomputed on a dropped
     // frame and the same retirements are retried next publish.
-    let mut despawns: Vec<LogiEntityId> = snap.rendered.difference(&snap.pending_rendered).copied().collect();
-    despawns.sort_unstable_by_key(|id| (id.index, id.generation, id.shard, id.kind));
-    snap.despawns = despawns;
+    // Extend the already-cleared `despawns` buffer in place rather than `.collect()`-ing a fresh Vec and
+    // reassigning — the reassign drops the retained capacity and reallocates every extract, the one
+    // per-frame heap allocation on this otherwise allocation-free path (§9). Destructure to borrow the
+    // three sets as disjoint fields.
+    {
+        let RenderSnapshotResource {
+            rendered,
+            pending_rendered,
+            despawns,
+            ..
+        } = &mut *snap;
+        despawns.extend(rendered.difference(&*pending_rendered).copied());
+        despawns.sort_unstable_by_key(|id| (id.index, id.generation, id.shard, id.kind));
+    }
 
     // Flatten the grouped instances into the contiguous instance buffer + pointer-free batch metadata.
     // Sort by batch key (then entity id) for a deterministic, replay-stable order, then emit one BatchMeta

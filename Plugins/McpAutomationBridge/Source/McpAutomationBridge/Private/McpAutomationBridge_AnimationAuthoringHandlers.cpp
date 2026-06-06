@@ -2094,12 +2094,20 @@ if (SubAction == TEXT("add_montage_notify"))
                 AR.GetAssetsByPackageName(RefPkg, Assets);
                 for (const FAssetData& Data : Assets)
                 {
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1)
                     if (Data.AssetClassPath == UAnimBlueprint::StaticClass()->GetClassPathName())
+#else
+                    if (Data.AssetClass == UAnimBlueprint::StaticClass()->GetFName())
+#endif
                     {
                         // Capture the soft path up front so a null GetAsset()
                         // still gets reported as a load failure rather than
                         // silently skipped.
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1)
                         const FString RefPath = Data.GetObjectPathString();
+#else
+                        const FString RefPath = Data.ToSoftObjectPath().ToString();
+#endif
                         if (UAnimBlueprint* ABP = Cast<UAnimBlueprint>(Data.GetAsset()))
                         {
                             if (McpSafeCompileBlueprint(ABP))

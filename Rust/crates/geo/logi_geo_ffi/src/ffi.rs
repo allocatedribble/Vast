@@ -262,12 +262,18 @@ pub unsafe extern "C" fn logi_building_destroy(building: *mut LogiBuilding) {
 // buffers are **zero-copy views into Rust-owned memory, valid until the next `step`** (the terrain-lane
 // contract). The C++ side caches one proc-mesh section per `tile_key` and rebuilds only new keys.
 
-use logi_3dtiles_scene::TilesetWorld;
+use logi_3dtiles_scene::{GeoRenderFrame, GeoWorld, GlobeStreamer, StreamPoll, ViewParams};
+use std::time::Duration;
 
-/// Opaque handle to a streaming globe world (boxed). Null is invalid. Holds the world + a scratch frame
-/// list whose buffer the returned [`LogiGlobeFrame::tiles`] points into.
+/// Opaque handle to a streaming globe world (boxed). Null is invalid. Owns the decoupled stream thread
+/// (ADR-0012): the `bevy_ecs` `GeoWorld` advances on its own Rust thread; the game thread only pushes views
+/// ([`logi_globe_world_set_view`]) and polls the latest frame ([`logi_globe_world_poll`]).
 pub struct LogiGlobeWorld {
-    world: TilesetWorld,
+    streamer: GlobeStreamer,
+    /// The latest frame polled from the stream thread — retained so its `Arc` geometry keeps backing the
+    /// pointers in `frame_tiles` until the next New poll replaces it (valid-until-next-poll).
+    current_frame: Option<GeoRenderFrame>,
+    /// Scratch C descriptor array the returned [`LogiGlobeFrame::tiles`] points into (rebuilt each New poll).
     frame_tiles: Vec<LogiGlobeTile>,
 }
 
@@ -331,18 +337,6 @@ const _: () = {
     assert!(std::mem::size_of::<LogiGlobeFrame>() == 48);
 };
 
-/// FNV-1a over the tile path's little-endian bytes — a stable per-tile key for C++ caching.
-fn hash_path(path: &[u32]) -> u64 {
-    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
-    for &seg in path {
-        for b in seg.to_le_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01B3);
-        }
-    }
-    h
-}
-
 fn globe_create_impl(
     info: *const LogiGlobeCreateInfo,
     ion_token: *const c_char,
@@ -362,7 +356,10 @@ fn globe_create_impl(
     };
     // Optional persistent disk cache; a cache-open failure degrades to no-cache (the globe still streams).
     let cache = build_globe_cache(info.cache_budget_bytes, cache_dir);
-    match TilesetWorld::from_ion(
+    // The Geo World pre-spawns a fixed tile-entity pool; size it above the resident cap + in-flight slack so
+    // it never exhausts in steady state. (Decode-failed tiles linger in the pool until a cleanup pass —
+    // TODO; the headroom covers it for now.)
+    match GeoWorld::from_ion(
         info.ion_asset_id,
         token,
         info.origin_longitude_deg,
@@ -371,9 +368,15 @@ fn globe_create_impl(
         info.workers.clamp(1, 64) as usize, // clamp: a garbage count must not spawn unbounded threads
         info.max_tile_distance_m,
         cache,
+        5120, // pre-spawned tile-entity pool
+        4096, // resident-tile cap (mirrors the old TilesetWorld max_decoded)
     ) {
         Ok(world) => Some(LogiGlobeWorld {
-            world,
+            // Hand the world to its own stream thread (ADR-0012): it advances continuously OFF the game
+            // thread; the game thread only pushes views + polls. 8 ms idle park (~125 Hz when idle; a
+            // `set_view` unparks it so it advances promptly on camera motion).
+            streamer: GlobeStreamer::spawn(world, Duration::from_millis(8)),
+            current_frame: None,
             frame_tiles: Vec::new(),
         }),
         Err(e) => {
@@ -431,24 +434,111 @@ pub unsafe extern "C" fn logi_globe_world_create(
     }
 }
 
-/// Advances the globe world one step using an **Unreal-space** camera position (cm; ENU origin at Unreal
-/// `(0,0,0)`) and writes the frame to `out_frame`. The frame's tile buffers are zero-copy views valid
-/// until the next `step` on this world.
+/// Rebuild the C descriptor array (`frame_tiles`) from the retained `current_frame`. The emitted pointers
+/// index that frame's `Arc` geometry, which stays alive (valid for the renderer) until the next New poll
+/// replaces `current_frame`.
+fn build_globe_frame(gw: &mut LogiGlobeWorld) {
+    let LogiGlobeWorld {
+        current_frame,
+        frame_tiles,
+        ..
+    } = gw;
+    frame_tiles.clear();
+    let Some(frame) = current_frame.as_ref() else {
+        return;
+    };
+    frame_tiles.reserve(frame.tiles.len());
+    for t in &frame.tiles {
+        let g = &t.geom;
+        // H5: count + stride come from the SAME buffers we emit pointers into → no OOB GPU upload.
+        debug_assert!(
+            g.vertices.len() % VERTEX_STRIDE == 0,
+            "tile vertex buffer not a VERTEX_STRIDE multiple"
+        );
+        frame_tiles.push(LogiGlobeTile {
+            tile_key: t.tile_key,
+            vertices: g.vertices.as_ptr(),
+            vertices_len: g.vertices.len() as u64,
+            vertex_count: (g.vertices.len() / VERTEX_STRIDE) as u32,
+            vertex_stride: VERTEX_STRIDE as u32,
+            indices: g.indices.as_ptr() as *const u8,
+            index_count: g.indices.len() as u32,
+            _pad: 0,
+            texture_jpeg: g.texture.as_ptr(),
+            texture_jpeg_len: g.texture.len() as u64,
+            bounds_center: g.bounds_center,
+            bounds_radius: g.bounds_radius,
+        });
+    }
+}
+
+/// The camera view pushed to the stream thread (UE space). The forward + up + aspect + FOV build the view
+/// frustum (frustum-aware streaming LOD); `dir`/`up` `[0,0,0]` ⇒ unknown (accept-all frustum, no view-priority
+/// weighting). All `f64`; `#[repr(C)]`, 13 fields = 104 bytes — mirrors `LogiGlobeView` in the header.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LogiGlobeView {
+    pub camera_x_cm: f64,
+    pub camera_y_cm: f64,
+    pub camera_z_cm: f64,
+    pub dir_x: f64,
+    pub dir_y: f64,
+    pub dir_z: f64,
+    pub up_x: f64,
+    pub up_y: f64,
+    pub up_z: f64,
+    pub aspect: f64,
+    pub fov_y_radians: f64,
+    pub viewport_height: f64,
+    pub max_sse_pixels: f64,
+}
+
+/// Push the newest desired camera/view to the stream thread (newest-wins; cheap, non-blocking). The thread
+/// advances against it asynchronously OFF the game thread; the renderer reads results via
+/// [`logi_globe_world_poll`]. This is the producer half of the poll-based FFI (ADR-0012).
 ///
 /// # Safety
-/// `world` must be a valid handle from [`logi_globe_world_create`] (or null → `InvalidHandle`). `out_frame`
-/// must be null or point to writable `LogiGlobeFrame` storage (written unaligned); the frame's tile buffers
-/// borrow Rust-owned memory valid only until the next `step` on this world.
+/// `world` must be a valid handle from [`logi_globe_world_create`] (or null → `InvalidHandle`); `view` must
+/// be null (→ `NullArg`) or point to a readable [`LogiGlobeView`].
 #[no_mangle]
-#[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn logi_globe_world_step(
+pub unsafe extern "C" fn logi_globe_world_set_view(
     world: *mut LogiGlobeWorld,
-    camera_x_cm: f64,
-    camera_y_cm: f64,
-    camera_z_cm: f64,
-    fov_y_radians: f64,
-    viewport_height: f64,
-    max_sse_pixels: f64,
+    view: *const LogiGlobeView,
+) -> LogiStatus {
+    guard(|| {
+        let gw = match unsafe { world.as_mut() } {
+            Some(w) => w,
+            None => return LogiStatus::InvalidHandle,
+        };
+        let v = match unsafe { view.as_ref() } {
+            Some(v) => v,
+            None => return LogiStatus::NullArg,
+        };
+        gw.streamer.set_view(ViewParams {
+            camera_ue_cm: [v.camera_x_cm, v.camera_y_cm, v.camera_z_cm],
+            camera_dir_ue: [v.dir_x, v.dir_y, v.dir_z],
+            camera_up_ue: [v.up_x, v.up_y, v.up_z],
+            aspect: v.aspect,
+            fov_y_radians: v.fov_y_radians,
+            viewport_height: v.viewport_height,
+            max_sse: v.max_sse_pixels,
+        });
+        LogiStatus::Ok
+    })
+}
+
+/// Poll the latest render frame the stream thread has published and write it to `out_frame`. **Non-blocking:**
+/// it returns the most recent complete frame immediately (or an empty frame before the first one) — it never
+/// drives the streaming work, which runs on the stream thread. The frame's tile buffers are zero-copy views
+/// into Rust-owned `Arc` geometry, **valid until the next `logi_globe_world_poll` on this world**. This is
+/// the consumer half of the poll-based FFI (ADR-0012) — the replacement for the synchronous `step`.
+///
+/// # Safety
+/// `world` must be a valid handle from [`logi_globe_world_create`] (or null → `InvalidHandle`); `out_frame`
+/// must be null or point to writable `LogiGlobeFrame` storage (written unaligned).
+#[no_mangle]
+pub unsafe extern "C" fn logi_globe_world_poll(
+    world: *mut LogiGlobeWorld,
     out_frame: *mut LogiGlobeFrame,
 ) -> LogiStatus {
     guard(|| {
@@ -459,47 +549,28 @@ pub unsafe extern "C" fn logi_globe_world_step(
         if out_frame.is_null() {
             return LogiStatus::NullArg;
         }
-        let frame = gw.world.step_from_ue_camera(
-            [camera_x_cm, camera_y_cm, camera_z_cm],
-            fov_y_radians,
-            viewport_height,
-            max_sse_pixels,
-        );
-        // Rebuild the scratch tile array; its pointers index the world's decoded buffers (heap-stable
-        // until that tile is re-decoded/evicted on a later step — i.e. valid until the next `step`).
-        let mut tiles = Vec::with_capacity(frame.tiles.len());
-        for rt in &frame.tiles {
-            if let Some(m) = gw.world.tile_mesh(&rt.path) {
-                // H5: count + stride come from the SAME `m` buffers we emit pointers into (not the
-                // separate `RenderTileInfo`, which can disagree after a re-decode) → no OOB GPU upload.
-                debug_assert!(
-                    m.vertices.len() % VERTEX_STRIDE == 0,
-                    "tile vertex buffer not a VERTEX_STRIDE multiple"
-                );
-                tiles.push(LogiGlobeTile {
-                    tile_key: hash_path(&rt.path),
-                    vertices: m.vertices.as_ptr(),
-                    vertices_len: m.vertices.len() as u64,
-                    vertex_count: (m.vertices.len() / VERTEX_STRIDE) as u32,
-                    vertex_stride: VERTEX_STRIDE as u32,
-                    indices: m.indices.as_ptr() as *const u8,
-                    index_count: m.indices.len() as u32,
-                    _pad: 0,
-                    texture_jpeg: m.texture.as_ptr(),
-                    texture_jpeg_len: m.texture.len() as u64,
-                    bounds_center: rt.bounds_center,
-                    bounds_radius: rt.bounds_radius,
-                });
+        match gw.streamer.poll() {
+            // A newer frame: retain it (its `Arc` geometry backs the pointers) and rebuild the descriptors.
+            StreamPoll::New(frame) => {
+                gw.current_frame = Some(frame);
+                build_globe_frame(gw);
+            }
+            // No new frame: the previously built `frame_tiles` + retained geometry still stand (SAME).
+            StreamPoll::Same => {}
+            // Nothing published yet.
+            StreamPoll::Empty => {
+                gw.current_frame = None;
+                gw.frame_tiles.clear();
             }
         }
-        gw.frame_tiles = tiles;
+        let origin_ecef = gw.current_frame.as_ref().map(|f| f.origin_ecef).unwrap_or([0.0; 3]);
         let out = LogiGlobeFrame {
             tiles: gw.frame_tiles.as_ptr(),
             tile_count: gw.frame_tiles.len() as u32,
-            resident_tiles: gw.world.resident_tiles() as u32,
-            in_flight: gw.world.in_flight() as u32,
+            resident_tiles: gw.streamer.resident_tiles() as u32,
+            in_flight: gw.streamer.in_flight() as u32,
             _pad: 0,
-            origin_ecef: frame.origin_ecef,
+            origin_ecef,
         };
         unsafe { out_frame.write_unaligned(out) };
         LogiStatus::Ok
@@ -513,7 +584,7 @@ pub unsafe extern "C" fn logi_globe_world_step(
 #[no_mangle]
 pub unsafe extern "C" fn logi_globe_world_cached_bytes(world: *const LogiGlobeWorld) -> u64 {
     match unsafe { world.as_ref() } {
-        Some(gw) => gw.world.cached_bytes(),
+        Some(gw) => gw.streamer.cached_bytes(),
         None => 0,
     }
 }

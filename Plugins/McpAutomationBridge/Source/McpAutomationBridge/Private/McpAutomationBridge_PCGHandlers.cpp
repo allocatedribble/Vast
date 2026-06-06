@@ -278,7 +278,11 @@ FString GetNodeTitleString(UPCGNode* Node)
     {
         return Node->NodeTitle.ToString();
     }
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5)
     return Node->GetNodeTitle(EPCGNodeTitleType::ListView).ToString();
+#else
+    return Node->GetNodeTitle().ToString();
+#endif
 }
 
 TSharedPtr<FJsonObject> BuildNodeResult(UPCGGraph* Graph, UPCGNode* Node, const FString& GraphPath)
@@ -344,8 +348,12 @@ UPCGNode* FindPCGNode(UPCGGraph* Graph, const FString& NodeId)
         {
             return Node;
         }
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5)
         if (Node->GetNodeTitle(EPCGNodeTitleType::ListView).ToString().Equals(Needle, ESearchCase::IgnoreCase) ||
             Node->GetNodeTitle(EPCGNodeTitleType::FullTitle).ToString().Equals(Needle, ESearchCase::IgnoreCase))
+#else
+        if (Node->GetNodeTitle().ToString().Equals(Needle, ESearchCase::IgnoreCase))
+#endif
         {
             return Node;
         }
@@ -542,17 +550,18 @@ bool ApplySettingsObject(UPCGSettings* Settings, const TSharedPtr<FJsonObject>& 
 
     for (const auto& Pair : SettingsObject->Values)
     {
-        FProperty* Property = Settings->GetClass()->FindPropertyByName(FName(*Pair.Key));
+        const FString FieldName(Pair.Key.Len(), *Pair.Key);
+        FProperty* Property = Settings->GetClass()->FindPropertyByName(FName(*FieldName));
         if (!Property)
         {
-            OutError = FString::Printf(TEXT("PCG settings property '%s' was not found on '%s'."), *Pair.Key, *Settings->GetClass()->GetName());
+            OutError = FString::Printf(TEXT("PCG settings property '%s' was not found on '%s'."), *FieldName, *Settings->GetClass()->GetName());
             return false;
         }
 
         FString ApplyError;
         if (!ApplyJsonValueToProperty(Settings, Property, Pair.Value, ApplyError))
         {
-            OutError = FString::Printf(TEXT("Failed to apply PCG settings property '%s': %s"), *Pair.Key, *ApplyError);
+            OutError = FString::Printf(TEXT("Failed to apply PCG settings property '%s': %s"), *FieldName, *ApplyError);
             return false;
         }
         ++OutAppliedCount;
@@ -973,8 +982,10 @@ bool SaveGraphIfRequested(UPCGGraph* Graph, bool bSave, bool& bOutSaved, FString
 
     Graph->PostEditChange();
     Graph->MarkPackageDirty();
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5)
     Graph->ForceNotificationForEditor(EPCGChangeType::Structural);
+#elif ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+    Graph->ForceNotificationForEditor();
 #else
     Graph->NotifyGraphChanged(EPCGChangeType::Structural);
 #endif

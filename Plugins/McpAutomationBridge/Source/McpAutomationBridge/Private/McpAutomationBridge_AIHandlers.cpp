@@ -772,11 +772,13 @@ bool UMcpAutomationBridgeSubsystem::HandleManageAIAction(
 #if MCP_AI_HAS_BEHAVIOR_TREE_GRAPH
             if (UBehaviorTreeGraph* BTGraph = Cast<UBehaviorTreeGraph>(BT->BTGraph))
             {
+                UClass* BTRootNodeClass = FindObject<UClass>(nullptr, TEXT("/Script/BehaviorTreeEditor.BehaviorTreeGraphNode_Root"));
                 BTGraph->Modify();
                 for (UEdGraphNode* GraphNode : BTGraph->Nodes)
                 {
-                    if (UBehaviorTreeGraphNode_Root* RootNode = Cast<UBehaviorTreeGraphNode_Root>(GraphNode))
+                    if (BTRootNodeClass && GraphNode && GraphNode->GetClass()->IsChildOf(BTRootNodeClass))
                     {
+                        UBehaviorTreeGraphNode_Root* RootNode = static_cast<UBehaviorTreeGraphNode_Root*>(GraphNode);
                         RootNode->Modify();
                         RootNode->BlackboardAsset = BB;
                         BTGraph->UpdateBlackboardChange();
@@ -3373,10 +3375,12 @@ bool UMcpAutomationBridgeSubsystem::HandleManageAIAction(
 #if MCP_AI_HAS_BEHAVIOR_TREE_GRAPH
                 if (UBehaviorTreeGraph* BTGraph = Cast<UBehaviorTreeGraph>(BT->BTGraph))
                 {
+                    UClass* BTRootNodeClass = FindObject<UClass>(nullptr, TEXT("/Script/BehaviorTreeEditor.BehaviorTreeGraphNode_Root"));
                     for (UEdGraphNode* GraphNode : BTGraph->Nodes)
                     {
-                        if (UBehaviorTreeGraphNode_Root* RootNode = Cast<UBehaviorTreeGraphNode_Root>(GraphNode))
+                        if (BTRootNodeClass && GraphNode && GraphNode->GetClass()->IsChildOf(BTRootNodeClass))
                         {
+                            UBehaviorTreeGraphNode_Root* RootNode = static_cast<UBehaviorTreeGraphNode_Root*>(GraphNode);
                             AIInfo->SetStringField(TEXT("rootGraphBlackboard"), GetNameSafe(RootNode->BlackboardAsset));
                             AIInfo->SetBoolField(TEXT("rootGraphBlackboardMatchesAssigned"), RootNode->BlackboardAsset == BT->BlackboardAsset);
                             break;

@@ -49,7 +49,7 @@ const LOGI_ERROR_MSG_LEN: usize = 256;
 #[repr(C)]
 pub struct LogiError {
     pub code: u32,
-    pub message: [core::ffi::c_char; 256],
+    pub message: [core::ffi::c_char; LOGI_ERROR_MSG_LEN],
 }
 
 /// Creation parameters.

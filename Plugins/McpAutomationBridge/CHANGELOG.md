@@ -4,7 +4,7 @@ All notable changes to the MCP Automation Bridge plugin will be documented in th
 
 ---
 
-## [Unreleased]
+## [0.5.30] - 2026-06-05
 
 ### Security
 - **Capability token enforcement** on native MCP transport — validates `X-MCP-Capability-Token` header when `bRequireCapabilityToken` is enabled (mirrors WebSocket bridge logic)
@@ -31,8 +31,10 @@ All notable changes to the MCP Automation Bridge plugin will be documented in th
 - **`execute_python` action** in `system_control` — execute Python code with stdout/stderr capture, supports inline `code` and `file` path, execution time tracking
 - **Shared `ListenHost` setting** — native MCP respects `AllowNonLoopback` for network access control
 - **Plugin-packaging scripts** for Win/Mac/Linux — build and package the plugin via RunUAT BuildPlugin, with smart arg parsing
+- **Expanded environment systems coverage** — heightmap import/export, landscape layer info/material/splines/LOD/streaming proxies, foliage type configuration/paint/remove flows, sky/volumetric-cloud/weather/wind/time-of-day setup, water bodies, water waves/material/collision, and buoyancy components
 
 ### Changed
+- Plugin descriptor metadata updated to `0.5.30` to match the server/source release version.
 - Tool categories now use four groups: `core`, `world`, `gameplay`, and `utility`. The singleton `authoring` category was removed, and `manage_blueprint` moved into `core`.
 - `manage_blueprint` schema: `location`, `rotation`, `scale` changed from flat number arrays to structured objects with named sub-fields (`x`/`y`/`z` or `pitch`/`yaw`/`roll`) — matches TypeScript schema
 - `system_control` schema: removed `export_asset` action (not in TypeScript schema) and `additionalArgs` parameter (C++-only, never used by TS clients)
@@ -45,6 +47,7 @@ All notable changes to the MCP Automation Bridge plugin will be documented in th
 - `reset` action now restores initial state from `Initialize()` instead of enabling all tools unconditionally
 - UE 5.6 compatibility: `TSharedPtr` for incomplete types, `Headers.Add` instead of `SetHeader`, `TryGetField` return value
 - Package script arg parsing — flags no longer eaten as output directory, extra args correctly forwarded to RunUAT
+- Build-environment action routing and validation now cover the expanded landscape, foliage, sky/weather, water, and buoyancy actions across native and TypeScript surfaces
 
 ### Technical Details
 - Response routing via explicit `ERequestOrigin` enum (`NativeHTTP` vs `WebSocket`) — no more `TargetSocket==nullptr` inference

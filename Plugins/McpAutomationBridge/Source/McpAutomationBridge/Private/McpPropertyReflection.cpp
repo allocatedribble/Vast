@@ -6,12 +6,32 @@
 
 #include "McpPropertyReflection.h"
 #include "McpVersionCompatibility.h"
+#include "Internationalization/Text.h"
 #include "Runtime/Launch/Resources/Version.h"
 #include "UObject/TextProperty.h"
 
 #if WITH_EDITOR
 #include "Editor.h"
 #endif
+
+namespace
+{
+FString ExportTextToJsonString(const FText& TextValue)
+{
+    if (TextValue.IsCultureInvariant() && !TextValue.IsFromStringTable())
+    {
+        return TextValue.ToString();
+    }
+    FString ExportedText;
+    FTextStringHelper::WriteToBuffer(ExportedText, TextValue);
+    return ExportedText;
+}
+
+FText ImportTextFromJsonString(const FString& TextValue)
+{
+    return FTextStringHelper::CreateFromBuffer(*TextValue);
+}
+}
 
 // =============================================================================
 // JSON Value Export Implementation
@@ -37,6 +57,11 @@ TSharedPtr<FJsonValue> ExportPropertyToJsonValue(void* TargetContainer, FPropert
     if (FNameProperty* NP = CastField<FNameProperty>(Property))
     {
         return MakeShared<FJsonValueString>(NP->GetPropertyValue_InContainer(TargetContainer).ToString());
+    }
+
+    if (FTextProperty* TP = CastField<FTextProperty>(Property))
+    {
+        return MakeShared<FJsonValueString>(ExportTextToJsonString(TP->GetPropertyValue_InContainer(TargetContainer)));
     }
 
     // Booleans
@@ -448,6 +473,7 @@ bool IsPropertyTypeSupported(FProperty* Property)
 
     return Property->IsA<FStrProperty>() ||
            Property->IsA<FNameProperty>() ||
+           Property->IsA<FTextProperty>() ||
            Property->IsA<FBoolProperty>() ||
            Property->IsA<FFloatProperty>() ||
            Property->IsA<FDoubleProperty>() ||
@@ -567,6 +593,10 @@ TArray<TSharedPtr<FJsonValue>> ExportArrayToJson(void* Container, FArrayProperty
         else if (FNameProperty* NameInner = CastField<FNameProperty>(Inner))
         {
             Out.Add(MakeShared<FJsonValueString>(reinterpret_cast<FName*>(ElemPtr)->ToString()));
+        }
+        else if (FTextProperty* TextInner = CastField<FTextProperty>(Inner))
+        {
+            Out.Add(MakeShared<FJsonValueString>(ExportTextToJsonString(TextInner->GetPropertyValue(ElemPtr))));
         }
         else if (FBoolProperty* BoolInner = CastField<FBoolProperty>(Inner))
         {
@@ -701,6 +731,17 @@ bool ApplyJsonValueToProperty(void* TargetContainer, FProperty* Property, const 
             return true;
         }
         OutError = TEXT("Expected string for name property");
+        return false;
+    }
+
+    if (FTextProperty* TP = CastField<FTextProperty>(Property))
+    {
+        if (ValueField->Type == EJson::String)
+        {
+            TP->SetPropertyValue_InContainer(TargetContainer, ImportTextFromJsonString(ValueField->AsString()));
+            return true;
+        }
+        OutError = TEXT("Expected string for text property");
         return false;
     }
 

@@ -138,6 +138,12 @@ impl Subtree {
     /// Does a child subtree exist rooted at local `(x, y[, z])` (indexed at the deepest+1 level, i.e. the
     /// subtree-root coordinates — no level offset)?
     pub fn is_child_subtree_available(&self, x: u32, y: u32, z: u32) -> bool {
+        // The octree Morton (`spread3`) packs 21 bits per axis; a coordinate ≥ 2^21 would silently alias
+        // to another subtree's availability bit (the `bit_index` tile path already saturates similarly).
+        // A real tileset nests far shallower; treat an out-of-range coordinate as unavailable.
+        if self.child_count == 8 && (x | y | z) >= (1 << 21) {
+            return false;
+        }
         self.child_subtree_availability.get(self.morton(x, y, z))
     }
 }

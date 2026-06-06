@@ -378,11 +378,13 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
       if (Node->GetName().Equals(Needle, ESearchCase::IgnoreCase)) return Node;
       if (Node->GetPathName().Equals(Needle, ESearchCase::IgnoreCase)) return Node;
       // Recurse into subnodes (decorators/services attached to graph nodes).
+#if MCP_HAS_BEHAVIOR_TREE_GRAPH
       if (UAIGraphNode* AINode = Cast<UAIGraphNode>(Node)) {
         for (UAIGraphNode* SubNode : AINode->SubNodes) {
           if (UEdGraphNode* Found = Match(SubNode)) return Found;
         }
       }
+#endif
       return nullptr;
     };
 
@@ -862,6 +864,26 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
       return true;
     }
 
+    UClass* BTNodeBaseClass = FindObject<UClass>(nullptr, TEXT("/Script/BehaviorTreeEditor.BehaviorTreeGraphNode"));
+    UClass* BTRootNodeClass = FindObject<UClass>(nullptr, TEXT("/Script/BehaviorTreeEditor.BehaviorTreeGraphNode_Root"));
+    UClass* BTDecoratorNodeClass = FindObject<UClass>(nullptr, TEXT("/Script/BehaviorTreeEditor.BehaviorTreeGraphNode_Decorator"));
+    UClass* BTServiceNodeClass = FindObject<UClass>(nullptr, TEXT("/Script/BehaviorTreeEditor.BehaviorTreeGraphNode_Service"));
+    if (!BTNodeBaseClass || !BTRootNodeClass || !BTDecoratorNodeClass || !BTServiceNodeClass) {
+      SendAutomationError(RequestingSocket, RequestId,
+        TEXT("BehaviorTreeEditor graph node classes are not loaded."),
+        TEXT("NOT_SUPPORTED"));
+      return true;
+    }
+
+    auto AsBTGraphNode = [BTNodeBaseClass](UEdGraphNode* GraphNode) -> UBehaviorTreeGraphNode* {
+      return GraphNode && GraphNode->GetClass()->IsChildOf(BTNodeBaseClass)
+        ? static_cast<UBehaviorTreeGraphNode*>(GraphNode)
+        : nullptr;
+    };
+    auto IsGraphNodeOfClass = [](UEdGraphNode* GraphNode, UClass* GraphClass) -> bool {
+      return GraphNode && GraphClass && GraphNode->GetClass()->IsChildOf(GraphClass);
+    };
+
     // Resolve parent node. "root" sentinel is a contract, not workaround.
     // Branch order: literal BEFORE GUID parse — real GUIDs always contain
     // hyphens so the literal cannot collide (per spec R8).
@@ -869,10 +891,10 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
     bool bRootSentinelParent = false;
     if (ParentNodeIdStr.Equals(TEXT("root"), ESearchCase::IgnoreCase)) {
       bRootSentinelParent = true;
-      UBehaviorTreeGraphNode_Root* RootNode = nullptr;
+      UBehaviorTreeGraphNode* RootNode = nullptr;
       for (UEdGraphNode* GraphNode : BTGraph->Nodes) {
-        if (UBehaviorTreeGraphNode_Root* CandidateRoot = Cast<UBehaviorTreeGraphNode_Root>(GraphNode)) {
-          RootNode = CandidateRoot;
+        if (IsGraphNodeOfClass(GraphNode, BTRootNodeClass)) {
+          RootNode = AsBTGraphNode(GraphNode);
           break;
         }
       }
@@ -890,7 +912,7 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
         return true;
       }
       UEdGraphPin* LinkedPin = RootNode->Pins[0]->LinkedTo[0];
-      ParentNode = LinkedPin ? Cast<UBehaviorTreeGraphNode>(LinkedPin->GetOwningNode()) : nullptr;
+      ParentNode = LinkedPin ? AsBTGraphNode(LinkedPin->GetOwningNode()) : nullptr;
       if (!ParentNode) {
         SendAutomationError(RequestingSocket, RequestId,
           TEXT("Root graph node's linked child is not a Behavior Tree graph node"),
@@ -910,15 +932,15 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
       // "not found". This restores symmetry with the other 4 BT SubActions that
       // already walk UAIGraphNode::SubNodes via FindGraphNodeByIdOrName.
       if (UEdGraphNode* Found = FindGraphNodeByIdOrName(ParentNodeIdStr)) {
-        if (Cast<UBehaviorTreeGraphNode_Decorator>(Found) ||
-            Cast<UBehaviorTreeGraphNode_Service>(Found)) {
+        if (IsGraphNodeOfClass(Found, BTDecoratorNodeClass) ||
+            IsGraphNodeOfClass(Found, BTServiceNodeClass)) {
           SendAutomationError(RequestingSocket, RequestId,
             FString::Printf(TEXT("Parent node %s is a Decorator/Service subnode and cannot host other subnodes"),
               *ParentNodeIdStr),
             TEXT("INVALID_PARENT_FOR_SUBNODE"));
           return true;
         }
-        ParentNode = Cast<UBehaviorTreeGraphNode>(Found);
+        ParentNode = AsBTGraphNode(Found);
       }
     }
     if (!ParentNode) {
@@ -951,7 +973,7 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
           TEXT("INVALID_CLASS"));
         return true;
       }
-      SubnodeGraphClass = UBehaviorTreeGraphNode_Decorator::StaticClass();
+      SubnodeGraphClass = BTDecoratorNodeClass;
     } else if (SubnodeType.Equals(TEXT("Service"), ESearchCase::IgnoreCase)) {
       if (!NodeInstanceClass->IsChildOf(UBTService::StaticClass())) {
         SendAutomationError(RequestingSocket, RequestId,
@@ -962,13 +984,13 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
       // Parent acceptance: services cannot attach to BT root graph node
       // (UE editor convention — root only accepts decorators). Fail before
       // constructing rather than producing a graph the editor rejects.
-      if (bRootSentinelParent || Cast<UBehaviorTreeGraphNode_Root>(ParentNode)) {
+      if (bRootSentinelParent || IsGraphNodeOfClass(ParentNode, BTRootNodeClass)) {
         SendAutomationError(RequestingSocket, RequestId,
           TEXT("Service subnode cannot be attached to the root graph node — use Decorator, or attach the Service to a composite/task child."),
           TEXT("INVALID_PARENT_FOR_SUBNODE"));
         return true;
       }
-      SubnodeGraphClass = UBehaviorTreeGraphNode_Service::StaticClass();
+      SubnodeGraphClass = BTServiceNodeClass;
     } else {
       SendAutomationError(RequestingSocket, RequestId,
         FString::Printf(TEXT("subnodeType must be 'Decorator' or 'Service' (got: %s)"), *SubnodeType),
@@ -979,7 +1001,16 @@ bool UMcpAutomationBridgeSubsystem::HandleBehaviorTreeAction(
     // Create graph subnode + UBTNode instance. Mirror add_node init triplet
     // (AddNode + PostPlacedNewNode + AllocateDefaultPins). AllocateDefaultPins
     // is a no-op for subnodes (no pins) but kept for consistency.
-    UBehaviorTreeGraphNode* NewSubnode = NewObject<UBehaviorTreeGraphNode>(BTGraph, SubnodeGraphClass);
+    UObject* NewSubnodeObj = NewObject<UObject>(BTGraph, SubnodeGraphClass, NAME_None, RF_Transactional);
+    UBehaviorTreeGraphNode* NewSubnode = NewSubnodeObj && NewSubnodeObj->GetClass()->IsChildOf(BTNodeBaseClass)
+      ? static_cast<UBehaviorTreeGraphNode*>(NewSubnodeObj)
+      : nullptr;
+    if (!NewSubnode) {
+      SendAutomationError(RequestingSocket, RequestId,
+        TEXT("Failed to create Behavior Tree graph subnode."),
+        TEXT("CREATE_FAILED"));
+      return true;
+    }
     NewSubnode->ClassData = FGraphNodeClassData(NodeInstanceClass, FString());
     // NodeInstance is declared as UObject* on UAIGraphNode (shared with
     // StateTree). For BT subnodes the runtime type is always UBTNode — using

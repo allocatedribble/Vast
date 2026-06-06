@@ -8,12 +8,14 @@
 #include "Dom/JsonObject.h"
 #include "HAL/PlatformTime.h"
 #include "HAL/PlatformFileManager.h"
+#include "Internationalization/Text.h"
 #include "JsonObjectConverter.h"
 #include "Misc/FileHelper.h"
 #include "Misc/OutputDevice.h"
 #include "Misc/Paths.h"
 #include "Misc/PackageName.h"
 #include "Misc/ScopeLock.h"
+#include "UObject/TextProperty.h"
 #include "UObject/UnrealType.h"
 #include <type_traits>
 
@@ -1142,6 +1144,16 @@ ExportPropertyToJsonValue(void *TargetContainer, FProperty *Property) {
         NP->GetPropertyValue_InContainer(TargetContainer).ToString());
   }
 
+  if (FTextProperty *TP = CastField<FTextProperty>(Property)) {
+    const FText TextValue = TP->GetPropertyValue_InContainer(TargetContainer);
+    if (TextValue.IsCultureInvariant() && !TextValue.IsFromStringTable()) {
+      return MakeShared<FJsonValueString>(TextValue.ToString());
+    }
+    FString ExportedText;
+    FTextStringHelper::WriteToBuffer(ExportedText, TextValue);
+    return MakeShared<FJsonValueString>(ExportedText);
+  }
+
   // Booleans
   if (FBoolProperty *BP = CastField<FBoolProperty>(Property)) {
     return MakeShared<FJsonValueBoolean>(
@@ -1273,6 +1285,17 @@ ExportPropertyToJsonValue(void *TargetContainer, FProperty *Property) {
         if (FNameProperty *NameInner = CastField<FNameProperty>(Inner)) {
           const FName &N = *reinterpret_cast<FName *>(ElemPtr);
           Out.Add(MakeShared<FJsonValueString>(N.ToString()));
+          continue;
+        }
+        if (FTextProperty *TextInner = CastField<FTextProperty>(Inner)) {
+          const FText TextValue = TextInner->GetPropertyValue(ElemPtr);
+          if (TextValue.IsCultureInvariant() && !TextValue.IsFromStringTable()) {
+            Out.Add(MakeShared<FJsonValueString>(TextValue.ToString()));
+            continue;
+          }
+          FString ExportedText;
+          FTextStringHelper::WriteToBuffer(ExportedText, TextValue);
+          Out.Add(MakeShared<FJsonValueString>(ExportedText));
           continue;
         }
         if (FBoolProperty *BoolInner = CastField<FBoolProperty>(Inner)) {
@@ -1532,7 +1555,6 @@ ApplyJsonValueToProperty(void *TargetContainer, FProperty *Property,
     return false;
   }
 
-  // String and Name
   if (FStrProperty *SP = CastField<FStrProperty>(Property)) {
     if (ValueField->Type == EJson::String) {
       SP->SetPropertyValue_InContainer(TargetContainer, ValueField->AsString());
@@ -1548,6 +1570,16 @@ ApplyJsonValueToProperty(void *TargetContainer, FProperty *Property,
       return true;
     }
     OutError = TEXT("Expected string for name property");
+    return false;
+  }
+  if (FTextProperty *TP = CastField<FTextProperty>(Property)) {
+    if (ValueField->Type == EJson::String) {
+      TP->SetPropertyValue_InContainer(
+          TargetContainer,
+          FTextStringHelper::CreateFromBuffer(*ValueField->AsString()));
+      return true;
+    }
+    OutError = TEXT("Expected string for text property");
     return false;
   }
 
@@ -1914,6 +1946,11 @@ ApplyJsonValueToProperty(void *TargetContainer, FProperty *Property,
         Dest = (V->Type == EJson::Number)
                    ? (uint8)V->AsNumber()
                    : (uint8)FCString::Atoi(*V->AsString());
+        continue;
+      }
+
+      FString InnerError;
+      if (ApplyJsonValueToProperty(ElemPtr, Inner, V, InnerError)) {
         continue;
       }
 

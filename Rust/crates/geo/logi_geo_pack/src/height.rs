@@ -128,7 +128,10 @@ impl HeightPage {
         );
         // FIX 13: use the SAME EPSILON-floored range as from_heights so dequant matches quant exactly.
         let range = (self.max_elevation - self.min_elevation).max(f32::EPSILON);
-        self.min_elevation + (self.samples[index] as f32 / 65535.0) * range
+        // Saturate an out-of-range index to the floor sample rather than panicking — a raw OOB index in a
+        // release `panic = "abort"` build hard-kills the process instead of degrading this one call.
+        let sample = self.samples.get(index).copied().unwrap_or(0);
+        self.min_elevation + (sample as f32 / 65535.0) * range
     }
 
     pub fn encode(&self) -> Vec<u8> {

@@ -22,8 +22,10 @@ class UWorld;
 /// The streaming viewpoint + lens for SSE-driven tile selection.
 struct FLogiStreamView
 {
-	FVector Loc = FVector::ZeroVector; // Unreal cm
-	float FovY = 1.05f;                // vertical FOV (radians)
+	FVector Loc = FVector::ZeroVector;          // Unreal cm
+	FVector Dir = FVector(1.0, 0.0, 0.0);       // camera forward (unit, UE space) — globe fetch priority + frustum
+	FVector Up = FVector(0.0, 0.0, 1.0);        // camera up (unit, UE space) — globe view frustum
+	float FovY = 1.05f;                         // vertical FOV (radians)
 	float ViewportHeight = 1080.0f;
 	float ViewportWidth = 1920.0f;
 };

@@ -4,7 +4,8 @@
  * Mirrors the #[repr(C)] definitions in Rust/crates/geo/logi_geo_ffi/src/ffi.rs and src/ffi_baked.rs
  * byte-for-byte. Keep field order identical across this header and the Rust structs.
  * See Docs/Architecture/ADR-0007-Actorless-Rust-Terrain.md.
- * ABI version 3 (glam-typed: f32 render-local + f64 world).
+ * ABI version 5 (glam-typed: f32 render-local + f64 world; globe set_view takes a LogiGlobeView struct —
+ * camera basis + aspect — for the view frustum; the deprecated globe step shim is removed).
  */
 #ifndef LOGI_GEO_FFI_H
 #define LOGI_GEO_FFI_H
@@ -14,7 +15,7 @@
 
 /* ABI version. Must match logi_geo_abi_version() in the loaded DLL (mirrors LOGI_ABI_VERSION
  * in Rust/crates/geo/logi_geo_ffi/src/lib.rs). Callers verify before any other call. */
-#define LOGI_GEO_ABI_VERSION 3u
+#define LOGI_GEO_ABI_VERSION 5u
 
 #ifdef __cplusplus
 extern "C" {
@@ -71,8 +72,10 @@ void          logi_building_destroy(LogiBuilding* building);
 
 /* --- Streaming globe (Google Photorealistic 3D Tiles, ADR-0009 Milestone F) — additive; see src/ffi.rs.
  * Resolves a Cesium ion asset, streams + decodes glTF tiles on a worker pool, and rebases each into
- * Unreal render space (cm, Z-up LH) at a fixed ENU origin. step() returns a multi-tile frame whose tile
- * buffers are zero-copy views into Rust-owned memory, valid until the next step() on that world. --- */
+ * Unreal render space (cm, Z-up LH) at a fixed ENU origin. The world advances on its OWN Rust stream
+ * thread (ADR-0012): the game thread pushes the camera with set_view() and pulls the latest frame with
+ * poll() — it never blocks on streaming. A polled frame's tile buffers are zero-copy views into Rust-owned
+ * memory, valid until the next poll() on that world. --- */
 
 typedef struct LogiGlobeWorld LogiGlobeWorld; /* opaque */
 
@@ -112,12 +115,30 @@ typedef struct LogiGlobeFrame {
 } LogiGlobeFrame;
 
 /* Blocking (ion resolve + root fetch); call off the render thread. Returns NULL on failure. `cache_dir`
- * (UTF-8 path, or NULL/empty) + info.cache_budget_bytes enable the persistent on-disk tile cache. */
+ * (UTF-8 path, or NULL/empty) + info.cache_budget_bytes enable the persistent on-disk tile cache. The
+ * returned world advances on its own Rust stream thread — drive it with set_view + poll (below). */
 LogiGlobeWorld* logi_globe_world_create(const LogiGlobeCreateInfo* info, const char* ion_token, const char* cache_dir);
-LogiStatus      logi_globe_world_step(LogiGlobeWorld* world,
-                                      double camera_x_cm, double camera_y_cm, double camera_z_cm,
-                                      double fov_y_radians, double viewport_height, double max_sse_pixels,
-                                      LogiGlobeFrame* out_frame);
+
+/* The camera view pushed each frame (UE space). forward(dir) + up + aspect + fov build the view frustum for
+ * frustum-aware streaming LOD (in-view full detail, off-view a coarse shell — never hard-culled by direction,
+ * so the engine still casts off-screen shadows). dir/up = 0,0,0 => unknown (accept-all frustum, no view
+ * weighting). 13 doubles = 104 bytes; mirror this layout byte-for-byte with the Rust LogiGlobeView. */
+typedef struct LogiGlobeView {
+    double camera_x_cm, camera_y_cm, camera_z_cm; /* camera position (UE cm) */
+    double dir_x, dir_y, dir_z;                   /* camera forward (UE) */
+    double up_x, up_y, up_z;                       /* camera up (UE) */
+    double aspect;                                 /* viewport width / height */
+    double fov_y_radians;
+    double viewport_height;
+    double max_sse_pixels;
+} LogiGlobeView;
+
+/* ADR-0012 poll-based FFI. set_view pushes the newest camera (newest-wins; cheap, non-blocking; NULL view =>
+ * NullArg); the stream thread advances against it off the game thread. poll writes the latest published frame
+ * to out_frame (non-blocking — an empty frame before the first one); the frame's tile buffers are zero-copy
+ * views into Rust-owned geometry, valid until the next poll() on this world. */
+LogiStatus      logi_globe_world_set_view(LogiGlobeWorld* world, const LogiGlobeView* view);
+LogiStatus      logi_globe_world_poll(LogiGlobeWorld* world, LogiGlobeFrame* out_frame);
 uint64_t        logi_globe_world_cached_bytes(const LogiGlobeWorld* world); /* disk-cache resident bytes (telemetry) */
 void            logi_globe_world_destroy(LogiGlobeWorld* world);
 

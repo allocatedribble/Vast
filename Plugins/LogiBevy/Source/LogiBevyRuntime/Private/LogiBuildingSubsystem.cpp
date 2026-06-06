@@ -16,6 +16,15 @@
 bool LogiBevy_IsTerrainAbiOk();
 #endif
 
+void ULogiBuildingSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+	Super::Initialize(Collection);
+#if WITH_EDITOR
+	// Live-reload the sample building when its Project Setting changes (editor only; see OnSettingsChanged).
+	ULogiBevyDeveloperSettings::OnSettingsChanged.AddUObject(this, &ULogiBuildingSubsystem::OnSettingsChanged);
+#endif
+}
+
 bool ULogiBuildingSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 {
 	if (!Super::ShouldCreateSubsystem(Outer))
@@ -25,11 +34,8 @@ bool ULogiBuildingSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 #if LOGI_BEVY_HAVE_GEO
 	if (const UWorld* World = Cast<UWorld>(Outer))
 	{
-		if (!GetDefault<ULogiBevyDeveloperSettings>()->bShowAgiBuilding)
-		{
-			return false;
-		}
-		// Game + PIE, plus the main level-editor world (NOT preview/thumbnail worlds).
+		// Always create in game/PIE + the main level-editor world (NOT preview/thumbnail worlds). The
+		// bShowAgiBuilding toggle is honoured per-tick now (so flipping it takes effect live), not here.
 		return World->IsGameWorld() || World->WorldType == EWorldType::Editor;
 	}
 #endif
@@ -43,6 +49,17 @@ TStatId ULogiBuildingSubsystem::GetStatId() const
 
 void ULogiBuildingSubsystem::Tick(float /*DeltaTime*/)
 {
+#if WITH_EDITOR
+	if (bReloadRequested)
+	{
+		bReloadRequested = false;
+		TearDown(); // a building setting changed — reload below (or stay down if now hidden)
+	}
+#endif
+	if (!GetDefault<ULogiBevyDeveloperSettings>()->bShowAgiBuilding)
+	{
+		return; // hidden — honoured live now that the subsystem is always created
+	}
 	if (bLoaded)
 	{
 		return;
@@ -51,13 +68,34 @@ void ULogiBuildingSubsystem::Tick(float /*DeltaTime*/)
 	LoadAndBuild();
 }
 
-void ULogiBuildingSubsystem::Deinitialize()
+void ULogiBuildingSubsystem::TearDown()
 {
 	if (AActor* Host = HostActor.Get())
 	{
 		Host->Destroy();
 	}
 	HostActor.Reset();
+	bLoaded = false; // let the next tick reload from the current settings (when shown)
+}
+
+#if WITH_EDITOR
+void ULogiBuildingSubsystem::OnSettingsChanged(FName ChangedProperty)
+{
+	// The only building setting is bShowAgiBuilding; a None name (bulk change) also reloads. Everything else
+	// is ignored so editing unrelated settings never respawns the building.
+	if (ChangedProperty.IsNone() || ChangedProperty.ToString().Contains(TEXT("AgiBuilding")))
+	{
+		bReloadRequested = true;
+	}
+}
+#endif
+
+void ULogiBuildingSubsystem::Deinitialize()
+{
+#if WITH_EDITOR
+	ULogiBevyDeveloperSettings::OnSettingsChanged.RemoveAll(this);
+#endif
+	TearDown();
 	Super::Deinitialize();
 }
 
@@ -122,7 +160,8 @@ void ULogiBuildingSubsystem::LoadAndBuild()
 	Mesh->SetMobility(EComponentMobility::Movable);
 	Mesh->RegisterComponent();
 
-	const uint32 VCount = Data.vertex_count;
+	const uint32 Stride = Data.vertex_stride;
+	const uint32 VCount = (Stride >= 32u) ? Data.vertex_count : 0u; // sub-32 stride is malformed (ABI stride = 32) -> no geometry
 	const uint8* VData = Data.vertices;
 	TArray<FVector> Positions;
 	TArray<FVector> Normals;
@@ -132,7 +171,7 @@ void ULogiBuildingSubsystem::LoadAndBuild()
 	UVs.Reserve(VCount);
 	for (uint32 v = 0; v < VCount; ++v)
 	{
-		float F[8]; FMemory::Memcpy(F, VData + static_cast<uint64>(v) * 32, sizeof(F)); // aligned copy: Rust vertex buffer is byte-aligned (`*const u8`); a direct `(const float*)` deref is UB on strict-alignment targets (audit)
+		float F[8]; FMemory::Memcpy(F, VData + static_cast<uint64>(v) * Stride, sizeof(F)); // aligned copy: Rust vertex buffer is byte-aligned (`*const u8`); a direct `(const float*)` deref is UB on strict-alignment targets (audit)
 		Positions.Add(FVector(F[0], F[1], F[2])); // already cm, Z-up
 		Normals.Add(FVector(F[3], F[4], F[5]));
 		UVs.Add(FVector2D(F[6], F[7]));

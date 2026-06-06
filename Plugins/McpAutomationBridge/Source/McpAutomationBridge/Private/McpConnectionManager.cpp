@@ -30,7 +30,7 @@ static inline FString SanitizeForLogConnMgr(const FString &In) {
   return Out;
 }
 
-static inline bool IsImagePayloadPreviewField(FStringView Key) {
+static inline bool IsImagePayloadPreviewField(const FString &Key) {
   return Key.Equals(TEXT("imageBase64"), ESearchCase::IgnoreCase) ||
          Key.Equals(TEXT("imageData"), ESearchCase::IgnoreCase) ||
          Key.Equals(TEXT("data"), ESearchCase::IgnoreCase);
@@ -626,8 +626,9 @@ void FMcpConnectionManager::HandleMessage(
       FString PayloadPreview;
       if (Payload.IsValid()) {
         TArray<FString> Parts;
-        for (auto& Pair : Payload->Values) {
-          if (Pair.Key != TEXT("type") && Pair.Key != TEXT("requestId")) {
+        for (const auto& Pair : Payload->Values) {
+          const FString FieldName(Pair.Key.Len(), *Pair.Key);
+          if (FieldName != TEXT("type") && FieldName != TEXT("requestId")) {
             FString Val;
             if (Pair.Value->Type == EJson::String) {
               Val = FString::Printf(TEXT("\"%s\""), *Pair.Value->AsString().Left(50));
@@ -638,7 +639,7 @@ void FMcpConnectionManager::HandleMessage(
             } else {
               Val = TEXT("...");
             }
-            Parts.Add(FString::Printf(TEXT("%s=%s"), *Pair.Key, *Val));
+            Parts.Add(FString::Printf(TEXT("%s=%s"), *FieldName, *Val));
           }
         }
         PayloadPreview = Parts.Num() > 0 ? FString::Join(Parts, TEXT(" ")) : TEXT("{}");
@@ -838,9 +839,10 @@ void FMcpConnectionManager::SendAutomationResponse(
     FString ResultPreview;
     if (Result.IsValid() && Result->Values.Num() > 0) {
       TArray<FString> Parts;
-      for (auto& Pair : Result->Values) {
+      for (const auto& Pair : Result->Values) {
+        const FString FieldName(Pair.Key.Len(), *Pair.Key);
         FString Val;
-        if (IsImagePayloadPreviewField(Pair.Key)) {
+        if (IsImagePayloadPreviewField(FieldName)) {
           Val = TEXT("\"<omitted; see image content>\"");
         } else if (Pair.Value->Type == EJson::String) {
           Val = FString::Printf(TEXT("\"%s\""), *Pair.Value->AsString().Left(40));
@@ -855,7 +857,7 @@ void FMcpConnectionManager::SendAutomationResponse(
         } else {
           Val = TEXT("?");
         }
-        Parts.Add(FString::Printf(TEXT("%s=%s"), *Pair.Key, *Val));
+        Parts.Add(FString::Printf(TEXT("%s=%s"), *FieldName, *Val));
       }
       ResultPreview = FString::Printf(TEXT(" (%s)"), *FString::Join(Parts, TEXT(" ")));
     }

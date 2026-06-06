@@ -34,6 +34,11 @@ pub trait TileContentSource {
     fn poll_completed(&mut self, now_tick: u64, out: &mut Vec<Loaded>);
     fn cancel(&mut self, id: RequestId);
     fn in_flight(&self) -> usize;
+    /// Bytes resident in a persistent cache behind this source, if any (telemetry). Defaults to `0` for
+    /// sources without a cache (e.g. the synthetic test source).
+    fn cached_bytes(&self) -> u64 {
+        0
+    }
 }
 
 /// SplitMix64 — a fast, deterministic mixer (also used by the kernel's existing synthetic provider) so a
@@ -490,6 +495,9 @@ impl TileContentSource for HttpSource {
     }
     fn in_flight(&self) -> usize {
         self.in_flight.len()
+    }
+    fn cached_bytes(&self) -> u64 {
+        self.cache.as_ref().map(|c| c.bytes()).unwrap_or(0)
     }
 }
 

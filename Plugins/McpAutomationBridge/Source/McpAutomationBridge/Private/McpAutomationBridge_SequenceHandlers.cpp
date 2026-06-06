@@ -1618,6 +1618,29 @@ bool UMcpAutomationBridgeSubsystem::HandleSequenceAddKeyframe(
     return true;
   }
 
+  auto NormalizeTransformPropertyAlias = [&](const TCHAR *Alias,
+                                             const TCHAR *TransformField) {
+    if (!PropertyName.Equals(Alias, ESearchCase::IgnoreCase)) {
+      return false;
+    }
+
+    const TSharedPtr<FJsonObject> *ValueObj = nullptr;
+    if (LocalPayload->TryGetObjectField(TEXT("value"), ValueObj) &&
+        ValueObj && ValueObj->IsValid()) {
+      TSharedPtr<FJsonObject> TransformValue = MakeShared<FJsonObject>();
+      TransformValue->SetObjectField(TransformField, *ValueObj);
+      LocalPayload->SetObjectField(TEXT("value"), TransformValue);
+    }
+
+    PropertyName = TEXT("Transform");
+    return true;
+  };
+
+  NormalizeTransformPropertyAlias(TEXT("Location"), TEXT("location")) ||
+      NormalizeTransformPropertyAlias(TEXT("Translation"), TEXT("location")) ||
+      NormalizeTransformPropertyAlias(TEXT("Rotation"), TEXT("rotation")) ||
+      NormalizeTransformPropertyAlias(TEXT("Scale"), TEXT("scale"));
+
 #if WITH_EDITOR
   UObject *SeqObj = UEditorAssetLibrary::LoadAsset(SeqPath);
   if (!SeqObj) {

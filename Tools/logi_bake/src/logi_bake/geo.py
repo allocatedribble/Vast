@@ -84,8 +84,12 @@ class GeoidModel:
     def undulation(self, lat_deg: float, lon_deg: float) -> float:
         if self.constant_m is not None:
             return self.constant_m
+        # NOAA `.gtx` geoid grids are published in 0..360 east longitude; normalize a ±180 input into the
+        # grid's domain so a western-hemisphere lon (e.g. -75.6) indexes the right column instead of
+        # clamping to column 0 (which silently floats/sinks the whole AOI).
+        lon = lon_deg + 360.0 if (self.lon0 >= 0.0 and lon_deg < self.lon0) else lon_deg
         fj = (lat_deg - self.lat0) / self.dlat
-        fi = (lon_deg - self.lon0) / self.dlon
+        fi = (lon - self.lon0) / self.dlon
         j0 = max(0, min(self.rows - 2, int(math.floor(fj))))
         i0 = max(0, min(self.cols - 2, int(math.floor(fi))))
         tj, ti = fj - j0, fi - i0

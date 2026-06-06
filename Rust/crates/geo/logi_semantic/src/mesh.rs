@@ -395,6 +395,16 @@ fn rtin_coords(size: usize) -> Vec<i32> {
 }
 
 fn rtin_errors(terrain: &[f32], size: usize, coords: &[i32]) -> Vec<f32> {
+    // Invariant: a tile's height grid is exactly `size×size`. Every real SemanticTile enforces this in
+    // `new`/`decode`; a hand-built tile with inconsistent public `heights`/`grid_n` fields would index out
+    // of bounds below (a process abort under release `panic = "abort"`). Catch the misuse loud in dev.
+    debug_assert!(
+        terrain.len() >= size * size,
+        "rtin_errors: terrain has {} samples, expected ≥ {}×{}",
+        terrain.len(),
+        size,
+        size
+    );
     let tile_size = size - 1;
     let num_triangles = tile_size * tile_size * 2 - 2;
     let num_parent = num_triangles - tile_size * tile_size;

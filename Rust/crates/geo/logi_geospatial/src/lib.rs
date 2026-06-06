@@ -260,7 +260,9 @@ mod tests {
         assert!(up.dot(east).abs() <= 1e-12);
         assert!((east.cross(north) - up).length() <= 1e-12, "not right-handed"); // E×N = U
                                                                                  // "up" is exactly the geodetic surface normal at the origin's lon/lat.
-        assert!((up - geodetic_surface_normal_cartographic(c.longitude, c.latitude)).length() <= 1e-15);
+                                                                                 // 1e-12, not 1e-15: a tighter bound is below the agreement `sin`/`cos` guarantee across libm
+                                                                                 // implementations (it fails under miri though the math is exact) — keep it portable.
+        assert!((up - geodetic_surface_normal_cartographic(c.longitude, c.latitude)).length() <= 1e-12);
     }
 
     #[test]

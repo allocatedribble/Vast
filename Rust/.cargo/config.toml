@@ -7,3 +7,11 @@
 
 [build]
 # target = "x86_64-pc-windows-msvc"  # default host on this machine; uncomment to force.
+
+[target.x86_64-pc-windows-msvc]
+# Faster links via the LLVM linker (rust-lld / lld-link) bundled with the toolchain — speeds up the
+# bacon / cargo-watch inner loop. Local Windows only: CI builds the Linux host target and is unaffected.
+# lld-link emits MSVC-compatible PE/COFF, so the cdylibs stay ABI-compatible with Unreal's MSVC CRT.
+# (`-C linker-features=+lld` is still nightly-gated on our toolchain; pointing `linker` at the bundled
+# rust-lld is the stable way in.)
+linker = "rust-lld.exe"

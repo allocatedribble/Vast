@@ -58,15 +58,18 @@
 #include "Blueprint/UserWidget.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
 #include "Blueprint/WidgetTree.h"
+#include "Camera/PlayerCameraManager.h"
 #include "Components/Image.h"
 #include "Components/PanelWidget.h"
 #include "Components/TextBlock.h"
+#include "GameFramework/PlayerController.h"
 #include "WidgetBlueprint.h"
 
 // Engine & Rendering
 #include "Engine/GameViewportClient.h"
 #include "Engine/Texture2D.h"
 #include "Framework/Application/SlateApplication.h"
+#include "Slate/SceneViewport.h"
 #include "HAL/FileManager.h"
 #include "Misc/ConfigCacheIni.h"
 #include "IImageWrapper.h"
@@ -76,6 +79,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
+#include "RenderingThread.h"
 #include "UnrealClient.h"
 
 // Widget Factory (version-dependent header location)
@@ -461,13 +465,27 @@ bool UMcpAutomationBridgeSubsystem::HandleUiAction(
     bool bReturnBase64 = true;
     Payload->TryGetBoolField(TEXT("returnBase64"), bReturnBase64);
 
-    // Get viewport
-    if (!GEngine || !GEngine->GameViewport) {
+    // Get viewport. During PIE, prefer the viewport owned by the PIE world rather
+    // than GEngine->GameViewport, which can point at the editor viewport surface
+    // and capture editor overlays or a stale editor camera instead of the active
+    // game camera.
+    UGameViewportClient *ViewportClient = nullptr;
+    bool bUsingPieViewport = false;
+    if (GEditor && GEditor->PlayWorld) {
+      if (UWorld *PlayWorld = GEditor->PlayWorld.Get()) {
+        ViewportClient = PlayWorld->GetGameViewport();
+        bUsingPieViewport = ViewportClient != nullptr;
+      }
+    }
+    if (!ViewportClient && GEngine) {
+      ViewportClient = GEngine->GameViewport;
+    }
+
+    if (!ViewportClient) {
       Message = TEXT("No game viewport available");
       ErrorCode = TEXT("NO_VIEWPORT");
       Resp->SetStringField(TEXT("error"), Message);
     } else {
-      UGameViewportClient *ViewportClient = GEngine->GameViewport;
       FViewport *Viewport = ViewportClient->Viewport;
 
       if (!Viewport) {
@@ -475,6 +493,39 @@ bool UMcpAutomationBridgeSubsystem::HandleUiAction(
         ErrorCode = TEXT("NO_VIEWPORT");
         Resp->SetStringField(TEXT("error"), Message);
       } else {
+        bool bForcedViewportDraw = false;
+        bool bHasPlayerCamera = false;
+        FString ActiveViewTargetPath;
+        FVector ActiveCameraLocation = FVector::ZeroVector;
+        FRotator ActiveCameraRotation = FRotator::ZeroRotator;
+        float ActiveCameraFov = 0.0f;
+
+        if (UWorld *ViewportWorld = ViewportClient->GetWorld()) {
+          if (APlayerController *PlayerController = ViewportWorld->GetFirstPlayerController()) {
+            if (AActor *ViewTarget = PlayerController->GetViewTarget()) {
+              ActiveViewTargetPath = ViewTarget->GetPathName();
+            }
+            if (APlayerCameraManager *CameraManager = PlayerController->PlayerCameraManager) {
+              CameraManager->UpdateCamera(0.0f);
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3)
+              const FMinimalViewInfo &CameraView = CameraManager->GetCameraCacheView();
+#else
+              const FMinimalViewInfo CameraView = CameraManager->GetCameraCachePOV();
+#endif
+              ActiveCameraLocation = CameraView.Location;
+              ActiveCameraRotation = CameraView.Rotation;
+              ActiveCameraFov = CameraView.FOV;
+              bHasPlayerCamera = true;
+            }
+          }
+        }
+
+        if (bUsingPieViewport) {
+          Viewport->Draw(false);
+          FlushRenderingCommands();
+          bForcedViewportDraw = true;
+        }
+
         // Capture viewport pixels
         TArray<FColor> Bitmap;
         FIntVector Size(Viewport->GetSizeXY().X, Viewport->GetSizeXY().Y, 0);
@@ -535,6 +586,29 @@ bool UMcpAutomationBridgeSubsystem::HandleUiAction(
           Resp->SetStringField(TEXT("screenshotPath"), FullPath);
           Resp->SetStringField(TEXT("filename"), Filename);
           Resp->SetStringField(TEXT("mode"), TEXT("game_viewport"));
+          Resp->SetBoolField(TEXT("usingPieViewport"), bUsingPieViewport);
+          Resp->SetBoolField(TEXT("forcedViewportDraw"), bForcedViewportDraw);
+          if (UWorld *ViewportWorld = ViewportClient->GetWorld()) {
+            Resp->SetStringField(TEXT("viewportWorld"), ViewportWorld->GetName());
+            Resp->SetNumberField(TEXT("viewportWorldType"), static_cast<int32>(ViewportWorld->WorldType));
+          }
+          if (!ActiveViewTargetPath.IsEmpty()) {
+            Resp->SetStringField(TEXT("activeViewTarget"), ActiveViewTargetPath);
+          }
+          if (bHasPlayerCamera) {
+            TSharedPtr<FJsonObject> CameraLocationObj = McpHandlerUtils::CreateResultObject();
+            CameraLocationObj->SetNumberField(TEXT("x"), ActiveCameraLocation.X);
+            CameraLocationObj->SetNumberField(TEXT("y"), ActiveCameraLocation.Y);
+            CameraLocationObj->SetNumberField(TEXT("z"), ActiveCameraLocation.Z);
+            Resp->SetObjectField(TEXT("activeCameraLocation"), CameraLocationObj);
+
+            TSharedPtr<FJsonObject> CameraRotationObj = McpHandlerUtils::CreateResultObject();
+            CameraRotationObj->SetNumberField(TEXT("pitch"), ActiveCameraRotation.Pitch);
+            CameraRotationObj->SetNumberField(TEXT("yaw"), ActiveCameraRotation.Yaw);
+            CameraRotationObj->SetNumberField(TEXT("roll"), ActiveCameraRotation.Roll);
+            Resp->SetObjectField(TEXT("activeCameraRotation"), CameraRotationObj);
+            Resp->SetNumberField(TEXT("activeCameraFov"), ActiveCameraFov);
+          }
           Resp->SetBoolField(TEXT("saved"), bSaved);
           Resp->SetNumberField(TEXT("width"), Width);
           Resp->SetNumberField(TEXT("height"), Height);

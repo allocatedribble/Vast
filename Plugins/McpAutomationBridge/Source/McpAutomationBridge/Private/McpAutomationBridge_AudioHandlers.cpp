@@ -237,10 +237,10 @@ DEFINE_LOG_CATEGORY_STATIC(LogMcpAudioHandlers, Log, All);
 /**
  * Sanitize a directory path and build a combined asset FullPath.
  *
- * Calls SanitizeProjectRelativePath on the directory, then again on the
- * combined "directory/assetName" string. Returns true on success with
- * OutDirectory and OutFullPath set; returns false if either sanitization
- * rejects the path.
+ * Prefixes bare relative directories with /Game, calls
+ * SanitizeProjectRelativePath on the directory, then again on the combined
+ * "directory/assetName" string. Returns true on success with OutDirectory and
+ * OutFullPath set; returns false if either sanitization rejects the path.
  */
 static bool BuildSanitizedAssetPath(
     const FString& InDirectory, const FString& AssetName,
@@ -252,7 +252,12 @@ static bool BuildSanitizedAssetPath(
     return false;
   }
 
-  OutDirectory = SanitizeProjectRelativePath(InDirectory);
+  FString Directory = InDirectory.TrimStartAndEnd();
+  if (!Directory.IsEmpty() && !Directory.StartsWith(TEXT("/"))) {
+    Directory = TEXT("/Game/") + Directory;
+  }
+
+  OutDirectory = SanitizeProjectRelativePath(Directory);
   if (OutDirectory.IsEmpty()) return false;
   OutFullPath = SanitizeProjectRelativePath(
       FString::Printf(TEXT("%s/%s"), *OutDirectory, *AssetName));
@@ -452,7 +457,9 @@ static USoundMix *ResolveSoundMix(const FString &MixPath) {
 	// For paths without a root (e.g. "TestSoundMix"), skip DoesAssetExist to avoid UE log errors
 	// and go straight to asset registry search below
 	if (MixPath.Contains(TEXT("/")))
+	{
 		return nullptr;
+	}
 
   FString AssetName = FPaths::GetBaseFilename(MixPath);
   FAssetRegistryModule &AssetRegistryModule =
@@ -1551,7 +1558,7 @@ bool UMcpAutomationBridgeSubsystem::HandleAudioAction(
   //             "targetVolume"?: number (fade_in only) }
   // Response: { "success": bool, "actorName": string, "action": string }
   // -------------------------------------------------------------------------
-	else if (Lower == TEXT("fade_sound_out") ||
+	if (Lower == TEXT("fade_sound_out") ||
 		Lower == TEXT("fade_sound_in") ||
 		Lower == TEXT("audio_fade_sound_out") ||
 		Lower == TEXT("audio_fade_sound_in")) {
@@ -1670,7 +1677,7 @@ bool UMcpAutomationBridgeSubsystem::HandleAudioAction(
   // Payload:  { "soundPath": string }
   // Response: { "success": bool, "message": "Sound primed" }
   // -------------------------------------------------------------------------
-  else if (Lower == TEXT("prime_sound")) {
+  if (Lower == TEXT("prime_sound")) {
     FString SoundPath;
     Payload->TryGetStringField(TEXT("soundPath"), SoundPath);
     USoundBase *Sound = ResolveSoundAsset(SoundPath);

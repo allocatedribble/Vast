@@ -1518,6 +1518,50 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
       return true;
     }
 
+    int32 SourceOutputIndex = 0;
+    if (!SourcePin.IsEmpty()) {
+      if (SourcePin.IsNumeric()) {
+        SourceOutputIndex = FCString::Atoi(*SourcePin);
+      } else if (UMaterialExpressionMaterialFunctionCall* MFCallSource = Cast<UMaterialExpressionMaterialFunctionCall>(SourceExpr)) {
+        bool bResolvedOutputName = false;
+        for (int32 OutputIdx = 0; OutputIdx < MFCallSource->FunctionOutputs.Num(); ++OutputIdx) {
+          const FFunctionExpressionOutput& FunctionOutput = MFCallSource->FunctionOutputs[OutputIdx];
+          if (FunctionOutput.ExpressionOutput &&
+              FunctionOutput.ExpressionOutput->OutputName.ToString().Equals(SourcePin, ESearchCase::IgnoreCase)) {
+            SourceOutputIndex = OutputIdx;
+            bResolvedOutputName = true;
+            break;
+          }
+        }
+        if (!bResolvedOutputName) {
+          SendAutomationError(Socket, RequestId,
+                              FString::Printf(TEXT("Source output pin '%s' not found."), *SourcePin),
+                              TEXT("INVALID_PIN"));
+          return true;
+        }
+      } else if (UMaterialExpressionCustom* CustomSource = Cast<UMaterialExpressionCustom>(SourceExpr)) {
+        bool bResolvedOutputName = false;
+        for (int32 OutputIdx = 0; OutputIdx < CustomSource->AdditionalOutputs.Num(); ++OutputIdx) {
+          if (CustomSource->AdditionalOutputs[OutputIdx].OutputName.ToString().Equals(SourcePin, ESearchCase::IgnoreCase)) {
+            SourceOutputIndex = OutputIdx + 1;
+            bResolvedOutputName = true;
+            break;
+          }
+        }
+        if (!bResolvedOutputName) {
+          SendAutomationError(Socket, RequestId,
+                              FString::Printf(TEXT("Source output pin '%s' not found."), *SourcePin),
+                              TEXT("INVALID_PIN"));
+          return true;
+        }
+      } else {
+        SendAutomationError(Socket, RequestId,
+                            FString::Printf(TEXT("Source output pin '%s' is not numeric and source node has no named outputs."), *SourcePin),
+                            TEXT("INVALID_PIN"));
+        return true;
+      }
+    }
+
     // "Main" target: for UMaterial this means the material attributes inputs;
     // for UMaterialFunction this means a FunctionOutput node matched by name
     // (InputName) or, if InputName is empty, the first FunctionOutput.
@@ -1565,11 +1609,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
         if (bFound) {
           // Re-lookup the input to set OutputIndex (main inputs are FScalar/FColor/FVectorMaterialInput)
           auto SetMainInputOutputIndex = [&](FExpressionInput& Input) {
-            if (!SourcePin.IsEmpty()) {
-              Input.OutputIndex = FCString::Atoi(*SourcePin);
-            } else {
-              Input.OutputIndex = 0;
-            }
+            Input.OutputIndex = SourceOutputIndex;
           };
 #if WITH_EDITORONLY_DATA
           if (InputName == TEXT("BaseColor")) { SetMainInputOutputIndex(MCP_GET_MATERIAL_INPUT(Material, BaseColor)); }
@@ -1615,11 +1655,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
           return true;
         }
         TargetOutput->A.Expression = SourceExpr;
-        if (!SourcePin.IsEmpty()) {
-          TargetOutput->A.OutputIndex = FCString::Atoi(*SourcePin);
-        } else {
-          TargetOutput->A.OutputIndex = 0;
-        }
+        TargetOutput->A.OutputIndex = SourceOutputIndex;
         FINALIZE_HOST();
         SendAutomationResponse(Socket, RequestId, true,
                                TEXT("Connected to function output."));
@@ -1644,11 +1680,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
             StructProp->ContainerPtrToValuePtr<FExpressionInput>(TargetExpr);
         if (InputPtr) {
           InputPtr->Expression = SourceExpr;
-          if (!SourcePin.IsEmpty()) {
-            InputPtr->OutputIndex = FCString::Atoi(*SourcePin);
-          } else {
-            InputPtr->OutputIndex = 0;
-          }
+          InputPtr->OutputIndex = SourceOutputIndex;
           FINALIZE_HOST();
           SendAutomationResponse(Socket, RequestId, true,
                                  TEXT("Nodes connected."));
@@ -1662,9 +1694,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
       for (FCustomInput& CustomInput : CustomExpr->Inputs) {
         if (CustomInput.InputName.ToString() == InputName) {
           CustomInput.Input.Expression = SourceExpr;
-          if (!SourcePin.IsEmpty()) {
-            CustomInput.Input.OutputIndex = FCString::Atoi(*SourcePin);
-          }
+          CustomInput.Input.OutputIndex = SourceOutputIndex;
           FINALIZE_HOST();
           SendAutomationResponse(Socket, RequestId, true, TEXT("Nodes connected."));
           return true;
@@ -1678,38 +1708,10 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
         if (FuncInput.ExpressionInput->InputName.ToString() == InputName ||
             FuncInput.Input.InputName.ToString() == InputName) {
           FuncInput.Input.Expression = SourceExpr;
-          if (!SourcePin.IsEmpty()) {
-            FuncInput.Input.OutputIndex = FCString::Atoi(*SourcePin);
-          }
+          FuncInput.Input.OutputIndex = SourceOutputIndex;
           FINALIZE_HOST();
           SendAutomationResponse(Socket, RequestId, true, TEXT("Nodes connected to MF call input."));
           return true;
-        }
-      }
-    }
-
-    // Fallback: check UMaterialExpressionMaterialFunctionCall as SOURCE (output pin matching)
-    if (UMaterialExpressionMaterialFunctionCall* MFCallSource = Cast<UMaterialExpressionMaterialFunctionCall>(SourceExpr)) {
-      // If sourcePin names an MF call output, resolve its index
-      if (!SourcePin.IsEmpty()) {
-        for (int32 i = 0; i < MFCallSource->FunctionOutputs.Num(); ++i) {
-          if (MFCallSource->FunctionOutputs[i].ExpressionOutput->OutputName.ToString() == SourcePin) {
-            // Found the output index — now connect to target using property reflection
-            FProperty *TargetProp = TargetExpr->GetClass()->FindPropertyByName(FName(*InputName));
-            if (TargetProp) {
-              if (FStructProperty *SP = CastField<FStructProperty>(TargetProp)) {
-                FExpressionInput *InPtr = SP->ContainerPtrToValuePtr<FExpressionInput>(TargetExpr);
-                if (InPtr) {
-                  InPtr->Expression = SourceExpr;
-                  InPtr->OutputIndex = i;
-                  FINALIZE_HOST();
-                  SendAutomationResponse(Socket, RequestId, true, TEXT("Nodes connected via MF call output."));
-                  return true;
-                }
-              }
-            }
-            break;
-          }
         }
       }
     }
@@ -2059,14 +2061,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageMaterialAuthoringAction(
     NewExpr->MaterialExpressionEditorX = (int32)X;
     NewExpr->MaterialExpressionEditorY = (int32)Y;
 
-#if WITH_EDITORONLY_DATA
-    // UE 5.0: MaterialFunction uses FunctionExpressions, not Expressions
-    #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
-      Func->GetEditorOnlyData()->ExpressionCollection.Expressions.Add(NewExpr);
-    #else
-      Func->FunctionExpressions.Add(NewExpr);
-    #endif
-#endif
+    AddExpressionToContainer(nullptr, Func, NewExpr);
     Func->PostEditChange();
     Func->MarkPackageDirty();
 

@@ -169,6 +169,8 @@ bool UMcpAutomationBridgeSubsystem::HandleEffectAction(
 
   auto IsNiagaraAuthoringSubAction = [](const FString &SubAction) {
     static const TSet<FString> NiagaraAuthoringActions = {
+        TEXT("create_niagara_system"),
+        TEXT("create_niagara_emitter"),
         TEXT("add_emitter_to_system"),
         TEXT("set_emitter_properties"),
         TEXT("add_spawn_rate_module"),
@@ -1443,6 +1445,9 @@ bool UMcpAutomationBridgeSubsystem::HandleEffectAction(
   if (bSpawnNiagara) {
     FString SystemPath;
     LocalPayload->TryGetStringField(TEXT("systemPath"), SystemPath);
+    if (SystemPath.IsEmpty()) {
+      LocalPayload->TryGetStringField(TEXT("system"), SystemPath);
+    }
     if (SystemPath.IsEmpty()) {
       SendAutomationResponse(RequestingSocket, RequestId, false,
                              TEXT("systemPath required"), nullptr,

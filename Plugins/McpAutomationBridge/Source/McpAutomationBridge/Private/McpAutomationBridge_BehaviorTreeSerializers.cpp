@@ -1,8 +1,10 @@
 // McpAutomationBridge_BehaviorTreeSerializers.cpp
+#include "McpVersionCompatibility.h"
 #include "McpAutomationBridge_BehaviorTreeSerializers.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "GameplayTagContainer.h"
 #include "UObject/UnrealType.h"          // FStructProperty, TFieldIterator
 #include "UObject/Class.h"
 
@@ -81,6 +83,29 @@ static void CollectBlackboardKeySelectors(UBTNode* Node, const TSharedRef<FJsonO
             }
         }
     }
+}
+
+static FString GetRunBehaviorDynamicInjectionTag(UBTTask_RunBehaviorDynamic* DynBT)
+{
+    if (!DynBT)
+    {
+        return FString();
+    }
+
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3)
+    return DynBT->GetInjectionTag().ToString();
+#else
+    FStructProperty* InjectionTagProperty = FindFProperty<FStructProperty>(DynBT->GetClass(), TEXT("InjectionTag"));
+    if (InjectionTagProperty && InjectionTagProperty->Struct == FGameplayTag::StaticStruct())
+    {
+        const FGameplayTag* InjectionTag = InjectionTagProperty->ContainerPtrToValuePtr<FGameplayTag>(DynBT);
+        if (InjectionTag)
+        {
+            return InjectionTag->ToString();
+        }
+    }
+    return FString();
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +347,7 @@ TSharedPtr<FJsonObject> SerializeBTNode(
                 Obj->SetStringField(TEXT("subTreeAsset"), Sub->GetPathName());
             }
             Obj->SetStringField(TEXT("subTreeSource"), TEXT("dynamicDefault"));
-            Obj->SetStringField(TEXT("injectionTag"), DynBT->GetInjectionTag().ToString());
+            Obj->SetStringField(TEXT("injectionTag"), GetRunBehaviorDynamicInjectionTag(DynBT));
             Obj->SetBoolField(TEXT("runtimeInjectable"), true);
         }
     }

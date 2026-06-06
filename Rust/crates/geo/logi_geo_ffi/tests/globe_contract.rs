@@ -4,10 +4,29 @@
 //!   `$env:CESIUM_ION_TOKEN="<token>"; cargo test -p logi_geo_ffi --release -- --ignored globe_streams_live`
 
 use logi_geo::ffi::{
-    logi_globe_world_cached_bytes, logi_globe_world_create, logi_globe_world_destroy, logi_globe_world_step,
-    LogiGlobeCreateInfo, LogiGlobeFrame, LogiGlobeTile, LogiStatus,
+    logi_globe_world_cached_bytes, logi_globe_world_create, logi_globe_world_destroy, logi_globe_world_poll,
+    logi_globe_world_set_view, LogiGlobeCreateInfo, LogiGlobeFrame, LogiGlobeTile, LogiGlobeView, LogiStatus,
 };
 use std::mem::size_of;
+
+/// A camera view looking down-ish from the Manhattan camera, for the set_view/poll calls.
+fn sample_view(cx: f64, cy: f64, cz: f64) -> LogiGlobeView {
+    LogiGlobeView {
+        camera_x_cm: cx,
+        camera_y_cm: cy,
+        camera_z_cm: cz,
+        dir_x: 0.0,
+        dir_y: 0.0,
+        dir_z: -1.0, // looking down
+        up_x: 0.0,
+        up_y: 1.0,
+        up_z: 0.0,
+        aspect: 16.0 / 9.0,
+        fov_y_radians: 60f64.to_radians(),
+        viewport_height: 1080.0,
+        max_sse_pixels: 16.0,
+    }
+}
 
 /// The Rust `#[repr(C)]` layout must match the byte-for-byte sizes documented in `logi_geo_ffi.h`.
 /// A mismatch means the header drifted from the Rust struct — the classic silent-ABI-corruption bug.
@@ -16,6 +35,7 @@ fn globe_structs_have_the_documented_abi_layout() {
     assert_eq!(size_of::<LogiGlobeCreateInfo>(), 56, "LogiGlobeCreateInfo");
     assert_eq!(size_of::<LogiGlobeTile>(), 80, "LogiGlobeTile");
     assert_eq!(size_of::<LogiGlobeFrame>(), 48, "LogiGlobeFrame");
+    assert_eq!(size_of::<LogiGlobeView>(), 104, "LogiGlobeView"); // 13 × f64
 }
 
 #[test]
@@ -36,21 +56,16 @@ fn globe_null_args_rejected_not_crashed() {
     // Non-null info but null token is still rejected (no resolve attempted).
     assert!(unsafe { logi_globe_world_create(&info as *const _, std::ptr::null(), std::ptr::null()) }.is_null());
 
-    // Step on a null world → InvalidHandle; never dereferenced.
+    // The poll-based surface (ADR-0012) rejects a null world, no deref. A null world is caught before the
+    // view is read, so even a valid view pointer returns InvalidHandle.
     let mut frame: LogiGlobeFrame = unsafe { std::mem::zeroed() };
+    let view = sample_view(0.0, 0.0, 0.0);
     assert_eq!(
-        unsafe {
-            logi_globe_world_step(
-                std::ptr::null_mut(),
-                0.0,
-                0.0,
-                0.0,
-                1.0,
-                1080.0,
-                16.0,
-                &mut frame as *mut _,
-            )
-        },
+        unsafe { logi_globe_world_set_view(std::ptr::null_mut(), &view as *const _) },
+        LogiStatus::InvalidHandle
+    );
+    assert_eq!(
+        unsafe { logi_globe_world_poll(std::ptr::null_mut(), &mut frame as *mut _) },
         LogiStatus::InvalidHandle
     );
 
@@ -88,21 +103,16 @@ fn globe_streams_live() {
 
     // Camera 800 m south, 1.5 km up: ENU (0,-800,1500) m → Unreal (0, 80000, 150000) cm (negate North).
     let (cx, cy, cz) = (0.0_f64, 80_000.0_f64, 150_000.0_f64);
+    let view = sample_view(cx, cy, cz);
     let mut frame: LogiGlobeFrame = unsafe { std::mem::zeroed() };
     for _ in 0..80 {
+        // The poll-based surface: push the view, then pull the latest async frame (ADR-0012).
         assert_eq!(
-            unsafe {
-                logi_globe_world_step(
-                    world,
-                    cx,
-                    cy,
-                    cz,
-                    60f64.to_radians(),
-                    1080.0,
-                    16.0,
-                    &mut frame as *mut _,
-                )
-            },
+            unsafe { logi_globe_world_set_view(world, &view as *const _) },
+            LogiStatus::Ok
+        );
+        assert_eq!(
+            unsafe { logi_globe_world_poll(world, &mut frame as *mut _) },
             LogiStatus::Ok
         );
         std::thread::sleep(std::time::Duration::from_millis(70));
@@ -125,7 +135,7 @@ fn globe_streams_live() {
 
     // Null out-frame is rejected on a valid world.
     assert_eq!(
-        unsafe { logi_globe_world_step(world, cx, cy, cz, 1.0, 1080.0, 16.0, std::ptr::null_mut()) },
+        unsafe { logi_globe_world_poll(world, std::ptr::null_mut()) },
         LogiStatus::NullArg
     );
 

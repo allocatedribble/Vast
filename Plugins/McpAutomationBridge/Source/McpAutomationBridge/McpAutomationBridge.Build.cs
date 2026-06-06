@@ -231,9 +231,8 @@ public class McpAutomationBridge : ModuleRules
             AddOptionalDynamicModule(Target, EngineDir, "GeometryScriptingCore", "GeometryScriptingCore");
             AddOptionalDynamicModule(Target, EngineDir, "GeometryScriptingEditor", "GeometryScriptingEditor");
 
-            // Note: In UE 5.8 the PCG module exports data symbols (e.g. PCG::Private::UserParameterTagData,
-            // declared `extern PCG_API const FString` in PCGCommon.h and referenced by inline header code).
-            // Data symbols cannot be delay-loaded (LNK1194), so PCG must be hard-linked via the conditional helper.
+            // PCG exports a data symbol (PCG::Private::UserParameterTagData), so it cannot be delay-loaded
+            // (LNK1194) — use the conditional (hard-link) helper, like MetasoundFrontend / StructUtils above.
             bool bHasPCG = AddOptionalConditionalModule(Target, EngineDir, "PCG", "PCG");
             PublicDefinitions.Add(bHasPCG ? "MCP_HAS_PCG=1" : "MCP_HAS_PCG=0");
 

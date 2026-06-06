@@ -44,6 +44,9 @@ public:
 				TEXT("remove_component"),
 				TEXT("set_component_properties"),
 				TEXT("set_component_property"),
+				TEXT("set_material"),
+				TEXT("set_actor_material"),
+				TEXT("apply_material"),
 				TEXT("get_component_property"),
 				TEXT("get_components"),
 				TEXT("get_actor_components"),
@@ -76,6 +79,10 @@ public:
 			.String(TEXT("actorClass"), TEXT("Actor class alias or path."))
 			.String(TEXT("className"), TEXT("Actor class name."))
 			.String(TEXT("meshPath"), TEXT("Mesh asset path."))
+			.String(TEXT("materialPath"), TEXT("Material asset path."))
+			.Integer(TEXT("materialSlot"), TEXT("Material slot index."))
+			.Integer(TEXT("materialIndex"), TEXT("Material slot index alias."))
+			.Bool(TEXT("allComponents"), TEXT("Apply material to every primitive component on the actor."))
 			.String(TEXT("blueprintPath"), TEXT("Blueprint asset path."))
 			.Object(TEXT("location"), TEXT("3D location (x, y, z)."),
 				[](FMcpSchemaBuilder& S) {

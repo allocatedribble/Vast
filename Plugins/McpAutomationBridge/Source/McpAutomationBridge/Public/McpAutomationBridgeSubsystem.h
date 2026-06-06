@@ -1080,6 +1080,9 @@ private:
   bool HandleControlActorSetComponentProperties(
       const FString &RequestId, const TSharedPtr<FJsonObject> &Payload,
       TSharedPtr<FMcpBridgeWebSocket> Socket);
+  bool HandleControlActorSetMaterial(const FString &RequestId,
+                                     const TSharedPtr<FJsonObject> &Payload,
+                                     TSharedPtr<FMcpBridgeWebSocket> Socket);
   bool HandleControlActorGetComponents(const FString &RequestId,
                                        const TSharedPtr<FJsonObject> &Payload,
                                        TSharedPtr<FMcpBridgeWebSocket> Socket);
@@ -1162,6 +1165,9 @@ private:
   bool HandleControlEditorPossess(const FString &RequestId,
                                   const TSharedPtr<FJsonObject> &Payload,
                                   TSharedPtr<FMcpBridgeWebSocket> Socket);
+  bool HandleControlEditorSetViewTarget(
+      const FString &RequestId, const TSharedPtr<FJsonObject> &Payload,
+      TSharedPtr<FMcpBridgeWebSocket> Socket);
   bool HandleControlEditorFocusActor(const FString &RequestId,
                                      const TSharedPtr<FJsonObject> &Payload,
                                      TSharedPtr<FMcpBridgeWebSocket> Socket);

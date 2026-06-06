@@ -16,9 +16,10 @@ TSharedPtr<FJsonObject> MakeToolTextData(const TSharedPtr<FJsonObject>& Data)
 	TSharedPtr<FJsonObject> TextData = MakeShared<FJsonObject>();
 	for (const auto& Field : Data->Values)
 	{
-		if (Field.Key != TEXT("imageBase64"))
+		const FString FieldName(Field.Key.Len(), *Field.Key);
+		if (FieldName != TEXT("imageBase64"))
 		{
-			TextData->SetField(Field.Key, Field.Value);
+			TextData->SetField(FieldName, Field.Value);
 		}
 	}
 	TextData->SetStringField(TEXT("imageBase64"), TEXT("<omitted; see image content>"));

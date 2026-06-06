@@ -8,8 +8,13 @@
 
 #![forbid(unsafe_code)]
 
+pub(crate) mod frustum;
+pub mod geo_world;
+pub mod stream_thread;
 pub mod streaming;
-pub use streaming::{GlobeFrame, RenderTileInfo, StreamError, TileMesh, TilesetWorld};
+pub use geo_world::{GeoRenderFrame, GeoView, GeoWorld};
+pub use stream_thread::{GlobeStreamer, StreamPoll, ViewParams};
+pub use streaming::{StreamError, TileGeometry};
 
 use logi_collada::{decode_collada, ColladaError};
 use logi_geospatial::{Cartographic, Ellipsoid};
@@ -87,11 +92,15 @@ pub fn load_building(dae_xml: &str, jpg_bytes: Vec<u8>, placement: &Placement) -
     // culled (renders nothing in solid mode, visible only in wireframe).
     let indices = mesh.indices;
 
-    let bounds_center = [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, (mn[2] + mx[2]) * 0.5];
-    let bounds_radius = if vcount == 0 {
-        0.0
+    // Guard the empty mesh on BOTH center and radius: with no vertices, `mn`/`mx` are still the
+    // ±INF accumulator seeds, so center would be a meaningless `(MAX + -MAX)`. Emit a degenerate
+    // origin sphere instead.
+    let (bounds_center, bounds_radius) = if vcount == 0 {
+        ([0.0, 0.0, 0.0], 0.0)
     } else {
-        0.5 * ((mx[0] - mn[0]).powi(2) + (mx[1] - mn[1]).powi(2) + (mx[2] - mn[2]).powi(2)).sqrt()
+        let center = [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, (mn[2] + mx[2]) * 0.5];
+        let radius = 0.5 * ((mx[0] - mn[0]).powi(2) + (mx[1] - mn[1]).powi(2) + (mx[2] - mn[2]).powi(2)).sqrt();
+        (center, radius)
     };
 
     let ecef = Ellipsoid::wgs84().cartographic_to_cartesian(Cartographic::from_degrees(

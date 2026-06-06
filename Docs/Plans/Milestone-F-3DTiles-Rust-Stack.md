@@ -299,6 +299,23 @@ Reuse: SSE, culling, LRU cache, scheduler queues/budgets, hysteresis. New: `Tile
 `TraversalDetails`, the kick / `ancestor_meets_sse` flow, per-volume distance. This is **risk #1** —
 golden-test it (9.5).
 
+> **Status (2026-06-06): implemented** in `logi_3dtiles_select` + wired into the `bevy_ecs` Geo World
+> (`logi_3dtiles_scene::geo_world`). Done: per-tile `SelectionResult` cross-frame state
+> (`Selection::state`/`select_tree(prev_state)`), `TraversalDetails` fold, the **kick** (steps 3–5) with
+> `LOADING_DESCENDANT_LIMIT=20`, the hysteresis dead-band (step 2), the `ancestor_meets_sse` coarse-fallback
+> load (step 6 — an active, not-fully-loaded subtree with no loaded ancestor enqueues its own coarse content),
+> and the **view-direction fetch priority** (step 7 — `fetch_priority` blends screen-importance × look-direction
+> alignment). Also done: **frustum-aware LOD** — a `Visibility{Visible,Offscreen,Culled}` classification with an
+> ECEF `ViewFrustum` (`frustum.rs`); in-view tiles refine to `max_screen_space_error`, off-view-in-range to the
+> coarser `culled_screen_space_error` (a resident coarse shell, **shadow-safe** — never hard-culled by
+> direction, since UE casts shadows from a larger-than-view frustum; only distance hard-culls). The camera
+> basis (forward + up + aspect) is plumbed UE→Rust as **ABI v5** (a `LogiGlobeView` struct; the deprecated
+> globe `step` shim was removed). Golden 3-frame trace + per-result-state + fallback-load + priority + frustum
+> (math + in-view-vs-off-view) unit tests are in place (9.5). **Still deferred:** `ADD` refinement (warned +
+> treated as REPLACE — no ADD tileset in the pipeline to validate). A tighter **dilated shadow frustum**
+> (pulled toward the light, clamped to CSM distance) could later hard-cull more off-view tiles once the light
+> direction is plumbed; today off-view stays a conservative coarse shell.
+
 ### 9.3 FFI / ABI delta (version 3 → 4)
 
 The geometry packet is otherwise unchanged (the C++ geometry path is untouched). Additions:

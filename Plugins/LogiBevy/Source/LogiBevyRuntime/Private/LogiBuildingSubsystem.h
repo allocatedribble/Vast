@@ -19,6 +19,7 @@ class LOGIBEVYRUNTIME_API ULogiBuildingSubsystem : public UTickableWorldSubsyste
 	GENERATED_BODY()
 
 public:
+	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
 	virtual bool ShouldCreateSubsystem(UObject* Outer) const override;
 
@@ -28,7 +29,15 @@ public:
 
 private:
 	void LoadAndBuild();
+	/** Destroy the building host so the next tick reloads from current settings (or stays down if hidden). */
+	void TearDown();
 
 	bool bLoaded = false;
 	TWeakObjectPtr<AActor> HostActor;
+
+#if WITH_EDITOR
+	/** Bound to ULogiBevyDeveloperSettings::OnSettingsChanged (editor): flags a reload when a building setting changes. */
+	void OnSettingsChanged(FName ChangedProperty);
+	bool bReloadRequested = false;
+#endif
 };

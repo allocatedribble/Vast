@@ -149,5 +149,77 @@ class DatumTests(unittest.TestCase):
             BakeConfig(lat_deg=39.6, lon_deg=-75.6, radius_m=100.0, generator="lidar")
 
 
+def _has_geo_deps() -> bool:
+    try:
+        import numpy, PIL, pyproj  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+@unittest.skipUnless(_has_geo_deps(), "needs the [geo] extra (numpy/Pillow/pyproj)")
+class TerrariumMosaicTests(unittest.TestCase):
+    """The real-elevation `TerrariumDem` mosaic sampler, tested offline (no network): a fake source whose
+    tiles form one continuous global ramp must sample back as a smooth, strictly-increasing, seam-free
+    surface — the regression net for the vectorized mosaic rewrite (no per-point loop; correct across the
+    source-tile seams a 1-mile AOI straddles)."""
+
+    def test_mosaic_is_vectorized_and_seam_continuous(self) -> None:
+        import numpy as np
+
+        from logi_bake.acquire import TerrariumDem
+
+        class RampTerrarium(TerrariumDem):
+            # Offline: each source tile is an east ramp of its GLOBAL pixel-x, so the assembled mosaic is
+            # one continuous global ramp. A seam/clamp bug would show as a discontinuity or a flat step.
+            def _fetch_tile(self, tx: int, ty: int):  # type: ignore[override]
+                return np.tile(tx * 256.0 + np.arange(256.0), (256, 1))
+
+        dem = RampTerrarium(39.643178, -75.617567, 1609.34, zoom=14)
+        easts = np.linspace(-1609.0, 1609.0, 400).reshape(1, -1)
+        norths = np.zeros((1, 400))
+        h = dem.heights_grid(easts, norths)
+        self.assertEqual(h.shape, (1, 400))
+        self.assertTrue(np.all(np.isfinite(h)))
+        diffs = np.diff(h[0])
+        self.assertTrue(np.all(diffs > 0.0), "east ramp must be strictly increasing")
+        self.assertLess(float(diffs.max()), 5.0 * float(diffs.mean()), "no seam discontinuity across tiles")
+        # The scalar height() wrapper agrees with the grid path at the same point.
+        self.assertAlmostEqual(
+            dem.height(12.0, -7.0),
+            float(dem.heights_grid(np.array([[12.0]]), np.array([[-7.0]]))[0, 0]),
+        )
+
+    def test_mosaic_is_seam_continuous_along_north(self) -> None:
+        # Companion to the east sweep: a NORTH ramp exercises the ty0 / row-stride mapping the east-only
+        # ramp leaves untested (a flipped or mis-strided Y passes that test but would break here).
+        import numpy as np
+
+        from logi_bake.acquire import TerrariumDem
+
+        class NorthRampTerrarium(TerrariumDem):
+            # Each tile is a SOUTH ramp of its GLOBAL pixel-y (slippy-tile rows increase southward), so the
+            # assembled mosaic is one continuous global vertical ramp.
+            def _fetch_tile(self, tx: int, ty: int):  # type: ignore[override]
+                col = (ty * 256.0 + np.arange(256.0)).reshape(256, 1)
+                return np.tile(col, (1, 256))
+
+        dem = NorthRampTerrarium(39.643178, -75.617567, 1609.34, zoom=14)
+        norths = np.linspace(-1609.0, 1609.0, 400).reshape(-1, 1)
+        easts = np.zeros((400, 1))
+        h = dem.heights_grid(easts, norths)
+        self.assertEqual(h.shape, (400, 1))
+        self.assertTrue(np.all(np.isfinite(h)))
+        diffs = np.diff(h[:, 0])
+        # Going north decreases the global slippy-tile y, so the sampled south-ramp value strictly DECREASES.
+        self.assertTrue(np.all(diffs < 0.0), "north sweep must be strictly monotonic (Y mapping correct)")
+        self.assertLess(
+            float(np.abs(diffs).max()),
+            5.0 * float(np.abs(diffs).mean()),
+            "no seam discontinuity across tiles north–south",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

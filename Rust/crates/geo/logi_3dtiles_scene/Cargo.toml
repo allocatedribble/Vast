@@ -25,3 +25,8 @@ logi_3dtiles_ion = { path = "../logi_3dtiles_ion" }
 bytemuck = "1"
 # Surface external-tileset graft failures (audit M17) instead of silently dropping the subtree.
 tracing = { workspace = true }
+# Geo ECS orchestration (ADR-0012 Addendum A): tiles become entities and the stream thread runs a bevy_ecs
+# schedule whose heavy systems `par_iter` on the SHARED ComputeTaskPool. This is the one geo crate that takes
+# a bevy dependency — the orchestration layer. Rationale + constraints: Docs/Research/ECS-Multithreading-for-Geo.md.
+bevy_ecs = { workspace = true }
+bevy_tasks = { workspace = true }
