@@ -1,0 +1,16 @@
+[package]
+name = "logi_3dtiles_ion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# Cesium ion asset-endpoint resolver (ADR-0009 Milestone F). The blocking HTTP client (ureq + rustls, no
+# tokio) is reached through the shared timeout-bounded agent in logi_3dtiles_io so both network paths share
+# one connection pool and the same connect/read/write/overall timeouts (audit H9) — ureq is therefore a
+# transitive dep via that crate, not a direct one here.
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+logi_3dtiles_io = { path = "../logi_3dtiles_io" }

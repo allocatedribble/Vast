@@ -22,7 +22,7 @@ use logi_sim::resources::{SimClock, UnrealFrameInput};
 /// instead of drifting every frame as a continuous camera position would force.
 /// Deliberately FINE (256 m) — small per-agent transforms need tight f32 precision
 /// near the camera. (Contrast the much coarser TERRAIN rebase grid,
-/// logi_terrain_scene REBASE_SNAP = 2048 m: big terrain tiles tolerate a far origin,
+/// the retired render-scene crate REBASE_SNAP = 2048 m: big terrain tiles tolerate a far origin,
 /// so a wide grid means rarer rebuilds. Different precision needs, different grids.)
 pub const ORIGIN_GRID_CM: f64 = 25_600.0;
 
@@ -45,6 +45,9 @@ pub struct LogiInstanceUpdate {
     pub stable_instance_slot: u32,
     /// Row-major 3x4 affine (cols 0-2 = rotation*scale, col 3 = translation).
     pub transform_3x4: [f32; 12],
+    /// Per-instance custom data uploaded to the ISM (e.g. material params). Part of
+    /// the ABI struct, but the extract currently emits all-zeros: no system writes
+    /// per-instance custom data yet. Reserved so adding one needs no ABI bump.
     pub custom_data: [f32; 8],
     pub flags: u32,
 }
@@ -308,7 +311,7 @@ pub fn extract_render_snapshot(
                         entity: id.0,
                         stable_instance_slot: u32::MAX, // Unreal assigns/keeps the slot.
                         transform_3x4: transform_to_3x4(&transform, origin),
-                        custom_data: [0.0; 8],
+                        custom_data: [0.0; 8], // reserved (see field doc): no per-instance data source yet.
                         flags: renderable.flags.0,
                     },
                 ));
@@ -378,21 +381,33 @@ pub fn extract_render_snapshot(
     }
 }
 
-/// Marshal the pointer-bearing C batch array from the resource (called at the
-/// FFI boundary). `out` is owned by the runtime (not a Resource), so raw
-/// pointers into `snapshot.instances` are allowed. Valid until the next tick.
-pub fn build_ffi_batches(snapshot: &RenderSnapshotResource, out: &mut Vec<LogiStaticBatch>) {
+/// Marshal the pointer-bearing C batch array (the SINGLE home for this `unsafe`
+/// pointer-baking; the runtime's `SnapshotRing::publish` calls this instead of
+/// re-implementing it — audit M24). Each emitted `LogiStaticBatch.instances` points
+/// at `instances_base + meta.offset`; `out` must be owned non-resource storage (raw
+/// pointers may not live in a `Send + Sync` resource).
+///
+/// # Safety
+/// `instances_base` must point to the start of a contiguous instance buffer that
+/// outlives `out`, and every `meta.offset + meta.count` in `metas` must be in
+/// bounds of that buffer. The produced pointers are valid only while that buffer
+/// is neither freed nor reallocated.
+pub unsafe fn build_ffi_batches(
+    instances_base: *const LogiInstanceUpdate,
+    metas: &[BatchMeta],
+    out: &mut Vec<LogiStaticBatch>,
+) {
     out.clear();
-    out.reserve(snapshot.batch_metas.len());
-    let base = snapshot.instances.as_ptr();
-    for meta in &snapshot.batch_metas {
+    out.reserve(metas.len());
+    for meta in metas {
         out.push(LogiStaticBatch {
             mesh: meta.mesh,
             material: meta.material,
             lod: meta.lod,
             instance_count: meta.count,
-            // SAFETY: offset is within `instances`, which is not mutated until the next tick.
-            instances: unsafe { base.add(meta.offset as usize) },
+            // SAFETY: caller guarantees `offset` is within the buffer at `instances_base`,
+            // which outlives `out` and is not reallocated while these pointers are used.
+            instances: unsafe { instances_base.add(meta.offset as usize) },
         });
     }
 }

@@ -1,5 +1,7 @@
 # Milestone F — Native Rust 3D Tiles & Real-World Terrain Stack
 
+> **2026-06-05 — renamed to the Geo engine.** The terrain / real-world-earth stack is now `Rust/crates/geo/` (`logi_geo_*` plus the 3D-Tiles / geospatial / semantic crates), cdylib `logi_geo.dll`, C++ `ULogiBakedGeoSubsystem`. The `logi_terrain*` / `LogiTerrain*` / `logi_terrain.dll` names below are historical (pre-rename); see [AGENTS.md](../../AGENTS.md) §4.
+
 **Status:** Plan (2026-06-04). Seeds **ADR-0009** (decision + consequences).
 **Author context:** synthesised from a 5-agent research pass (quantized-mesh format, cesium-native
 architecture, UE 5.8 MeshTerrainMode, glTF→Unreal render shim + KML/COLLADA, cost/pricing) plus a

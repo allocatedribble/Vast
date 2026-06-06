@@ -1,0 +1,13 @@
+[package]
+name = "logi_collada"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# Runtime COLLADA loader for the AGI_HQ sample (ADR-0009 Milestone F, user decision #3). dae-parser
+# models the COLLADA 1.4.1 data model; we resolve sources + de-index triangles ourselves.
+dae-parser = "0.11"
+# Shared vertex-layout home: the 32-byte interleave (AGENTS.md §1A).
+logi_geo_mesh = { path = "../logi_geo_mesh" }

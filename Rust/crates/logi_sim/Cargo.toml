@@ -9,4 +9,4 @@ bevy_ecs.workspace = true
 bevy_tasks.workspace = true
 logi_schema = { path = "../logi_schema" }
 # Coarse deterministic ground for gameplay queries (ADR-0007 / plan §10).
-logi_terrain_procgen = { path = "../logi_terrain_procgen" }
+logi_geo_procgen = { path = "../geo/logi_geo_procgen" }

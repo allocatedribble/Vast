@@ -12,16 +12,18 @@ use std::collections::HashMap;
 use std::thread::ThreadId;
 
 use logi_render_extract::{
-    extract_render_snapshot, LogiActorUpdate, LogiInstanceUpdate, LogiStaticBatch, RenderSnapshotResource,
+    build_ffi_batches, extract_render_snapshot, LogiActorUpdate, LogiInstanceUpdate, LogiStaticBatch,
+    RenderSnapshotResource,
 };
 #[cfg(feature = "editor_inspector")]
 use logi_schema::LogiEntitySummary;
 use logi_schema::{LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnCommand, LOGI_FLAG_FORCE_SINGLE_THREADED};
 use logi_sim::components::{
-    Agent, CullState, Renderable, Representation, Shipment, Simulated, StableId, Transform3d, Velocity3d,
+    Agent, AnimationDrive, CullState, Renderable, Representation, Shipment, Simulated, StableId, Transform3d,
+    Velocity3d,
 };
 use logi_sim::resources::{RepresentationBudget, SimClock, SimRng, TerrainResource, UnrealFrameInput};
-use logi_sim::schedules::{LogiSchedulerMode, LogiSchedules};
+use logi_sim::schedules::{run_if_populated, LogiSchedulerMode, LogiSchedules};
 use logi_sim::terrain::Terrain;
 
 /// Captured at creation (from the FFI `LogiInitDesc`).
@@ -102,6 +104,9 @@ struct SnapshotRing {
 impl SnapshotRing {
     fn new() -> Self {
         Self {
+            // All slots start `retired` (the `SnapshotSlot::default()` invariant) and `published` is
+            // `None`, so the very first `publish` always finds a free slot and can never drop a frame
+            // or overwrite a buffer Unreal is reading.
             slots: [
                 SnapshotSlot::default(),
                 SnapshotSlot::default(),
@@ -141,20 +146,16 @@ impl SnapshotRing {
             slot.despawns.extend_from_slice(&scratch.despawns);
             slot.retired = false;
 
-            // Build the pointer-bearing C batch array into THIS slot's instances.
-            slot.ffi_batches.clear();
-            slot.ffi_batches.reserve(scratch.batch_metas.len());
+            // Build the pointer-bearing C batch array into THIS slot's instances via the single
+            // shared marshaller (audit M24: no duplicated pointer-baking `unsafe` here). The metas
+            // came from `scratch`, but the pointers must base off the SLOT's own copy, which is
+            // stable until the slot is reused.
             let base = slot.instances.as_ptr();
-            for meta in &scratch.batch_metas {
-                slot.ffi_batches.push(LogiStaticBatch {
-                    mesh: meta.mesh,
-                    material: meta.material,
-                    lod: meta.lod,
-                    instance_count: meta.count,
-                    // SAFETY: offset is within this slot's instances, stable until reuse.
-                    instances: unsafe { base.add(meta.offset as usize) },
-                });
-            }
+            // SAFETY: `base` is this slot's instance buffer; every `scratch.batch_metas` offset/count
+            // indexes the instances just copied from the same scratch (`extend_from_slice` above), so
+            // the bounds match; the slot's `instances` outlives `ffi_batches` and is not reallocated
+            // until this slot is reused (≥ 2 ticks away, guarded by the drop fence).
+            unsafe { build_ffi_batches(base, &scratch.batch_metas, &mut slot.ffi_batches) };
         }
         self.published = Some(idx);
         true
@@ -162,6 +163,17 @@ impl SnapshotRing {
 
     fn published(&self) -> Option<&SnapshotSlot> {
         self.published.map(|i| &self.slots[i])
+    }
+
+    /// Look up a still-live snapshot slot by id (`0` ⇒ the currently-published "latest").
+    /// A non-zero id resolves across ALL ring slots — not just the latest — so a consumer
+    /// can still read a snapshot it has not yet released even after a newer one published
+    /// (the ring keeps up to three live; audit M28). A retired slot is never returned.
+    fn find(&self, id: u64) -> Option<&SnapshotSlot> {
+        if id == 0 {
+            return self.published();
+        }
+        self.slots.iter().find(|s| s.id == id && !s.retired)
     }
 
     /// Retire (mark free) the slot with `id`. Returns true if found.
@@ -174,6 +186,19 @@ impl SnapshotRing {
         }
         false
     }
+}
+
+/// A borrowed view of one live snapshot ring slot, returned by
+/// [`LogiWorld::render_snapshot`]. The slices borrow the slot's owned buffers and stay valid as long
+/// as the slot is neither retired (`logi_buffer_release`) nor reused by a later `publish` — see the
+/// FFI `LogiRenderSnapshot` contract. No Bevy pointers; ABI-stable owned copies.
+pub struct SnapshotView<'a> {
+    pub id: u64,
+    pub sim_tick: u64,
+    pub world_origin_cm: [f64; 3],
+    pub static_batches: &'a [LogiStaticBatch],
+    pub actor_updates: &'a [LogiActorUpdate],
+    pub despawns: &'a [LogiEntityId],
 }
 
 /// The whole simulation world for one shard (the §11 `Runtime`).
@@ -209,8 +234,8 @@ impl LogiWorld {
         let mut world = World::new();
         world.insert_resource(SimClock { tick: 0, fixed_hz: hz });
         world.insert_resource(SimRng::new(config.deterministic_seed));
-        // Terrain is the CANONICAL shared field (logi_terrain_procgen::canonical) — the SAME surface
-        // the renderer draws (logi_terrain_scene), so agents sit on the terrain you see. The terrain
+        // Terrain is the CANONICAL shared field (logi_geo_procgen::canonical) — the SAME surface
+        // the renderer draws (the retired render-scene crate), so agents sit on the terrain you see. The terrain
         // is a fixed designed world; deterministic_seed drives agent RNG, not terrain geography.
         // (Supersedes audit M1's per-seed terrain: the holistic fix is one shared field, not two.)
         world.insert_resource(TerrainResource(Terrain::canonical()));
@@ -261,17 +286,24 @@ impl LogiWorld {
     /// auto-allocated id can never collide with an externally-supplied `requested_id`
     /// (which would orphan the prior entity). Deterministic: the live-index set is a
     /// pure function of the spawn sequence, so the same sequence yields the same ids.
+    ///
+    /// Index advance uses `checked_add` (audit Low): a bare `+=` would debug-panic
+    /// (a panic must not cross the FFI) and silently wrap in release. On the
+    /// astronomically-unreachable `u64` overflow we wrap the search back to 1 (never
+    /// 0 — index 0 is the invalid/default sentinel); a free slot is then guaranteed
+    /// unless 2^64 indices are live, which cannot happen.
     fn allocate_id(&mut self, kind: u16) -> LogiEntityId {
         while self.used_indices.contains(&self.next_index) {
-            self.next_index += 1;
+            self.next_index = self.next_index.checked_add(1).unwrap_or(1);
         }
+        let index = self.next_index;
         let id = LogiEntityId {
-            index: self.next_index,
+            index,
             generation: 1,
             shard: self.shard,
             kind,
         };
-        self.next_index += 1;
+        self.next_index = self.next_index.checked_add(1).unwrap_or(1);
         id
     }
 
@@ -309,6 +341,12 @@ impl LogiWorld {
                 Renderable::default(),
                 Representation::default(),
                 CullState::default(),
+                // Animation-drive lane (audit M26): every spawned entity carries this so the
+                // render-extract actor path treats the lane as live (its `Option<AnimationDrive>`
+                // resolves to `Some` and carries the entity's `anim_graph` + locomotion params)
+                // rather than always emitting defaults. The component starts at its inert default;
+                // a locomotion system (not yet present) will write it as agents move.
+                AnimationDrive::default(),
                 Agent::default(),
                 Shipment {
                     id: Default::default(),
@@ -375,16 +413,20 @@ impl LogiWorld {
         intents: &[LogiPlayerIntent],
     ) -> TickOutcome {
         self.ingest_input(cameras, intents);
-        self.schedules.input_ingest.run(&mut self.world);
+        // Reserved/empty phases are skipped (audit M25): `run_if_populated` runs a schedule only when
+        // it has systems, so empty phases cost nothing per step but still run automatically once a
+        // system is added. `ingest_input` already applied the FFI input above (the InputIngest
+        // schedule is reserved for systems that derive from it).
+        run_if_populated(&mut self.schedules.input_ingest, &mut self.world);
 
         // f64 accumulator; the f32 frame delta is widened once here. Determinism
         // comes from the constant `fixed_dt` per step, not this wall-clock input.
         self.accumulator += f64::from(frame_delta_seconds.max(0.0));
         let mut steps_run = 0u32;
         while self.accumulator >= self.fixed_dt && steps_run < max_fixed_steps {
-            self.schedules.fixed_pre_sim.run(&mut self.world);
-            self.schedules.fixed_sim.run(&mut self.world);
-            self.schedules.fixed_post_sim.run(&mut self.world);
+            run_if_populated(&mut self.schedules.fixed_pre_sim, &mut self.world);
+            run_if_populated(&mut self.schedules.fixed_sim, &mut self.world);
+            run_if_populated(&mut self.schedules.fixed_post_sim, &mut self.world);
             increment_sim_tick(&mut self.world);
             self.accumulator -= self.fixed_dt;
             steps_run += 1;
@@ -396,9 +438,9 @@ impl LogiWorld {
             dropped += 1;
         }
 
-        self.schedules.representation_plan.run(&mut self.world);
-        self.schedules.render_extract.run(&mut self.world); // fills the scratch resource
-        self.schedules.maintenance.run(&mut self.world);
+        run_if_populated(&mut self.schedules.representation_plan, &mut self.world);
+        run_if_populated(&mut self.schedules.render_extract, &mut self.world); // fills the scratch resource
+        run_if_populated(&mut self.schedules.maintenance, &mut self.world);
 
         // Publish the scratch into a fresh ring slot (ABI-stable copy).
         let scratch_id = self.world.resource::<RenderSnapshotResource>().snapshot_id;
@@ -476,6 +518,21 @@ impl LogiWorld {
         self.ring.published().map(|s| s.despawns.as_slice()).unwrap_or(&[])
     }
 
+    /// Borrow a still-live snapshot by id (`0` ⇒ latest), resolved across ALL ring slots so a
+    /// consumer can read a snapshot it has not yet released even after a newer one published
+    /// (audit M28). Returns `None` if the id is unknown or already retired.
+    pub fn render_snapshot(&self, id: u64) -> Option<SnapshotView<'_>> {
+        let slot = self.ring.find(id)?;
+        Some(SnapshotView {
+            id: slot.id,
+            sim_tick: slot.sim_tick,
+            world_origin_cm: slot.world_origin_cm,
+            static_batches: slot.ffi_batches.as_slice(),
+            actor_updates: slot.actor_updates.as_slice(),
+            despawns: slot.despawns.as_slice(),
+        })
+    }
+
     // --- Editor introspection (ADR-0006; `editor_inspector` feature only) ---
 
     /// Pin/unpin an entity for editor debug focus.
@@ -490,26 +547,35 @@ impl LogiWorld {
 
     /// Fill the editor query buffer with a page of entity summaries; returns the
     /// total entity count (for the editor's paging). Sampled (5-10 Hz), not hot.
+    ///
+    /// Single pass (audit M27): the page is pushed DIRECTLY into the reused
+    /// `editor_query_buf` while the query is iterated once, and `total` is summed in
+    /// the same walk — no separate count scan and no throwaway intermediate `Vec`.
     #[cfg(feature = "editor_inspector")]
     pub fn editor_query_entities(&mut self, offset: u32, limit: u32) -> u32 {
         use logi_sim::components::{Representation, StableId, Transform3d};
+        // Build the QueryState first (needs `&mut self.world`; that borrow ends here), then split the
+        // remaining borrows so the immutable iteration over `self.world` and the mutable push into the
+        // disjoint `editor_query_buf` (reading the disjoint `pinned`) can coexist in one pass.
         let mut state = self.world.query::<(&StableId, &Transform3d, &Representation)>();
-        let total = state.iter(&self.world).count() as u32;
-        let rows: Vec<(LogiEntityId, [f64; 3], f32, u8)> = state
-            .iter(&self.world)
-            .skip(offset as usize)
-            .take(limit as usize)
-            .map(|(sid, t, rep)| (sid.0, t.translation_cm, rep.significance, rep.current_tier as u8))
-            .collect();
-        self.editor_query_buf.clear();
-        for (id, position_cm, significance, representation_tier) in rows {
-            let pinned = u8::from(self.pinned.contains(&id));
-            self.editor_query_buf.push(LogiEntitySummary {
-                id,
-                position_cm,
-                significance,
-                representation_tier,
-                pinned,
+        let world = &self.world;
+        let pinned = &self.pinned;
+        let buf = &mut self.editor_query_buf;
+        buf.clear();
+        let (offset, limit) = (offset as usize, limit as usize);
+        let mut total: u32 = 0;
+        for (i, (sid, t, rep)) in state.iter(world).enumerate() {
+            total = total.saturating_add(1);
+            // Keep only the requested page; still count every row for paging.
+            if i < offset || buf.len() >= limit {
+                continue;
+            }
+            buf.push(LogiEntitySummary {
+                id: sid.0,
+                position_cm: t.translation_cm,
+                significance: rep.significance,
+                representation_tier: rep.current_tier as u8,
+                pinned: u8::from(pinned.contains(&sid.0)),
                 _pad: [0; 2],
             });
         }
@@ -597,6 +663,27 @@ mod tests {
         let b = w.tick(0.0625, 8, &[], &[]).render_snapshot_id;
         assert!(b > a);
         assert_eq!(w.snapshot_id(), b);
+    }
+
+    /// M28: a still-live, non-latest snapshot id resolves across the ring (not just the
+    /// published "latest"); id 0 means latest; a retired/unknown id resolves to None.
+    #[test]
+    fn render_snapshot_resolves_nonlatest_live_ids() {
+        let mut w = LogiWorld::new(cfg(1));
+        w.submit_spawn_commands(&[spawn_cmd(10, 1.0)]);
+        // Publish A and B without releasing either — both slots stay live.
+        let a = w.tick(0.0625, 8, &[], &[]).render_snapshot_id;
+        let b = w.tick(0.0625, 8, &[], &[]).render_snapshot_id;
+        assert_ne!(a, b);
+        // id 0 == latest (B); the older A still resolves while live.
+        assert_eq!(w.render_snapshot(0).map(|v| v.id), Some(b));
+        assert_eq!(w.render_snapshot(a).map(|v| v.id), Some(a));
+        assert_eq!(w.render_snapshot(b).map(|v| v.id), Some(b));
+        // An unknown id resolves to None...
+        assert!(w.render_snapshot(a.wrapping_add(b).wrapping_add(999)).is_none());
+        // ...and a retired id no longer resolves.
+        assert!(w.release_snapshot(a));
+        assert!(w.render_snapshot(a).is_none());
     }
 
     #[test]
@@ -714,7 +801,7 @@ mod tests {
         assert_eq!(published.actor_updates[0].entity.index, 50);
     }
 
-    /// The terrain is the CANONICAL shared field — the same surface the renderer (logi_terrain_scene)
+    /// The terrain is the CANONICAL shared field — the same surface the renderer (the retired render-scene crate)
     /// draws — so it deliberately does NOT vary with the world seed (a fixed designed world; the seed
     /// drives agent RNG, not terrain geography). Supersedes M1's per-seed terrain.
     #[test]
@@ -734,7 +821,7 @@ mod tests {
             sample_world(2),
             "terrain must be the canonical shared field, independent of seed"
         );
-        // ...and it equals Terrain::canonical (the exact field logi_terrain_scene renders).
+        // ...and it equals Terrain::canonical (the exact field the retired render-scene crate renders).
         let canonical = Terrain::canonical()
             .sample_surface(LogiTileId::new(1), 1234.0, 5678.0)
             .height_cm;

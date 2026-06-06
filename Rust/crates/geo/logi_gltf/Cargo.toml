@@ -1,0 +1,18 @@
+[package]
+name = "logi_gltf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# `utils` gives the accessor Reader; default-features off avoids the filesystem-import + image deps
+# (we extract raw texture bytes, decode them on the renderer side). `KHR_materials_unlit` so the gltf
+# crate accepts Google P3DT tiles (they list it as a REQUIRED extension); P3DT is otherwise plain glTF
+# (no Draco / no KTX2), so the standard accessor reader decodes the geometry directly.
+gltf = { version = "1", default-features = false, features = ["utils", "KHR_materials_unlit"] }
+# Compose the glTF node hierarchy's world transforms (P3DT bakes each tile's ECEF placement into its
+# node transform — the renderer MUST apply it, else geometry collapses to the geocenter).
+glam = { workspace = true }
+# Shared vertex-layout home: interleave + VERTEX_STRIDE (AGENTS.md §1A — one home per shared contract).
+logi_geo_mesh = { path = "../logi_geo_mesh" }

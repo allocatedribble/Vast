@@ -1,0 +1,18 @@
+# INTENTIONALLY STANDALONE (audit DEP-1): this is staged Milestone-F code — the OGC 3D Tiles *implicit
+# tiling* codec (subtree parse, Morton, availability bitstreams). It is not yet consumed by any crate; its
+# planned consumer is `logi_3dtiles_scene` (synthesizing implicit children during traversal). It is kept in
+# the workspace ON PURPOSE so CI builds/tests/clippy it and it cannot rot before that wiring lands — it is
+# not an accidental orphan. (When wired, also take `logi_3dtiles_tileset::SubdivisionScheme` instead of a
+# raw arity `u32` — audit DUP-6.) Drop it from `[workspace] members` only if Milestone-F implicit streaming
+# is abandoned.
+[package]
+name = "logi_3dtiles_implicit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

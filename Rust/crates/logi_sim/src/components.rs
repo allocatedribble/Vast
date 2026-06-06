@@ -71,7 +71,10 @@ pub struct AnimationDrive {
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct DirtyTransform;
 
-/// Visibility/culling state, fed by Unreal camera data; drives significance.
+/// Visibility/culling state. **Reserved**: no culling/frustum system populates it
+/// yet, so `compute_significance` does not read it (audit Low — significance is
+/// camera-proximity only for now). It rides on spawned entities so the future
+/// culling system can fill it and feed a screen-area significance term.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct CullState {
     pub visible_to_any_camera: bool,

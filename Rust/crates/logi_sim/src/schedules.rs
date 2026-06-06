@@ -8,21 +8,32 @@ use bevy_tasks::{ComputeTaskPool, TaskPoolBuilder};
 
 /// The hard phase boundaries of a single tick. Each runs to completion before
 /// the next, in the order the runtime drives them.
+///
+/// Several phases are **reserved**: they have no systems yet and the runtime skips
+/// running them while empty (audit M25 — an empty schedule still has executor
+/// overhead per step). They exist so future work lands in the right phase without
+/// reshuffling the treaty; add a system via `LogiSchedules::new` and the runtime
+/// begins running that phase automatically.
 #[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LogiSchedule {
     /// Apply ingested Unreal input (cameras, player intent) into the World.
+    /// **Reserved**: the runtime currently ingests input directly into
+    /// `UnrealFrameInput` (the data arrives as FFI call args, not yet World state),
+    /// so this schedule holds no systems. Reserved for input-derived systems that
+    /// read the freshly-ingested resource.
     InputIngest,
-    /// Per fixed step: setup before the authoritative sim.
+    /// Per fixed step: setup before the authoritative sim. **Reserved** (empty).
     FixedPreSim,
     /// Per fixed step: the authoritative gameplay systems.
     FixedSim,
-    /// Per fixed step: cleanup/derive after the sim.
+    /// Per fixed step: cleanup/derive after the sim. **Reserved** (empty).
     FixedPostSim,
     /// Once per frame: compute representation/significance plan.
     RepresentationPlan,
     /// Once per frame: prepare the render snapshot.
     RenderExtract,
     /// Once per frame: housekeeping (recycle ids, compact, telemetry).
+    /// **Reserved** (empty).
     Maintenance,
 }
 
@@ -47,9 +58,25 @@ pub struct LogiSchedules {
     pub maintenance: Schedule,
 }
 
+/// Run a phase schedule only if it has any systems (audit M25): the reserved
+/// phases are empty, and running an empty schedule still pays the executor's
+/// per-step setup. `systems_len()` reflects systems added at build time even
+/// before the first run, so a phase that later gains a system runs automatically.
+#[inline]
+pub fn run_if_populated(schedule: &mut Schedule, world: &mut World) {
+    if schedule.systems_len() > 0 {
+        schedule.run(world);
+    }
+}
+
 /// Worker-thread policy: `clamp(requested, 1, max(1, cores - reserved))`.
 /// Never "all cores" — leave headroom for Unreal's game/render threads.
-/// (Uses logical cores as a proxy; refine with physical-core detection later.)
+///
+/// TODO(perf, audit Low): uses LOGICAL cores as a proxy for the core budget.
+/// Hyperthreaded logical cores are not full execution resources, so on SMT CPUs
+/// this can over-subscribe the compute pool versus Unreal. Refine with
+/// physical-core detection (e.g. a `num_cpus::get_physical()`-style probe) and
+/// re-tune `UNREAL_RESERVED_THREADS` once measured on target hardware.
 pub fn resolve_worker_thread_count(requested: u32) -> usize {
     const UNREAL_RESERVED_THREADS: usize = 2;
     let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);

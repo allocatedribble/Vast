@@ -1,5 +1,7 @@
 # ADR-0007 — Actorless Rust terrain for Unreal
 
+> **2026-06-05 — renamed to the Geo engine.** The terrain / real-world-earth stack is now `Rust/crates/geo/` (`logi_geo_*` plus the 3D-Tiles / geospatial / semantic crates), cdylib `logi_geo.dll`, C++ `ULogiBakedGeoSubsystem`. The `logi_terrain*` / `LogiTerrain*` / `logi_terrain.dll` names below are historical (pre-rename); see [AGENTS.md](../../AGENTS.md) §4.
+
 - **Status:** Accepted (2026-06-02)
 - **Supersedes (in part):** [ADR-0005](ADR-0005-Bevy-ECS-Authority.md) — the clause
   that listed terrain host `AActor`s as an allowed Unreal shell zone.

@@ -1,5 +1,7 @@
 # ADR-0009 — Native Rust OGC 3D Tiles & real-world terrain stack
 
+> **2026-06-05 — renamed to the Geo engine.** The terrain / real-world-earth stack is now `Rust/crates/geo/` (`logi_geo_*` plus the 3D-Tiles / geospatial / semantic crates), cdylib `logi_geo.dll`, C++ `ULogiBakedGeoSubsystem`. The `logi_terrain*` / `LogiTerrain*` / `logi_terrain.dll` names below are historical (pre-rename); see [AGENTS.md](../../AGENTS.md) §4.
+
 - **Status:** Accepted (2026-06-04)
 - **Implements:** [ADR-0007](ADR-0007-Actorless-Rust-Terrain.md) — the "provider adapters (native +
   **Cesium**)" it names; the LOD/SSE/streaming it assigns to Rust now also covers OGC 3D Tiles tilesets.

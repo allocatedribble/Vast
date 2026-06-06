@@ -41,7 +41,7 @@ void LogiBuildTileSection(
 	const uint8* Vertices, uint32 Stride, uint64 VerticesLen, uint32 VertexCount,
 	const uint8* Indices, uint32 IndexCount);
 
-#if LOGI_TERRAIN_NANITE_LANE
+#if LOGI_GEO_NANITE_LANE
 /// Build a transient, Nanite-enabled UStaticMesh from the same 32-byte contract (editor-only encode path,
 /// ADR-0008). Kernel-supplied normals are preserved (no per-tile recompute → no cross-tile lighting
 /// seams). Returns nullptr on a degenerate/empty tile. The build is ASYNC (encode on the static-mesh

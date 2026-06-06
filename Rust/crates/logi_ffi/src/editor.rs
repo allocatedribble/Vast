@@ -5,10 +5,12 @@
 //! are paged + sampled (5-10 Hz), never per-row, and every mutation funnels
 //! through the same owner-thread guard as the runtime ABI (§11).
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
 use logi_runtime::LogiWorld;
 use logi_schema::{LogiEntityId, LogiEntitySummary};
 
-use crate::{clear_err, write_err, FfiError, LogiError, LOGI_ERR_NULL, LOGI_ERR_WRONG_THREAD, LOGI_OK};
+use crate::{clear_err, write_err, FfiError, LogiError, LOGI_ERR_NULL, LOGI_ERR_PANIC, LOGI_ERR_WRONG_THREAD, LOGI_OK};
 
 /// Paged entity query (in). `limit == 0` means "no cap" (all from `offset`).
 #[repr(C)]
@@ -51,20 +53,30 @@ pub unsafe extern "C" fn logi_editor_query_entities(
         write_err(err, &FfiError::WrongThread("logi_editor_query_entities"));
         return LOGI_ERR_WRONG_THREAD;
     }
-    let q = unsafe { &*query };
-    let limit = if q.limit == 0 { u32::MAX } else { q.limit };
-    let total = w.editor_query_entities(q.offset, limit);
-    let entities = w.editor_entities();
-    // SAFETY: out_packet non-null (checked); `entities` points into the world's
-    // single editor buffer, valid until the next query.
-    unsafe {
-        *out_packet = LogiEntityInspectorPacket {
-            entity_count: entities.len() as u32,
-            total_count: total,
-            entities: entities.as_ptr(),
-        };
+    // `editor_query_entities` runs a Bevy `world.query()` + buffer fill that can panic;
+    // a panic must never unwind across the C ABI (UB), so catch it here like the runtime fns.
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let q = unsafe { &*query };
+        let limit = if q.limit == 0 { u32::MAX } else { q.limit };
+        let total = w.editor_query_entities(q.offset, limit);
+        let entities = w.editor_entities();
+        // SAFETY: out_packet non-null (checked); `entities` points into the world's
+        // single editor buffer, valid until the next query.
+        unsafe {
+            *out_packet = LogiEntityInspectorPacket {
+                entity_count: entities.len() as u32,
+                total_count: total,
+                entities: entities.as_ptr(),
+            };
+        }
+    }));
+    match result {
+        Ok(()) => LOGI_OK,
+        Err(_) => {
+            write_err(err, &FfiError::Panic("logi_editor_query_entities"));
+            LOGI_ERR_PANIC
+        }
     }
-    LOGI_OK
 }
 
 /// Pin/unpin an entity for editor debug focus. Owner-thread only.
@@ -90,6 +102,12 @@ pub unsafe extern "C" fn logi_editor_set_debug_pin(
         write_err(err, &FfiError::WrongThread("logi_editor_set_debug_pin"));
         return LOGI_ERR_WRONG_THREAD;
     }
-    w.editor_set_pin(id, pinned != 0);
-    LOGI_OK
+    // A `HashSet` insert/remove can panic (allocation); catch it so no panic crosses the C ABI.
+    match catch_unwind(AssertUnwindSafe(|| w.editor_set_pin(id, pinned != 0))) {
+        Ok(()) => LOGI_OK,
+        Err(_) => {
+            write_err(err, &FfiError::Panic("logi_editor_set_debug_pin"));
+            LOGI_ERR_PANIC
+        }
+    }
 }

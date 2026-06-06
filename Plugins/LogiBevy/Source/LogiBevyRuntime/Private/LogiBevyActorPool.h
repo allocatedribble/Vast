@@ -4,10 +4,12 @@
 
 #include "CoreMinimal.h"
 #include "UObject/WeakObjectPtr.h"
+#include "UObject/StrongObjectPtr.h"
 #include "logi_bevy_ffi.h"
 
 class UWorld;
 class AStaticMeshActor;
+class UStaticMesh;
 class ULogiBevyAssetRegistry;
 
 /**
@@ -43,10 +45,13 @@ private:
 	FVector FrameOrigin = FVector::ZeroVector;
 	TMap<uint64 /*entity index*/, TWeakObjectPtr<AStaticMeshActor>> EntityToActor;
 	TArray<TWeakObjectPtr<AStaticMeshActor>> Pool;
+	/// Engine-cube fallback, loaded once and GC-rooted (audit C++ L6): a LoadObject per spawned actor was a
+	/// needless synchronous registry lookup. Resolved lazily on the first fallback.
+	TStrongObjectPtr<UStaticMesh> CubeFallback;
 
-	AStaticMeshActor* AcquireActor(const FVector& Location, const LogiActorUpdate& Update);
+	UStaticMesh* GetCubeFallback();
+	AStaticMeshActor* AcquireActor(const FTransform& Xform, const LogiActorUpdate& Update);
 	void HideAndPool(AStaticMeshActor* Actor);
-	AStaticMeshActor* SpawnActor(const FVector& Location, const LogiActorUpdate& Update);
+	AStaticMeshActor* SpawnActor(const FTransform& Xform, const LogiActorUpdate& Update);
 	UStaticMesh* ResolveMeshFor(const LogiActorUpdate& Update) const;
-	static FVector TranslationOf(const LogiActorUpdate& Update);
 };

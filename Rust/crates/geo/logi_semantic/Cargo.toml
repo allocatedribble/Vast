@@ -1,0 +1,29 @@
+[package]
+name = "logi_semantic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# WIP: the future voxel terrain lane (dual contouring / SDF). Off by default — compiles a skeleton only.
+voxel = []
+
+[dependencies]
+# The fetch contract BakedTileSource implements (RequestId / Loaded / TileContentSource).
+logi_3dtiles_io = { path = "../logi_3dtiles_io" }
+# Reused from the kernel (absorb, don't duplicate): SSE math for the LOD pyramid, and the CANONICAL
+# procedural terrain field gameplay shares (so the new stack and agents stand on one surface).
+logi_geo_lod = { path = "../logi_geo_lod" }
+logi_geo_procgen = { path = "../logi_geo_procgen" }
+# Shared render-geometry home: VERTEX_STRIDE + AABB sphere (AGENTS.md §1A).
+logi_geo_mesh = { path = "../logi_geo_mesh" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Structured logging (workspace standard) — used to surface a baked-tile IO error before it is dropped.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Cross-check that the bake's manifest origin ECEF matches the engine's geodesy (Python↔Rust agreement).
+logi_geospatial = { path = "../logi_geospatial" }

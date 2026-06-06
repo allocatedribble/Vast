@@ -2,6 +2,7 @@
 
 #include "LogiBevyInstancedRenderer.h"
 #include "LogiBevyAssetRegistry.h"
+#include "LogiBevyTransform.h" // LogiBevy::LogiWorldTransformFrom3x4 (shared with the actor pool, audit M1)
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "Engine/StaticMesh.h"
@@ -11,22 +12,6 @@
 
 namespace
 {
-	/// World-space FTransform from a row-major 3x4 (column-vector convention:
-	/// world = R*S*local + T), rebased by adding the frame origin (P0 #6). UE's
-	/// FMatrix is row-vector, so the 3x3 is transposed and translation goes in row 3.
-	FTransform WorldTransformFrom3x4(const float M[12], const FVector& Origin)
-	{
-		FMatrix Mat(EForceInit::ForceInitToZero);
-		Mat.M[0][0] = M[0]; Mat.M[0][1] = M[4]; Mat.M[0][2] = M[8];
-		Mat.M[1][0] = M[1]; Mat.M[1][1] = M[5]; Mat.M[1][2] = M[9];
-		Mat.M[2][0] = M[2]; Mat.M[2][1] = M[6]; Mat.M[2][2] = M[10];
-		Mat.M[3][0] = static_cast<double>(M[3]) + Origin.X;
-		Mat.M[3][1] = static_cast<double>(M[7]) + Origin.Y;
-		Mat.M[3][2] = static_cast<double>(M[11]) + Origin.Z;
-		Mat.M[3][3] = 1.0;
-		return FTransform(Mat);
-	}
-
 	/// Zero-scale transform: collapses a recycled/despawned instance to a point.
 	FTransform HiddenTransform()
 	{
@@ -64,8 +49,18 @@ void FLogiInstancedRenderer::Shutdown()
 	Buckets.Reset();
 	EntityToSlot.Reset();
 	DirtyIsms.Reset();
+	CubeFallback.Reset(); // drop the GC root on the cached engine cube
 	AssetRegistry = nullptr; // borrowed; clear so a stale ptr is never read post-shutdown
 	World.Reset();
+}
+
+UStaticMesh* FLogiInstancedRenderer::GetCubeFallback()
+{
+	if (!CubeFallback.IsValid())
+	{
+		CubeFallback.Reset(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube")));
+	}
+	return CubeFallback.Get();
 }
 
 UInstancedStaticMeshComponent* FLogiInstancedRenderer::GetOrCreateComponent(const FLogiBucketKey& Key)
@@ -74,6 +69,20 @@ UInstancedStaticMeshComponent* FLogiInstancedRenderer::GetOrCreateComponent(cons
 	if (Bucket.Ism.IsValid())
 	{
 		return Bucket.Ism.Get();
+	}
+
+	// The bucket has no live ISM. With the strong ref (audit H11) this only happens on the FIRST request
+	// for a key; the ISM cannot vanish under a surviving bucket afterwards. Reset the slot bookkeeping
+	// anyway so a fresh ISM always starts dense from index 0 -- defends the "AddInstance index == Slot"
+	// invariant even if a future change ever recreates a bucket's component.
+	Bucket.HighWater = 0;
+	Bucket.FreeSlots.Reset();
+	for (auto It = EntityToSlot.CreateIterator(); It; ++It)
+	{
+		if (It.Value().Key == Key)
+		{
+			It.RemoveCurrent(); // drop entity->slot maps into the now-gone ISM (they re-acquire on next ApplyBatch)
+		}
 	}
 
 	AActor* Host = HostActor.Get();
@@ -98,7 +107,7 @@ UInstancedStaticMeshComponent* FLogiInstancedRenderer::GetOrCreateComponent(cons
 	}
 	if (Mesh == nullptr)
 	{
-		Mesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+		Mesh = GetCubeFallback(); // cached engine cube (audit C++ L6)
 	}
 	if (Mesh != nullptr)
 	{
@@ -109,7 +118,7 @@ UInstancedStaticMeshComponent* FLogiInstancedRenderer::GetOrCreateComponent(cons
 		Ism->SetMaterial(0, Material);
 	}
 	Ism->RegisterComponent();
-	Bucket.Ism = Ism;
+	Bucket.Ism.Reset(Ism);
 	return Ism;
 }
 
@@ -129,7 +138,7 @@ void FLogiInstancedRenderer::ApplyBatch(const LogiStaticBatch& Batch)
 	{
 		const LogiInstanceUpdate& Inst = Batch.instances[Index];
 		const uint64 Entity = Inst.entity.index;
-		const FTransform Xform = WorldTransformFrom3x4(Inst.transform_3x4, FrameOrigin);
+		const FTransform Xform = LogiBevy::LogiWorldTransformFrom3x4(Inst.transform_3x4, FrameOrigin);
 
 		int32 Slot = INDEX_NONE;
 		bool bIsNew = false;

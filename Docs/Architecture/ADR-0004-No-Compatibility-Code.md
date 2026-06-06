@@ -6,9 +6,12 @@
 - **Related:** [ADR-0001](ADR-0001-Mass-First-Unreal.md), [ADR-0005](ADR-0005-Bevy-ECS-Authority.md)
 
 > **Reinforced by [ADR-0005](ADR-0005-Bevy-ECS-Authority.md).** The same rule now applies to Rust: depend
-> on **`bevy_ecs` as a library** at its current version — never the full `bevy` engine, never
-> `bevy_render`/`bevy_window`/`wgpu`/`bevy_audio`. No compatibility shims across engine or crate versions;
-> migrate forward and delete.
+> on **`bevy_ecs` as a library** at its current version — never the full `bevy` engine, never a *direct*
+> `bevy_render`/`bevy_window`/`bevy_audio`/`winit`/`wgpu` dependency (no second renderer; Unreal renders).
+> **Clarification (2026-06-05):** type-only transitive crates that `bevy_ecs`'s default features pull in —
+> e.g. `bevy_reflect` → `wgpu-types` (pure type definitions, no GPU/renderer/runtime) — are **allowed**.
+> The bar is "no renderer/GPU/windowing/audio *runtime*", not the crate name. No compatibility shims across
+> engine or crate versions; migrate forward and delete.
 
 ## Context
 

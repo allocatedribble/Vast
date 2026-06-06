@@ -1,36 +1,38 @@
 # LogiUE simulation workspace — the gameplay authority (ADR-0005).
-# bevy_ecs is used as a LIBRARY. Never depend on bevy_render/bevy_window/wgpu/
-# bevy_audio or the umbrella `bevy` crate — Unreal renders; Bevy only simulates.
+# bevy_ecs is used as a LIBRARY. Do not add a DIRECT dep on bevy_render/bevy_window/bevy_audio/winit/
+# wgpu or the umbrella `bevy` crate — Unreal renders; Bevy only simulates. (Type-only transitive crates
+# bevy_ecs's default features pull in — e.g. bevy_reflect -> wgpu-types — ARE allowed: no GPU/runtime.
+# See AGENTS.md rule 10 / ADR-0004.)
 #
 # Versions are pinned here and the resolved set is committed in Cargo.lock.
 
 [workspace]
 resolver = "2"
 members = [
+	# Gameplay authority tower (ADR-0005).
 	"crates/logi_ffi",
 	"crates/logi_runtime",
 	"crates/logi_sim",
 	"crates/logi_render_extract",
 	"crates/logi_schema",
-	# Terrain kernel (ADR-0007): the SHARED field/LOD/pack kept after the one-engine merge retired the old
-	# streaming synthetic renderer (logi_terrain_scene/stream/cache/decode/geo/core/tools — deleted).
-	"crates/logi_terrain_pack",    # fractal pack tables (procgen depends on it)
-	"crates/logi_terrain_procgen", # canonical TerrainHeights field (gameplay + render share it)
-	"crates/logi_terrain_lod",     # screen_space_error (shared by semantic + 3dtiles select)
-	"crates/logi_terrain_ffi",     # the C ABI cdylib (baked/procedural/globe/building)
-	# 3D Tiles / real-world terrain stack (Milestone F, ADR-0009).
-	"crates/logi_geospatial",
-	"crates/logi_qmesh",
-	"crates/logi_3dtiles_tileset",
-	"crates/logi_3dtiles_implicit",
-	"crates/logi_3dtiles_select",
-	"crates/logi_gltf",
-	"crates/logi_3dtiles_io",
-	"crates/logi_collada",
-	"crates/logi_3dtiles_scene",
-	"crates/logi_3dtiles_ion",
-	# Semantic tile enrichment (ADR-0011): baked-tile-store reader + render meshing.
-	"crates/logi_semantic",
+	# Geo engine — the real-world terrain / earth stack (renamed from "terrain"; ADR-0007/0009/0011),
+	# grouped under crates/geo/. Kernel = pack/procgen/lod/ffi; plus the 3D-Tiles + semantic crates.
+	"crates/geo/logi_geo_mesh",     # shared render-geometry contract: vertex layout, ENU<->UE, AABB sphere
+	"crates/geo/logi_geo_pack",     # fractal pack tables (procgen depends on it)
+	"crates/geo/logi_geo_procgen",  # canonical TerrainHeights field (gameplay + render share it)
+	"crates/geo/logi_geo_lod",      # screen_space_error (shared by semantic + 3dtiles select)
+	"crates/geo/logi_geo_ffi",      # the Geo C ABI cdylib (baked/procedural/globe/building) -> logi_geo.dll
+	"crates/geo/logi_geospatial",
+	"crates/geo/logi_qmesh",
+	"crates/geo/logi_3dtiles_tileset",
+	"crates/geo/logi_3dtiles_implicit",
+	"crates/geo/logi_3dtiles_select",
+	"crates/geo/logi_gltf",
+	"crates/geo/logi_3dtiles_io",
+	"crates/geo/logi_collada",
+	"crates/geo/logi_3dtiles_scene",
+	"crates/geo/logi_3dtiles_ion",
+	"crates/geo/logi_semantic",
 ]
 
 [workspace.package]
@@ -41,7 +43,6 @@ license = "Proprietary"
 [workspace.dependencies]
 bevy_ecs = "0.18.1"
 bevy_tasks = "0.18.1"
-bevy_app = "0.18.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

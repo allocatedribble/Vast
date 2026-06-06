@@ -1,0 +1,9 @@
+[package]
+name = "logi_geo_procgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+logi_geo_pack = { path = "../logi_geo_pack" }

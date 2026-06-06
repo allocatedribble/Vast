@@ -20,6 +20,9 @@ struct FLogiBevySimTickFunction : public FTickFunction
 {
 	GENERATED_BODY()
 
+	// Raw, deliberately NOT a UPROPERTY (audit C++ L-doc): this tick function is a member of its Target
+	// subsystem, so the Target always outlives it, and the subsystem unregisters the tick in Deinitialize.
+	// A UPROPERTY/TObjectPtr here would form a self-referential GC edge for no benefit.
 	ULogiBevySubsystem* Target = nullptr;
 
 	virtual void ExecuteTick(float DeltaTime, ELevelTick TickType, ENamedThreads::Type CurrentThread, const FGraphEventRef& MyCompletionGraphEvent) override;

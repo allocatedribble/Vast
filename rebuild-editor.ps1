@@ -1,4 +1,4 @@
-﻿<#
+<#
   rebuild-editor.ps1 - Close the Unreal Editor, rebuild LogiUEEditor (Rust + C++), relaunch at a level.
 
   Usage:
@@ -88,17 +88,17 @@ if ($running) {
 
 # ---- 2) Build the Rust cdylibs ----------------------------------------------
 # The editor target needs logi_ffi built WITH the editor_inspector feature (matches Build.cs).
-Step 2 "Building Rust (logi_ffi +editor_inspector, logi_terrain)..."
+Step 2 "Building Rust (logi_ffi +editor_inspector, logi_geo)..."
 # Build into the EDITOR target dir (target/ue-editor) — the exact dir Build.cs links the import lib from
 # and stages the runtime DLL. UBT's own cargo pre-step is SKIPPED on cached incremental builds, which left
 # a stale import lib missing newly-added exports -> LNK2019; building it here keeps the link lib fresh.
 & cargo build --release --manifest-path "$RustDir\Cargo.toml" -p logi_ffi --features editor_inspector --target-dir "$RustDir\target\ue-editor"
 if ($LASTEXITCODE -ne 0) { throw "cargo build (logi_ffi) failed." }
-& cargo build --release --manifest-path "$RustDir\Cargo.toml" -p logi_terrain_ffi --target-dir "$RustDir\target\ue-editor"
-if ($LASTEXITCODE -ne 0) { throw "cargo build (logi_terrain_ffi) failed." }
+& cargo build --release --manifest-path "$RustDir\Cargo.toml" -p logi_geo_ffi --target-dir "$RustDir\target\ue-editor"
+if ($LASTEXITCODE -ne 0) { throw "cargo build (logi_geo_ffi) failed." }
 # Stage fresh DLLs into the editor's binary dir (UBT's RuntimeDependencies copy is skipped on
 # incremental builds, which is exactly how the Rust DLL went stale during our session).
-foreach ($f in @("logi_ffi.dll", "logi_terrain.dll")) {
+foreach ($f in @("logi_ffi.dll", "logi_geo.dll")) {
     Copy-Item -Force (Join-Path $RustOut $f) (Join-Path $Binaries $f)
 }
 Note "rust built + staged."
@@ -111,7 +111,7 @@ Note "C++ build succeeded."
 
 # ---- Verify the artifacts are fresh -----------------------------------------
 Step 4 "Artifacts:"
-Get-ChildItem (Join-Path $Binaries "logi_terrain.dll"),
+Get-ChildItem (Join-Path $Binaries "logi_geo.dll"),
               (Join-Path $Binaries "logi_ffi.dll"),
               (Join-Path $Binaries "UnrealEditor-LogiBevyRuntime.dll") -ErrorAction SilentlyContinue |
     Select-Object @{N='DLL';E={$_.Name}}, LastWriteTime | Format-Table -AutoSize | Out-String | Write-Host

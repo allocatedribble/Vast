@@ -2,6 +2,7 @@
 
 #include "LogiBevyActorPool.h"
 #include "LogiBevyAssetRegistry.h"
+#include "LogiBevyTransform.h" // LogiBevy::LogiWorldTransformFrom3x4 (shared with the ISM lane, audit M1)
 #include "Engine/World.h"
 #include "Engine/StaticMeshActor.h"
 #include "Engine/StaticMesh.h"
@@ -30,14 +31,18 @@ void FLogiActorPool::Shutdown()
 	}
 	EntityToActor.Reset();
 	Pool.Reset();
+	CubeFallback.Reset(); // drop the GC root on the cached engine cube
 	AssetRegistry = nullptr; // borrowed; clear so a stale ptr is never read post-shutdown
 	World.Reset();
 }
 
-FVector FLogiActorPool::TranslationOf(const LogiActorUpdate& Update)
+UStaticMesh* FLogiActorPool::GetCubeFallback()
 {
-	// Row-major 3x4 affine: translation is column 3 of each row -> indices 3, 7, 11.
-	return FVector(Update.transform_3x4[3], Update.transform_3x4[7], Update.transform_3x4[11]);
+	if (!CubeFallback.IsValid())
+	{
+		CubeFallback.Reset(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube")));
+	}
+	return CubeFallback.Get();
 }
 
 UStaticMesh* FLogiActorPool::ResolveMeshFor(const LogiActorUpdate& Update) const
@@ -54,7 +59,7 @@ UStaticMesh* FLogiActorPool::ResolveMeshFor(const LogiActorUpdate& Update) const
 	return nullptr;
 }
 
-AStaticMeshActor* FLogiActorPool::SpawnActor(const FVector& Location, const LogiActorUpdate& Update)
+AStaticMeshActor* FLogiActorPool::SpawnActor(const FTransform& Xform, const LogiActorUpdate& Update)
 {
 	UWorld* W = World.Get();
 	if (W == nullptr)
@@ -62,9 +67,8 @@ AStaticMeshActor* FLogiActorPool::SpawnActor(const FVector& Location, const Logi
 		return nullptr;
 	}
 
-	const FTransform SpawnTransform(Location);
 	AStaticMeshActor* Actor = W->SpawnActorDeferred<AStaticMeshActor>(
-		AStaticMeshActor::StaticClass(), SpawnTransform, nullptr, nullptr,
+		AStaticMeshActor::StaticClass(), Xform, nullptr, nullptr,
 		ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
 	if (Actor == nullptr)
 	{
@@ -74,12 +78,12 @@ AStaticMeshActor* FLogiActorPool::SpawnActor(const FVector& Location, const Logi
 	if (UStaticMeshComponent* MeshComp = Actor->GetStaticMeshComponent())
 	{
 		MeshComp->SetMobility(EComponentMobility::Movable);
-		// Resolve from the registry (non-blocking after PreloadAll); fall back to the
-		// engine cube so the actor is always visible. TODO: skeletal_mesh / anim path.
+		// Resolve from the registry (non-blocking after PreloadAll); fall back to the cached engine cube
+		// (audit C++ L6) so the actor is always visible.
 		UStaticMesh* Mesh = ResolveMeshFor(Update);
 		if (Mesh == nullptr)
 		{
-			Mesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+			Mesh = GetCubeFallback();
 		}
 		if (Mesh != nullptr)
 		{
@@ -87,11 +91,11 @@ AStaticMeshActor* FLogiActorPool::SpawnActor(const FVector& Location, const Logi
 		}
 	}
 
-	Actor->FinishSpawning(SpawnTransform);
+	Actor->FinishSpawning(Xform);
 	return Actor;
 }
 
-AStaticMeshActor* FLogiActorPool::AcquireActor(const FVector& Location, const LogiActorUpdate& Update)
+AStaticMeshActor* FLogiActorPool::AcquireActor(const FTransform& Xform, const LogiActorUpdate& Update)
 {
 	// Reuse a pooled (hidden) actor if available; skip any GC'd entries.
 	while (Pool.Num() > 0)
@@ -100,11 +104,11 @@ AStaticMeshActor* FLogiActorPool::AcquireActor(const FVector& Location, const Lo
 		if (AStaticMeshActor* Actor = Weak.Get())
 		{
 			Actor->SetActorHiddenInGame(false);
-			Actor->SetActorLocation(Location);
+			Actor->SetActorTransform(Xform); // full rotation+scale (audit M1), not just location
 			return Actor;
 		}
 	}
-	return SpawnActor(Location, Update);
+	return SpawnActor(Xform, Update);
 }
 
 void FLogiActorPool::HideAndPool(AStaticMeshActor* Actor)
@@ -132,19 +136,30 @@ void FLogiActorPool::HideAndPool(AStaticMeshActor* Actor)
 void FLogiActorPool::ApplyActorUpdate(const LogiActorUpdate& Update)
 {
 	const uint64 Entity = Update.entity.index;
-	// Snapshot transforms are local to the frame origin (P0 #6); rebase to world.
-	const FVector Location = FrameOrigin + TranslationOf(Update);
+	// Snapshot transforms are local to the frame origin (P0 #6); the shared decoder rebases translation by
+	// the origin and applies the full rotation*scale (audit M1).
+	const FTransform Xform = LogiBevy::LogiWorldTransformFrom3x4(Update.transform_3x4, FrameOrigin);
 
-	TWeakObjectPtr<AStaticMeshActor>& Slot = EntityToActor.FindOrAdd(Entity);
-	if (!Slot.IsValid())
+	if (TWeakObjectPtr<AStaticMeshActor>* Existing = EntityToActor.Find(Entity))
 	{
-		Slot = AcquireActor(Location, Update);
+		if (AStaticMeshActor* Actor = Existing->Get())
+		{
+			Actor->SetActorTransform(Xform);
+			return;
+		}
+		// The tracked actor was GC'd out from under us; re-acquire below and refresh the map entry.
+		EntityToActor.Remove(Entity);
 	}
-	if (AStaticMeshActor* Actor = Slot.Get())
+
+	// Acquire into a local and only record it on success (audit M3): a failed acquire (no world / spawn
+	// refused) must NOT leave a permanent null entry that suppresses re-acquire and re-spawns every frame.
+	// AcquireActor already places the actor at Xform (pooled reuse + deferred spawn both do).
+	if (AStaticMeshActor* Actor = AcquireActor(Xform, Update))
 	{
-		Actor->SetActorLocation(Location);
-		// TODO: rotation/scale from transform_3x4; skeletal mesh from Update.skeletal_mesh.
+		EntityToActor.Add(Entity, Actor);
 	}
+	// TODO(skeletal): drive a USkeletalMeshComponent from Update.skeletal_mesh + Update.anim_blueprint
+	// once the actor tier supports skeletal actors; the static-mesh tier needs no anim wiring.
 }
 
 void FLogiActorPool::ReleaseEntity(uint64 EntityIndex)

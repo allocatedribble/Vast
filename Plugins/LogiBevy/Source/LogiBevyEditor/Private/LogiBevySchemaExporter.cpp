@@ -21,17 +21,20 @@ bool FLogiBevySchemaExporter::ExportScenario(const ULogiBevyScenarioAsset* Scena
 			Spawn.RecipeId, Spawn.Position.X, Spawn.Position.Y, Spawn.Position.Z, Spawn.Count));
 	}
 
-	// NOTE (audit): this is a WRITE-ONLY authoring export — no Rust deserializer reads it yet, and these
-	// JSON keys (`high_res_actors`, `terrain_world_config`, …) do NOT match the Rust `WorldConfig` /
-	// `LogiInitDesc` field names (`high_res_actor_budget`, …). When a Rust scenario loader is added, make it
-	// the single source of truth (serialize FROM the Rust types) and keep these keys in sync — otherwise
-	// this silently drifts from whatever finally consumes it.
+	// NOTE (audit M4/M29): this is a WRITE-ONLY authoring export — no Rust deserializer reads it yet. The
+	// keys below are aligned to the `LogiInitDesc` `#[repr(C)]` field names (deterministic_seed, fixed_step_hz,
+	// high_res_actor_budget, low_res_actor_budget, instanced_mesh_budget) so a future serde loader binds
+	// without silent drift. (`terrain_world_config` is scenario authoring data with no LogiInitDesc field; it
+	// is resolved by the terrain kernel.) When a Rust loader lands, make the Rust types the single source of
+	// truth (serialize FROM them) rather than maintaining these key strings by hand.
 	const FString Json = FString::Printf(
 		TEXT("{\n")
-		TEXT("  \"seed\": %lld,\n")
+		TEXT("  \"deterministic_seed\": %lld,\n")
 		TEXT("  \"fixed_step_hz\": %d,\n")
 		TEXT("  \"terrain_world_config\": %lld,\n")
-		TEXT("  \"budget\": { \"high_res_actors\": %d, \"low_res_actors\": %d, \"instanced_meshes\": %d },\n")
+		TEXT("  \"high_res_actor_budget\": %d,\n")
+		TEXT("  \"low_res_actor_budget\": %d,\n")
+		TEXT("  \"instanced_mesh_budget\": %d,\n")
 		TEXT("  \"initial_spawns\": [\n%s\n  ]\n")
 		TEXT("}\n"),
 		Scenario->Seed, Scenario->FixedStepHz, Scenario->TerrainWorldConfig,

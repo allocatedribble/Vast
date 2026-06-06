@@ -1,9 +1,0 @@
-[package]
-name = "logi_terrain_procgen"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-publish = false
-
-[dependencies]
-logi_terrain_pack = { path = "../logi_terrain_pack" }

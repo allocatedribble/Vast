@@ -1,5 +1,7 @@
 # ADR-0011 — Data-Driven Semantic Tile Enrichment (offline bake)
 
+> **2026-06-05 — renamed to the Geo engine.** The terrain / real-world-earth stack is now `Rust/crates/geo/` (`logi_geo_*` plus the 3D-Tiles / geospatial / semantic crates), cdylib `logi_geo.dll`, C++ `ULogiBakedGeoSubsystem`. The `logi_terrain*` / `LogiTerrain*` / `logi_terrain.dll` names below are historical (pre-rename); see [AGENTS.md](../../AGENTS.md) §4.
+
 - **Status:** Accepted (2026-06-05)
 - **Implements:** [ADR-0007](ADR-0007-Actorless-Rust-Terrain.md) — the data-driven *content* layer over the
   actorless terrain/render lanes; and the foliage scope once reserved for ADR-0010 (see **Numbering**).

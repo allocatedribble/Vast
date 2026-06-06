@@ -13,8 +13,8 @@ class UMaterialInterface;
 class UMaterialInstanceDynamic;
 class UTexture2D;
 
-// Opaque Rust streaming-globe handle (logi_terrain_ffi.h). Forward-declared so this header stays free of
-// the C ABI; the .cpp includes the real header under LOGI_BEVY_HAVE_TERRAIN.
+// Opaque Rust streaming-globe handle (logi_geo_ffi.h). Forward-declared so this header stays free of
+// the C ABI; the .cpp includes the real header under LOGI_BEVY_HAVE_GEO.
 struct LogiGlobeWorld;
 
 /**

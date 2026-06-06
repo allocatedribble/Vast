@@ -1,5 +1,7 @@
 # Plan — Hero-Location Semantic Tile Enrichment (New Castle County, DE)
 
+> **2026-06-05 — renamed to the Geo engine.** The terrain / real-world-earth stack is now `Rust/crates/geo/` (`logi_geo_*` plus the 3D-Tiles / geospatial / semantic crates), cdylib `logi_geo.dll`, C++ `ULogiBakedGeoSubsystem`. The `logi_terrain*` / `LogiTerrain*` / `logi_terrain.dll` names below are historical (pre-rename); see [AGENTS.md](../../AGENTS.md) §4.
+
 **Status:** Plan (2026-06-05). **Ratified by** [ADR-0011](../Architecture/ADR-0011-Semantic-Tile-Enrichment.md).
 **Builds on** Milestone F (M0 texture rail, M3 traversal, M4 glTF decode). **Supersedes** the procedural-only
 M-G foliage clause of the Milestone-F plan with a *data-driven* layer (real positions where detected; seeded

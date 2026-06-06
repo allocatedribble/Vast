@@ -1,6 +1,6 @@
 //! Terrain query surface for the sim (ADR-0002 / ADR-0007). Coarse, deterministic
 //! ground sampled from the ported terrain kernel's procedural height field
-//! (`logi_terrain_procgen`): identical inputs yield identical outputs on every
+//! (`logi_geo_procgen`): identical inputs yield identical outputs on every
 //! machine, which is exactly what gameplay (pathing, placement, route cost) needs.
 //!
 //! The full streaming terrain — residency, Cesium/native packs, LOD — is the
@@ -8,8 +8,8 @@
 //! Gameplay reads only this coarse deterministic representation (plan §10), so the
 //! authoritative sim never depends on what happens to be streamed in for display.
 
+use logi_geo_procgen::TerrainHeights;
 use logi_schema::{LogiTileId, Vec3};
-use logi_terrain_procgen::TerrainHeights;
 
 /// A deterministic terrain surface sample.
 #[derive(Clone, Copy, Debug, Default)]
@@ -42,7 +42,7 @@ impl Terrain {
     }
 
     /// The **canonical shared terrain** — the same field (seed + amplitude + noise params) the renderer
-    /// draws (`logi_terrain_procgen::TerrainHeights::canonical`). Gameplay MUST sample this so agents sit
+    /// draws (`logi_geo_procgen::TerrainHeights::canonical`). Gameplay MUST sample this so agents sit
     /// on the terrain you see; do not seed the sim terrain independently of the render scene.
     pub fn canonical() -> Self {
         Self {
@@ -50,8 +50,10 @@ impl Terrain {
         }
     }
 
-    /// Test/diagnostic helper: a terrain with an arbitrary seed. NOT for gameplay — production terrain
-    /// must be [`Terrain::canonical`] so the sim and render fields agree.
+    /// Test-only helper: a terrain with an arbitrary seed. NOT for gameplay — production terrain
+    /// must be [`Terrain::canonical`] so the sim and render fields agree. Gated to `#[cfg(test)]`
+    /// (audit Low) so no shipping code can mint a non-canonical terrain.
+    #[cfg(test)]
     pub fn with_seed(seed: u64) -> Self {
         Self {
             heights: TerrainHeights::new(seed),
@@ -78,9 +80,16 @@ impl Terrain {
     /// Coarse route-cost multiplier from local slope (steeper => costlier). Flat
     /// ground is 1.0; gameplay pathing can scale edge costs by this.
     pub fn route_cost(&self, tile: LogiTileId, world_x: f64, world_y: f64) -> f32 {
+        /// Floor on `cos(slope)` before dividing: caps the multiplier and guards a
+        /// div-by-zero / blow-up on a (near-)vertical or degenerate normal. 0.05 ≈
+        /// an 87° slope — anything steeper is clamped rather than going unbounded.
+        const MIN_SLOPE_COS: f32 = 0.05;
+        /// Upper bound on the route-cost multiplier so one cliff cell can't make an
+        /// edge effectively impassable (= 1 / MIN_SLOPE_COS, kept explicit).
+        const MAX_ROUTE_COST: f32 = 20.0;
         let n = self.sample_surface(tile, world_x, world_y).normal;
         // n.z is cos(slope); 1/n.z grows as the surface tilts away from flat.
-        (1.0 / n.z.max(0.05)).min(20.0)
+        (1.0 / n.z.max(MIN_SLOPE_COS)).min(MAX_ROUTE_COST)
     }
 
     /// Surface normal via central finite differences of the height field.

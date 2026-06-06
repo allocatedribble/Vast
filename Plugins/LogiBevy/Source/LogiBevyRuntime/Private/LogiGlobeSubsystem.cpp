@@ -24,16 +24,16 @@
 #include "LevelEditorViewport.h" // GCurrentLevelEditingViewportClient
 #endif
 
-#if LOGI_BEVY_HAVE_TERRAIN
-#include "logi_terrain_ffi.h"
+#if LOGI_BEVY_HAVE_GEO
+#include "logi_geo_ffi.h"
 // Defined in LogiBevyFfi.cpp: false once a terrain-DLL ABI mismatch is detected. The logi_globe_* exports
-// live in the same delay-loaded logi_terrain.dll, so consult this before any globe call.
+// live in the same delay-loaded logi_geo.dll, so consult this before any globe call.
 bool LogiBevy_IsTerrainAbiOk();
 #endif
 
 namespace
 {
-#if LOGI_BEVY_HAVE_TERRAIN
+#if LOGI_BEVY_HAVE_GEO
 	// The streaming viewpoint (FLogiStreamView + LogiResolveStreamView) and the proc-mesh section builder
 	// (LogiBuildTileSection) now live in LogiTileRenderShared — shared with the baked-terrain lane instead
 	// of a per-subsystem copy. The globe-specific helpers (ion token, tile-texture decode) follow.
@@ -91,11 +91,13 @@ namespace
 	FString LastFfiError()
 	{
 		uint8 Buf[512];
-		const size_t N = logi_terrain_last_error_message(Buf, sizeof(Buf) - 1);
-		Buf[N] = 0;
+		const size_t N = logi_geo_last_error_message(Buf, sizeof(Buf) - 1);
+		// Clamp the NUL index (audit C++ L4): defends against a misbehaving FFI returning a length >= the
+		// buffer (e.g. the required size rather than bytes written), which would overflow Buf by one byte.
+		Buf[FMath::Min(N, sizeof(Buf) - 1)] = 0;
 		return FString(UTF8_TO_TCHAR(reinterpret_cast<const char*>(Buf)));
 	}
-#endif // LOGI_BEVY_HAVE_TERRAIN
+#endif // LOGI_BEVY_HAVE_GEO
 }
 
 bool ULogiGlobeSubsystem::ShouldCreateSubsystem(UObject* Outer) const
@@ -104,7 +106,7 @@ bool ULogiGlobeSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 	{
 		return false;
 	}
-#if LOGI_BEVY_HAVE_TERRAIN
+#if LOGI_BEVY_HAVE_GEO
 	if (const UWorld* World = Cast<UWorld>(Outer))
 	{
 		if (!GetDefault<ULogiBevyDeveloperSettings>()->bShowPhotorealGlobe)
@@ -125,7 +127,7 @@ TStatId ULogiGlobeSubsystem::GetStatId() const
 
 bool ULogiGlobeSubsystem::EnsureWorld()
 {
-#if LOGI_BEVY_HAVE_TERRAIN
+#if LOGI_BEVY_HAVE_GEO
 	if (GlobeWorld != nullptr)
 	{
 		return true;
@@ -266,7 +268,7 @@ void ULogiGlobeSubsystem::EvictIfOverBudget()
 
 void ULogiGlobeSubsystem::Tick(float DeltaTime)
 {
-#if LOGI_BEVY_HAVE_TERRAIN
+#if LOGI_BEVY_HAVE_GEO
 	UWorld* World = GetWorld();
 	if (World == nullptr)
 	{
@@ -308,7 +310,7 @@ void ULogiGlobeSubsystem::Tick(float DeltaTime)
 	const double MaxSsePixels = FMath::Clamp(S->GlobeMaxScreenSpaceError, 1.0, 64.0);
 	LogiGlobeFrame Frame{};
 	if (logi_globe_world_step(GlobeWorld, View.Loc.X, View.Loc.Y, View.Loc.Z,
-			View.FovY, View.ViewportHeight, MaxSsePixels, &Frame) != LOGI_TERRAIN_OK)
+			View.FovY, View.ViewportHeight, MaxSsePixels, &Frame) != LOGI_GEO_OK)
 	{
 		return;
 	}
@@ -345,6 +347,11 @@ void ULogiGlobeSubsystem::Tick(float DeltaTime)
 		FGlobeTileEntry Entry;
 		Entry.Section = Section;
 		Entry.LastSeen = FrameCounter;
+		// NOTE (audit C++ L9): DecodeTileTexture runs the JPEG/PNG decode synchronously on the game thread.
+		// It is bounded per step by GlobeTileBuildsPerStep at the 30 Hz throttle above, so it is not a
+		// per-frame hitch, but a hero-view burst still costs game-thread time. Moving it to a worker is not a
+		// straightforward edit (async task + deferred UTexture2D create/UpdateResource on the game thread +
+		// tile-eviction lifetime across the await); deferred until profiling shows it on the budget.
 		if (UTexture2D* Tex = (T.texture_jpeg_len > 0)
 				? DecodeTileTexture(T.texture_jpeg, static_cast<int64>(T.texture_jpeg_len))
 				: nullptr)
@@ -401,7 +408,7 @@ void ULogiGlobeSubsystem::Tick(float DeltaTime)
 
 void ULogiGlobeSubsystem::ReleaseWorld()
 {
-#if LOGI_BEVY_HAVE_TERRAIN
+#if LOGI_BEVY_HAVE_GEO
 	if (GlobeWorld != nullptr)
 	{
 		logi_globe_world_destroy(GlobeWorld);

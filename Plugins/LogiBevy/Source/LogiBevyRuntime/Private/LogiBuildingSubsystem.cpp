@@ -9,10 +9,10 @@
 #include "Materials/MaterialInterface.h"
 #include "Misc/Paths.h"
 
-#if LOGI_BEVY_HAVE_TERRAIN
-#include "logi_terrain_ffi.h"
+#if LOGI_BEVY_HAVE_GEO
+#include "logi_geo_ffi.h"
 // Defined in LogiBevyFfi.cpp: false once a terrain-DLL ABI mismatch is detected at load. The
-// logi_building_* exports live in the same delay-loaded logi_terrain.dll, so consult this first.
+// logi_building_* exports live in the same delay-loaded logi_geo.dll, so consult this first.
 bool LogiBevy_IsTerrainAbiOk();
 #endif
 
@@ -22,7 +22,7 @@ bool ULogiBuildingSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 	{
 		return false;
 	}
-#if LOGI_BEVY_HAVE_TERRAIN
+#if LOGI_BEVY_HAVE_GEO
 	if (const UWorld* World = Cast<UWorld>(Outer))
 	{
 		if (!GetDefault<ULogiBevyDeveloperSettings>()->bShowAgiBuilding)
@@ -63,7 +63,7 @@ void ULogiBuildingSubsystem::Deinitialize()
 
 void ULogiBuildingSubsystem::LoadAndBuild()
 {
-#if LOGI_BEVY_HAVE_TERRAIN
+#if LOGI_BEVY_HAVE_GEO
 	if (!LogiBevy_IsTerrainAbiOk())
 	{
 		UE_LOG(LogLogiBevy, Warning, TEXT("AGI building: terrain DLL ABI not OK; skipping load."));
@@ -94,7 +94,7 @@ void ULogiBuildingSubsystem::LoadAndBuild()
 	}
 
 	LogiBuildingData Data{};
-	if (logi_building_get_data(Building, &Data) != LOGI_TERRAIN_OK || Data.vertices == nullptr)
+	if (logi_building_get_data(Building, &Data) != LOGI_GEO_OK || Data.vertices == nullptr)
 	{
 		UE_LOG(LogLogiBevy, Error, TEXT("logi_building_get_data failed."));
 		logi_building_destroy(Building);
@@ -138,7 +138,10 @@ void ULogiBuildingSubsystem::LoadAndBuild()
 		UVs.Add(FVector2D(F[6], F[7]));
 	}
 
-	const uint8* IBytes = Data.indices; // byte ptr; each index read via aligned Memcpy below (audit)
+	// Indices are `index_count` tightly-packed little-endian u32 (ABI contract: buffer = index_count*4 bytes).
+	// No separate indices_len crosses the FFI to clamp against (audit C++ L2); the vertex-range check below is
+	// the bounds safety net, and each index is read via an aligned Memcpy.
+	const uint8* IBytes = Data.indices;
 	TArray<int32> Triangles;
 	Triangles.Reserve(Data.index_count);
 	for (uint32 t = 0; t + 3 <= Data.index_count; t += 3)
@@ -180,5 +183,5 @@ void ULogiBuildingSubsystem::LoadAndBuild()
 	HostActor = Host;
 	// Geometry is now copied into UE buffers; release the Rust-owned building.
 	logi_building_destroy(Building);
-#endif // LOGI_BEVY_HAVE_TERRAIN
+#endif // LOGI_BEVY_HAVE_GEO
 }

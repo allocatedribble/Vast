@@ -62,7 +62,7 @@ public class LogiBevyRuntime : ModuleRules
 			// logi_ffi at RustOutDir (relative path = relative to RustDir, cargo's working dir).
 			string TargetDirArg = " --target-dir target/" + RustTargetSubdir;
 			TryBuildCargo(RustDir, "logi_ffi", (bWithEditorInspector ? " --features editor_inspector" : "") + TargetDirArg);
-			TryBuildCargo(RustDir, "logi_terrain_ffi", TargetDirArg);
+			TryBuildCargo(RustDir, "logi_geo_ffi", TargetDirArg);
 
 			string ImportLib = Path.Combine(RustOutDir, "logi_ffi.dll.lib");
 			string Dll = Path.Combine(RustOutDir, "logi_ffi.dll");
@@ -83,23 +83,23 @@ public class LogiBevyRuntime : ModuleRules
 			PublicDefinitions.Add("LOGI_BEVY_HAVE_RUST=1");
 			PublicDefinitions.Add("LOGI_BEVY_HAVE_EDITOR_INSPECTOR=" + (bWithEditorInspector ? "1" : "0"));
 
-			// Terrain kernel DLL (ADR-0007): a second cdylib, logi_terrain.dll.
-			PublicIncludePaths.Add(Path.Combine(RustDir, "crates", "logi_terrain_ffi", "include"));
-			string TerrainLib = Path.Combine(RustOutDir, "logi_terrain.dll.lib");
-			string TerrainDll = Path.Combine(RustOutDir, "logi_terrain.dll");
-			if (File.Exists(TerrainLib) && File.Exists(TerrainDll))
+			// Geo engine DLL (ADR-0007/0009): a second cdylib, logi_geo.dll.
+			PublicIncludePaths.Add(Path.Combine(RustDir, "crates", "geo", "logi_geo_ffi", "include"));
+			string GeoLib = Path.Combine(RustOutDir, "logi_geo.dll.lib");
+			string GeoDll = Path.Combine(RustOutDir, "logi_geo.dll");
+			if (File.Exists(GeoLib) && File.Exists(GeoDll))
 			{
-				PublicAdditionalLibraries.Add(TerrainLib);
-				PublicDelayLoadDLLs.Add("logi_terrain.dll");
-				RuntimeDependencies.Add("$(BinaryOutputDir)/logi_terrain.dll", TerrainDll);
-				PublicDefinitions.Add("LOGI_BEVY_HAVE_TERRAIN=1");
+				PublicAdditionalLibraries.Add(GeoLib);
+				PublicDelayLoadDLLs.Add("logi_geo.dll");
+				RuntimeDependencies.Add("$(BinaryOutputDir)/logi_geo.dll", GeoDll);
+				PublicDefinitions.Add("LOGI_BEVY_HAVE_GEO=1");
 				// Nanite terrain lane (E) compiles only in editor targets (NaniteBuilder is editor-only).
-				PublicDefinitions.Add("LOGI_TERRAIN_NANITE_LANE=" + (Target.bBuildEditor ? "1" : "0"));
+				PublicDefinitions.Add("LOGI_GEO_NANITE_LANE=" + (Target.bBuildEditor ? "1" : "0"));
 			}
 			else
 			{
-				PublicDefinitions.Add("LOGI_BEVY_HAVE_TERRAIN=0");
-				PublicDefinitions.Add("LOGI_TERRAIN_NANITE_LANE=0");
+				PublicDefinitions.Add("LOGI_BEVY_HAVE_GEO=0");
+				PublicDefinitions.Add("LOGI_GEO_NANITE_LANE=0");
 			}
 		}
 		else
@@ -107,8 +107,8 @@ public class LogiBevyRuntime : ModuleRules
 			// Other platforms: the bridge compiles to no-ops until the Rust target is added.
 			PublicDefinitions.Add("LOGI_BEVY_HAVE_RUST=0");
 			PublicDefinitions.Add("LOGI_BEVY_HAVE_EDITOR_INSPECTOR=0");
-			PublicDefinitions.Add("LOGI_BEVY_HAVE_TERRAIN=0");
-			PublicDefinitions.Add("LOGI_TERRAIN_NANITE_LANE=0");
+			PublicDefinitions.Add("LOGI_BEVY_HAVE_GEO=0");
+			PublicDefinitions.Add("LOGI_GEO_NANITE_LANE=0");
 		}
 	}
 

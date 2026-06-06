@@ -2,12 +2,19 @@
 //! (The fixed-step tick counter is advanced explicitly by the runtime between
 //! phases, not by a system, so the phase boundaries stay clean.)
 
-use crate::components::{CullState, Representation, StableId, Transform3d, Velocity3d};
+use crate::components::{Representation, StableId, Transform3d, Velocity3d};
 use crate::resources::{RepresentationBudget, SimClock, UnrealFrameInput};
 use bevy_ecs::entity::EntityHashMap;
 use bevy_ecs::prelude::*;
 use logi_schema::{LogiEntityId, RepresentationTier};
 use std::cmp::Ordering;
+
+/// Significance distance falloff (1/cm). At distance `d` cm the proximity term is
+/// `1 / (1 + d * SIGNIFICANCE_DISTANCE_FALLOFF)`, so it halves roughly every
+/// `1/FALLOFF = 10 km`. Tuned for planetary cm-scale: large enough that a courier
+/// hundreds of metres from the camera still earns meaningful significance, small
+/// enough that orbital-distance entities fall toward zero. Gameplay-tuning value.
+const SIGNIFICANCE_DISTANCE_FALLOFF: f64 = 1.0e-4;
 
 /// Integrate motion deterministically: translation += linear_velocity * dt.
 pub fn integrate_motion(clock: Res<SimClock>, mut query: Query<(&mut Transform3d, &Velocity3d)>) {
@@ -24,13 +31,15 @@ pub fn integrate_motion(clock: Res<SimClock>, mut query: Query<(&mut Transform3d
     }
 }
 
-/// Compute each entity's significance score from camera proximity + projected
-/// screen area (ADR-0003). This is the *score*; budgeting ranks against it.
-pub fn compute_significance(
-    input: Res<UnrealFrameInput>,
-    mut query: Query<(&Transform3d, &CullState, &mut Representation)>,
-) {
-    for (transform, cull, mut rep) in &mut query {
+/// Compute each entity's significance score from nearest-camera proximity
+/// (ADR-0003). This is the *score*; budgeting ranks against it.
+///
+/// `CullState` is deliberately NOT queried here yet: no culling/frustum system
+/// populates it, so its `projected_screen_area` / `visible_to_any_camera` would be
+/// constant defaults and contribute nothing (audit Low). When a culling system
+/// lands, re-add `&CullState` and fold the screen-area term back in.
+pub fn compute_significance(input: Res<UnrealFrameInput>, mut query: Query<(&Transform3d, &mut Representation)>) {
+    for (transform, mut rep) in &mut query {
         let mut nearest_sq = f64::MAX;
         for cam in &input.cameras {
             let dx = transform.translation_cm[0] - cam.position[0];
@@ -41,20 +50,14 @@ pub fn compute_significance(
                 nearest_sq = d2;
             }
         }
-        let distance_term = if nearest_sq == f64::MAX {
+        let significance = if nearest_sq == f64::MAX {
             0.0f32
         } else {
-            // Closer => larger.
-            (1.0 / (1.0 + nearest_sq.sqrt() * 1.0e-4)) as f32
+            // Closer => larger (see SIGNIFICANCE_DISTANCE_FALLOFF).
+            (1.0 / (1.0 + nearest_sq.sqrt() * SIGNIFICANCE_DISTANCE_FALLOFF)) as f32
         };
-        let area_term = cull.projected_screen_area.max(0.0);
-        // Significance from nearest-camera proximity (+ projected screen area once
-        // a culling system feeds CullState). Camera position drives promotion to
-        // actor tiers; a dedicated culling/frustum system will refine visibility.
-        let _ = cull.visible_to_any_camera;
         // Sanitize to a finite value: a NaN significance would make the budget sort order
         // input-dependent and break replay determinism (ADR-0001).
-        let significance = distance_term + area_term;
         let significance = if significance.is_finite() { significance } else { 0.0 };
         // Conditional write: only mark Changed when it actually changes (§8).
         if rep.significance != significance {

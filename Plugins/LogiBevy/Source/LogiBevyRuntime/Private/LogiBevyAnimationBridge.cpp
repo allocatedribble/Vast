@@ -2,25 +2,19 @@
 
 #include "LogiBevyAnimationBridge.h"
 
-void FLogiAnimationBridge::ApplyActorUpdate(const LogiActorUpdate& Update)
-{
-	FTracked& Tracked = EntityParams.FindOrAdd(Update.entity.index);
-	Tracked.Significance = Update.significance;
-	Tracked.Anim = Update.animation;
+// DORMANT lane (audit M2): see LogiBevyAnimationBridge.h. These are deliberately no-ops — the actor tier
+// has no pooled skeletal AnimInstance to drive, so there is nothing to push or register. They exist as the
+// single seam to wire when skeletal actors land; they must NOT accumulate per-entity state (the prior
+// implementation kept a TMap nothing read, pure overhead implying functionality that wasn't there).
 
-	// TODO: push Tracked.Anim into the pooled AnimInstance (locomotion state, speed,
-	// turn rate, aim), register the USkeletalMeshComponent with the Animation Budget
-	// Allocator, and set its significance from Tracked.Significance so the allocator
-	// prioritizes it under the fixed CPU budget.
+void FLogiAnimationBridge::ApplyActorUpdate(const LogiActorUpdate& /*Update*/)
+{
 }
 
-void FLogiAnimationBridge::ReleaseEntity(uint64 EntityIndex)
+void FLogiAnimationBridge::ReleaseEntity(uint64 /*EntityIndex*/)
 {
-	EntityParams.Remove(EntityIndex);
-	// TODO: unregister the skeletal mesh from the Animation Budget Allocator.
 }
 
 void FLogiAnimationBridge::Reset()
 {
-	EntityParams.Reset();
 }

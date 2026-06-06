@@ -1,0 +1,14 @@
+[package]
+name = "logi_3dtiles_select"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+glam = { workspace = true }
+logi_geospatial = { path = "../logi_geospatial" }
+logi_3dtiles_tileset = { path = "../logi_3dtiles_tileset" }
+logi_geo_lod = { path = "../logi_geo_lod" }
+# Structured logging (workspace standard) — warns when a tileset requests the unsupported ADD refinement.
+tracing = { workspace = true }

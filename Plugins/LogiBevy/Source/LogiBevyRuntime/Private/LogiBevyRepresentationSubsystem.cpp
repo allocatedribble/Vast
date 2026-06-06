@@ -209,7 +209,7 @@ void ULogiBevyRepresentationSubsystem::TickRepresentation(float DeltaTime)
 	// bucket switches hid their instances WITHOUT a per-instance MarkRenderStateDirty.
 	InstancedRenderer->FlushDirty();
 
-	Telemetry->RecordFrame(InstancedRenderer->LiveInstanceCount(), ActorPool->AssignedCount(), Sim->GetSimTick());
+	Telemetry->RecordFrame(InstancedRenderer->TrackedEntityCount(), ActorPool->AssignedCount(), Sim->GetSimTick());
 
 	// §11 thread-safety policy: representation only READS the published snapshot
 	// and then RETIRES it (triple buffer). This runs on the game thread in

@@ -10,13 +10,13 @@
 #include "logi_bevy_ffi.h"
 #endif
 
-#if LOGI_BEVY_HAVE_TERRAIN
-#include "logi_terrain_ffi.h" // logi_terrain_abi_version() + LOGI_TERRAIN_ABI_VERSION (ABI drift check)
+#if LOGI_BEVY_HAVE_GEO
+#include "logi_geo_ffi.h" // logi_geo_abi_version() + LOGI_GEO_ABI_VERSION (ABI drift check)
 #endif
 
 DEFINE_LOG_CATEGORY(LogLogiBevy);
 
-#if LOGI_BEVY_HAVE_TERRAIN
+#if LOGI_BEVY_HAVE_GEO
 namespace
 {
 	// Runtime gate for the terrain DLL. The terrain exports are delay-loaded, so freeing the
@@ -33,7 +33,7 @@ bool LogiBevy_IsTerrainAbiOk()
 {
 	return GLogiTerrainAbiOk;
 }
-#endif // LOGI_BEVY_HAVE_TERRAIN
+#endif // LOGI_BEVY_HAVE_GEO
 
 /**
  * LogiBevyRuntime module. Owns the lifetime of the Rust `logi_ffi` DLL handle:
@@ -72,33 +72,33 @@ public:
 		}
 #endif // PLATFORM_WINDOWS && LOGI_BEVY_HAVE_RUST
 
-#if PLATFORM_WINDOWS && LOGI_BEVY_HAVE_TERRAIN
+#if PLATFORM_WINDOWS && LOGI_BEVY_HAVE_GEO
 		// Sibling of the logi_ffi load (not nested under HAVE_RUST) so the terrain feature
-		// keys on LOGI_BEVY_HAVE_TERRAIN alone — matching ULogiTerrainSubsystem's gating.
+		// keys on LOGI_BEVY_HAVE_GEO alone — matching ULogiBakedGeoSubsystem's gating.
 		{
 			// Terrain kernel DLL (ADR-0007), loaded the same way as logi_ffi.dll.
-			FString TerrainPath = TEXT("logi_terrain.dll");
+			FString TerrainPath = TEXT("logi_geo.dll");
 			if (TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("LogiBevy")))
 			{
-				const FString Staged = FPaths::Combine(Plugin->GetBaseDir(), TEXT("Binaries"), TEXT("Win64"), TEXT("logi_terrain.dll"));
+				const FString Staged = FPaths::Combine(Plugin->GetBaseDir(), TEXT("Binaries"), TEXT("Win64"), TEXT("logi_geo.dll"));
 				if (FPaths::FileExists(Staged))
 				{
 					TerrainPath = Staged;
 				}
 			}
 			TerrainDllHandle = FPlatformProcess::GetDllHandle(*TerrainPath);
-			UE_CLOG(TerrainDllHandle == nullptr, LogLogiBevy, Warning, TEXT("Failed to load logi_terrain.dll ('%s'); terrain unavailable."), *TerrainPath);
-			UE_CLOG(TerrainDllHandle != nullptr, LogLogiBevy, Log, TEXT("Loaded logi_terrain.dll."));
+			UE_CLOG(TerrainDllHandle == nullptr, LogLogiBevy, Warning, TEXT("Failed to load logi_geo.dll ('%s'); terrain unavailable."), *TerrainPath);
+			UE_CLOG(TerrainDllHandle != nullptr, LogLogiBevy, Log, TEXT("Loaded logi_geo.dll."));
 
 			if (TerrainDllHandle != nullptr)
 			{
 				// Fail loud on a stale terrain DLL (ABI drift) rather than crashing in a later call.
-				const uint32 TerrainVersion = logi_terrain_abi_version();
-				if (TerrainVersion != LOGI_TERRAIN_ABI_VERSION)
+				const uint32 TerrainVersion = logi_geo_abi_version();
+				if (TerrainVersion != LOGI_GEO_ABI_VERSION)
 				{
 					UE_LOG(LogLogiBevy, Error,
-						TEXT("logi_terrain ABI MISMATCH: header=%u, loaded DLL=%u. Rebuild the plugin (editor closed) to stage the matching DLL. Terrain unavailable."),
-						static_cast<uint32>(LOGI_TERRAIN_ABI_VERSION), TerrainVersion);
+						TEXT("logi_geo ABI MISMATCH: header=%u, loaded DLL=%u. Rebuild the plugin (editor closed) to stage the matching DLL. Terrain unavailable."),
+						static_cast<uint32>(LOGI_GEO_ABI_VERSION), TerrainVersion);
 					// Treat terrain as unavailable. Freeing the handle is NOT enough: the terrain exports are
 					// delay-loaded, so the first terrain call would re-resolve + re-load the mismatched DLL and
 					// crash. Latch a runtime flag the subsystem checks before any terrain call, then drop the handle.
@@ -108,11 +108,11 @@ public:
 				}
 				else
 				{
-					UE_LOG(LogLogiBevy, Log, TEXT("logi_terrain ABI version %u OK."), TerrainVersion);
+					UE_LOG(LogLogiBevy, Log, TEXT("logi_geo ABI version %u OK."), TerrainVersion);
 				}
 			}
 		}
-#endif // PLATFORM_WINDOWS && LOGI_BEVY_HAVE_TERRAIN
+#endif // PLATFORM_WINDOWS && LOGI_BEVY_HAVE_GEO
 	}
 
 	virtual void ShutdownModule() override

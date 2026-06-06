@@ -12,7 +12,7 @@
 class FLogiBevyTelemetry
 {
 public:
-	void RecordFrame(int32 InstanceCount, int32 ActorCount, int64 SimTick);
+	void RecordFrame(int32 TrackedInstancedEntities, int32 ActorCount, int64 SimTick);
 
 private:
 	int64 FramesRecorded = 0;

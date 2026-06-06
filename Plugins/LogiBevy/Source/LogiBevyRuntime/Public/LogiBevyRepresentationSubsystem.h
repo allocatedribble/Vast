@@ -24,6 +24,9 @@ struct FLogiBevyRepresentationTickFunction : public FTickFunction
 {
 	GENERATED_BODY()
 
+	// Raw, deliberately NOT a UPROPERTY (audit C++ L-doc): this tick function is a member of its Target
+	// subsystem, so the Target always outlives it, and the subsystem unregisters the tick in Deinitialize.
+	// A UPROPERTY/TObjectPtr here would form a self-referential GC edge for no benefit.
 	ULogiBevyRepresentationSubsystem* Target = nullptr;
 
 	virtual void ExecuteTick(float DeltaTime, ELevelTick TickType, ENamedThreads::Type CurrentThread, const FGraphEventRef& MyCompletionGraphEvent) override;
@@ -39,9 +42,9 @@ struct TStructOpsTypeTraits<FLogiBevyRepresentationTickFunction> : public TStruc
 /**
  * Consumes the per-frame batched snapshot from the Rust world (§8) and applies
  * deltas to retained Unreal representation: instanced meshes for the many
- * (FLogiInstancedRenderer), pooled actors for the significant few (FLogiActorPool),
- * and animation params fed to the budget allocator (FLogiAnimationBridge).
- * Non-authoritative -- pure presentation.
+ * (FLogiInstancedRenderer) and pooled actors for the significant few
+ * (FLogiActorPool). The animation seam (FLogiAnimationBridge) is dormant until the
+ * actor tier gains skeletal actors (audit M2). Non-authoritative -- pure presentation.
  */
 UCLASS()
 class LOGIBEVYRUNTIME_API ULogiBevyRepresentationSubsystem : public UWorldSubsystem

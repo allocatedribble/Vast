@@ -184,12 +184,17 @@ void ULogiBevyEditorSubsystem::RefreshEntities()
 		return; // tab not open
 	}
 
+	// Max rows fetched per refresh (audit C++ L8). The query is paged at the FFI (offset/limit), but the
+	// outliner currently shows only the first page — there is no UI paging/scroll-to-load yet, so a world
+	// with more than this many entities shows the first MaxOutlinerRows (Total still reports the real count).
+	constexpr int32 MaxOutlinerRows = 500;
+
 	ULogiBevySubsystem* Sim = FindSimSubsystem();
 	int32 Total = 0;
 	TArray<FLogiBevyEntityRow> Rows;
 	if (Sim != nullptr)
 	{
-		Sim->EditorQueryEntities(0, 500, Rows, Total);
+		Sim->EditorQueryEntities(0, MaxOutlinerRows, Rows, Total);
 	}
 
 	Items.Reset(Rows.Num());

@@ -11,7 +11,7 @@
 #include "LevelEditorViewport.h"            // GCurrentLevelEditingViewportClient
 #endif
 
-#if LOGI_TERRAIN_NANITE_LANE
+#if LOGI_GEO_NANITE_LANE
 #include "Engine/StaticMesh.h"
 #include "StaticMeshAttributes.h"
 #include "MeshDescription.h"
@@ -77,31 +77,33 @@ void LogiBuildTileSection(UProceduralMeshComponent* Mesh, int32 Section,
 	UVs.Reserve(VCount);
 	for (uint32 v = 0; v < VCount; ++v)
 	{
-		const float* F = reinterpret_cast<const float*>(Vertices + static_cast<uint64>(v) * Stride);
+		// Aligned copy (audit C++ L1): the Rust vertex buffer is byte-aligned (`*const u8`); a direct
+		// `(const float*)` deref is UB on strict-alignment targets. Matches the building lane's Memcpy.
+		float F[8]; FMemory::Memcpy(F, Vertices + static_cast<uint64>(v) * Stride, sizeof(F));
 		Positions.Add(FVector(F[0], F[1], F[2])); // already cm, Z-up LH
 		Normals.Add(FVector(F[3], F[4], F[5]));
 		UVs.Add(FVector2D(F[6], F[7]));
 	}
 
-	const uint32* IData = reinterpret_cast<const uint32*>(Indices);
+	// Indices are `index_count` tightly-packed little-endian u32 (the ABI contract: buffer = index_count*4
+	// bytes, Rust-guaranteed). No separate indices_len crosses the FFI to clamp against (audit C++ L2), so
+	// the vertex-range check below is the bounds safety net; each index is read via an aligned Memcpy (L1).
 	TArray<int32> Triangles;
 	Triangles.Reserve(IndexCount);
 	for (uint32 t = 0; t + 3 <= IndexCount; t += 3)
 	{
-		const uint32 I0 = IData[t];
-		const uint32 I1 = IData[t + 1];
-		const uint32 I2 = IData[t + 2];
-		if (I0 >= VCount || I1 >= VCount || I2 >= VCount) { continue; }
-		Triangles.Add(static_cast<int32>(I0));
-		Triangles.Add(static_cast<int32>(I1));
-		Triangles.Add(static_cast<int32>(I2));
+		uint32 Tri[3]; FMemory::Memcpy(Tri, Indices + static_cast<uint64>(t) * 4, sizeof(Tri));
+		if (Tri[0] >= VCount || Tri[1] >= VCount || Tri[2] >= VCount) { continue; }
+		Triangles.Add(static_cast<int32>(Tri[0]));
+		Triangles.Add(static_cast<int32>(Tri[1]));
+		Triangles.Add(static_cast<int32>(Tri[2]));
 	}
 
 	Mesh->CreateMeshSection_LinearColor(Section, Positions, Triangles, Normals, UVs,
 		TArray<FLinearColor>(), TArray<FProcMeshTangent>(), /*bCreateCollision=*/false);
 }
 
-#if LOGI_TERRAIN_NANITE_LANE
+#if LOGI_GEO_NANITE_LANE
 UStaticMesh* LogiBuildTileNaniteMesh(UObject* Outer,
 	const uint8* Vertices, uint32 Stride, uint64 VerticesLen, uint32 VertexCount,
 	const uint8* Indices, uint32 IndexCount,
@@ -111,8 +113,6 @@ UStaticMesh* LogiBuildTileNaniteMesh(UObject* Outer,
 	const uint32 VCount = FMath::Min<uint32>(VertexCount, static_cast<uint32>(VerticesLen / Stride));
 	const uint32 ICount = IndexCount;
 	if (VCount < 3 || ICount < 3) { return nullptr; }
-
-	const uint32* IData = reinterpret_cast<const uint32*>(Indices);
 
 	FMeshDescription MeshDesc;
 	FStaticMeshAttributes Attrs(MeshDesc);
@@ -135,7 +135,7 @@ UStaticMesh* LogiBuildTileNaniteMesh(UObject* Outer,
 	VIDs.SetNumUninitialized(VCount);
 	for (uint32 v = 0; v < VCount; ++v)
 	{
-		const float* F = reinterpret_cast<const float*>(Vertices + static_cast<uint64>(v) * Stride);
+		float F[8]; FMemory::Memcpy(F, Vertices + static_cast<uint64>(v) * Stride, sizeof(F)); // aligned copy (audit C++ L1)
 		const FVertexID Vid = MeshDesc.CreateVertex();
 		Positions[Vid] = FVector3f(F[0], F[1], F[2]); // already Unreal cm
 		VIDs[v] = Vid;
@@ -145,12 +145,12 @@ UStaticMesh* LogiBuildTileNaniteMesh(UObject* Outer,
 	Corners.SetNum(3);
 	for (uint32 t = 0; t + 3 <= ICount; t += 3)
 	{
-		const uint32 Tri[3] = { IData[t], IData[t + 1], IData[t + 2] };
+		uint32 Tri[3]; FMemory::Memcpy(Tri, Indices + static_cast<uint64>(t) * 4, sizeof(Tri)); // aligned copy (audit C++ L1/L2)
 		if (Tri[0] >= VCount || Tri[1] >= VCount || Tri[2] >= VCount) { continue; }
 		for (int32 c = 0; c < 3; ++c)
 		{
 			const uint32 Vi = Tri[c];
-			const float* F = reinterpret_cast<const float*>(Vertices + static_cast<uint64>(Vi) * Stride);
+			float F[8]; FMemory::Memcpy(F, Vertices + static_cast<uint64>(Vi) * Stride, sizeof(F)); // aligned copy (audit C++ L1)
 			const FVertexInstanceID Iid = MeshDesc.CreateVertexInstance(VIDs[Vi]);
 			Normals[Iid] = FVector3f(F[3], F[4], F[5]);
 			UVs.Set(Iid, 0, FVector2f(F[6], F[7]));
@@ -184,4 +184,4 @@ UStaticMesh* LogiBuildTileNaniteMesh(UObject* Outer,
 	Mesh->BuildFromMeshDescriptions({ &MeshDesc }, Params);
 	return Mesh;
 }
-#endif // LOGI_TERRAIN_NANITE_LANE
+#endif // LOGI_GEO_NANITE_LANE

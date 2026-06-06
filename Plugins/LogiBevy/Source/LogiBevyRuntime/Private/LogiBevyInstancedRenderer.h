@@ -4,10 +4,12 @@
 
 #include "CoreMinimal.h"
 #include "UObject/WeakObjectPtr.h"
+#include "UObject/StrongObjectPtr.h"
 #include "logi_bevy_ffi.h"
 
 class UWorld;
 class AActor;
+class UStaticMesh;
 class UInstancedStaticMeshComponent;
 class ULogiBevyAssetRegistry;
 
@@ -37,8 +39,8 @@ FORCEINLINE uint32 GetTypeHash(const FLogiBucketKey& Key)
  * slot rather than RemoveInstance (which would renumber every later instance).
  * Instances are uploaded in world space = frame origin + rebased local (P0 #6).
  *
- * Mesh/material come from the bucket handle via ULogiBevyAssetRegistry (TODO:
- * wired next); a default cube stands in until then.
+ * Mesh/material are resolved from the bucket handle via ULogiBevyAssetRegistry;
+ * a default engine cube stands in for any handle not yet resident.
  */
 class FLogiInstancedRenderer
 {
@@ -61,13 +63,20 @@ public:
 	void FlushDirty();
 	void Reset();
 
-	int32 LiveInstanceCount() const { return EntityToSlot.Num(); }
+	/// Entities currently mapped to a slot. NOT the live instance count: hidden/recycled (HighWater +
+	/// FreeSlots) slots are not subtracted, so this is the tracked-entity count, not rendered instances.
+	int32 TrackedEntityCount() const { return EntityToSlot.Num(); }
 	int32 BucketCount() const { return Buckets.Num(); }
 
 private:
 	struct FBucket
 	{
-		TWeakObjectPtr<UInstancedStaticMeshComponent> Ism;
+		// Strong ref (audit H11): the host actor already GC-roots the ISM, so a weak ptr bought nothing
+		// but exposed a desync -- if the ISM were collected while the bucket survived, GetOrCreateComponent
+		// would mint a fresh 0-instance ISM while HighWater/FreeSlots/EntityToSlot still pointed at the old
+		// (now-gone) slots, breaking the "AddInstance index == Slot" invariant. Owning it here (in addition
+		// to the host) keeps slot indices and the component in lockstep for the bucket's whole lifetime.
+		TStrongObjectPtr<UInstancedStaticMeshComponent> Ism;
 		int32 HighWater = 0;     // next never-used instance index
 		TArray<int32> FreeSlots; // hidden, recycled indices
 
@@ -87,10 +96,14 @@ private:
 	};
 
 	UInstancedStaticMeshComponent* GetOrCreateComponent(const FLogiBucketKey& Key);
+	UStaticMesh* GetCubeFallback();
 
 	TWeakObjectPtr<UWorld> World;
 	TWeakObjectPtr<AActor> HostActor;
 	ULogiBevyAssetRegistry* AssetRegistry = nullptr; // borrowed; subsystem GC-roots it (H4)
+	/// Engine-cube fallback, loaded once and GC-rooted (audit C++ L6): a LoadObject per new bucket was a
+	/// needless synchronous lookup. Resolved lazily on the first fallback.
+	TStrongObjectPtr<UStaticMesh> CubeFallback;
 	FVector FrameOrigin = FVector::ZeroVector;
 	TMap<FLogiBucketKey, FBucket> Buckets;
 	TMap<uint64 /*entity index*/, FSlotRef> EntityToSlot;

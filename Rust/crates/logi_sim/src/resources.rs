@@ -28,8 +28,19 @@ impl SimClock {
     }
 }
 
-/// Deterministic RNG (SplitMix64). Seeded from sim inputs only — never wall-clock,
-/// never `thread_rng` (ADR-0001 Determinism, still in force under ADR-0005).
+/// Deterministic RNG (SplitMix64), seeded from `deterministic_seed` at world
+/// creation. **This is the ONLY sanctioned source of randomness in the
+/// simulation** (audit M23): every stochastic system MUST draw from this resource
+/// via [`SimRng::next_u64`]. Seeded from sim inputs only — **never** `thread_rng`,
+/// `rand::random`, a wall-clock, or any per-thread/global entropy, all of which
+/// break replay/snapshot determinism (§8 / ADR-0001 Determinism, in force under
+/// ADR-0005).
+///
+/// It is held in the `World` from creation but not yet consumed by any system:
+/// the current sim is fully deterministic without randomness. The resource exists
+/// so the first stochastic feature reaches for the sanctioned path instead of
+/// introducing `thread_rng`. The same-seed/different-seed contract is locked by
+/// `tests::sim_rng_is_seed_deterministic`.
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct SimRng {
     pub state: u64,
@@ -78,5 +89,32 @@ impl Default for RepresentationBudget {
             low_res_actors: 256,
             instanced_meshes: 100_000,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SimRng;
+
+    /// M23: the sanctioned RNG is purely seed-deterministic — the same seed yields the
+    /// same sequence (replay equality) and different seeds diverge — with no wall-clock
+    /// or thread-local entropy anywhere. Locks the contract so the first stochastic
+    /// system can rely on `SimRng` instead of reaching for `thread_rng`.
+    #[test]
+    fn sim_rng_is_seed_deterministic() {
+        let draw = |seed: u64| {
+            let mut rng = SimRng::new(seed);
+            [rng.next_u64(), rng.next_u64(), rng.next_u64(), rng.next_u64()]
+        };
+        // Same seed -> identical sequence (replay-stable).
+        assert_eq!(draw(0xDEAD_BEEF), draw(0xDEAD_BEEF));
+        // Different seed -> different sequence.
+        assert_ne!(draw(1), draw(2));
+        // A stream advances (not a constant) and is a pure function of prior state.
+        let mut a = SimRng::new(42);
+        let mut b = SimRng::new(42);
+        let first = a.next_u64();
+        assert_ne!(first, a.next_u64(), "consecutive draws advance state");
+        assert_eq!(first, b.next_u64(), "same-seed streams stay in lockstep");
     }
 }

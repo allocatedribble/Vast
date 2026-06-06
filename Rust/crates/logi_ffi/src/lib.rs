@@ -310,20 +310,28 @@ pub unsafe extern "C" fn logi_world_tick(
 }
 
 /// Fill `out_snapshot` with a borrowed view of a render snapshot. Pass
-/// `snapshot_id == 0` for the latest. View is valid until the next tick.
+/// `snapshot_id == 0` for the latest, or a specific id to read one of the (up to
+/// three) still-live ring slots (audit M28).
+///
+/// LIFETIME: the returned pointers borrow a snapshot ring slot and stay valid
+/// until that snapshot is retired via [`logi_buffer_release`] OR its slot is reused
+/// by a later `publish` (the ring keeps three live, so reuse is ≥ 2 ticks away),
+/// whichever comes first — NOT merely "until the next tick". This matches the
+/// `LogiRenderSnapshot` struct contract; release each id once you are done so the
+/// ring does not stall on the drop fence.
 ///
 /// THREADING (§11): although this is a read, it MUST be called from the world's
 /// owner (game) thread — the same thread that calls `logi_world_tick`. The
-/// returned pointers borrow the published ring slot, which the owner thread
-/// rewrites/retires on the next tick; reading it from another thread races that
-/// mutation. This is not enforced here (no owner-thread check on the read path)
-/// because the C++ side already drives both tick and snapshot consumption from the
-/// game thread; the contract is the caller's to keep.
+/// returned pointers borrow a ring slot the owner thread may rewrite/retire on a
+/// later tick; reading it from another thread races that mutation. A
+/// `debug_assert` on the owner thread guards this in dev/test builds; in release
+/// the C++ side already drives both tick and snapshot consumption from the game
+/// thread, so the contract is the caller's to keep.
 ///
 /// # Safety
 /// `world` must be a valid handle called on its owner thread; `out_snapshot` must be null or point to
-/// writable `LogiRenderSnapshot` storage. The returned borrowed pointers stay valid only until the next
-/// tick or `logi_buffer_release`.
+/// writable `LogiRenderSnapshot` storage. The returned borrowed pointers stay valid until the snapshot is
+/// retired via [`logi_buffer_release`] or its ring slot is reused (≥ 2 ticks), whichever comes first.
 #[no_mangle]
 pub unsafe extern "C" fn logi_world_get_render_snapshot(
     world: *mut LogiWorld,
@@ -357,23 +365,25 @@ pub unsafe extern "C" fn logi_world_get_render_snapshot(
 
     let result = catch_unwind(AssertUnwindSafe(|| {
         let world = unsafe { &*world };
-        // `snapshot_id == 0` means "latest"; otherwise it must match.
-        if snapshot_id != 0 && snapshot_id != world.snapshot_id() {
-            return None;
-        }
-        let batches = world.static_batches();
-        let actors = world.actor_updates();
-        let despawns = world.despawns();
+        // §11: the borrowed pointers race the owner thread's next publish/retire. Enforce the
+        // owner-thread contract in dev/test (the runtime fns LOGI_ERR on it; a read returns a
+        // debug_assert because release C++ already calls this from the game thread).
+        debug_assert!(
+            world.is_owner_thread(),
+            "logi_world_get_render_snapshot must be called on the world's owner thread (§11)"
+        );
+        // `snapshot_id == 0` means "latest"; otherwise resolve across all live ring slots (audit M28).
+        let view = world.render_snapshot(snapshot_id)?;
         Some(LogiRenderSnapshot {
-            snapshot_id: world.snapshot_id(),
-            sim_tick: world.snapshot_sim_tick(),
-            world_origin_cm: world.snapshot_world_origin(),
-            static_batch_count: batches.len() as u32,
-            static_batches: batches.as_ptr(),
-            actor_update_count: actors.len() as u32,
-            actor_updates: actors.as_ptr(),
-            despawn_count: despawns.len() as u32,
-            despawns: despawns.as_ptr(),
+            snapshot_id: view.id,
+            sim_tick: view.sim_tick,
+            world_origin_cm: view.world_origin_cm,
+            static_batch_count: view.static_batches.len() as u32,
+            static_batches: view.static_batches.as_ptr(),
+            actor_update_count: view.actor_updates.len() as u32,
+            actor_updates: view.actor_updates.as_ptr(),
+            despawn_count: view.despawns.len() as u32,
+            despawns: view.despawns.as_ptr(),
         })
     }));
 
