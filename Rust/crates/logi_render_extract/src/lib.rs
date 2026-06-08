@@ -10,7 +10,7 @@
 //! [`build_ffi_batches`]), owned by the non-resource runtime.
 
 use bevy_ecs::prelude::*;
-use std::collections::HashSet;
+use hashbrown::HashSet;
 
 use logi_schema::{LogiAnimationParams, LogiAssetHandle, LogiEntityId, RepresentationTier};
 use logi_sim::components::{AnimationDrive, Renderable, Representation, StableId, Transform3d};
@@ -21,9 +21,9 @@ use logi_sim::resources::{SimClock, UnrealFrameInput};
 /// (audit H3): retained instances only re-bake when the camera crosses a cell,
 /// instead of drifting every frame as a continuous camera position would force.
 /// Deliberately FINE (256 m) — small per-agent transforms need tight f32 precision
-/// near the camera. (Contrast the much coarser TERRAIN rebase grid,
-/// the retired render-scene crate REBASE_SNAP = 2048 m: big terrain tiles tolerate a far origin,
-/// so a wide grid means rarer rebuilds. Different precision needs, different grids.)
+/// near the camera. (Contrast the much coarser TERRAIN rebase grid of 2048 m: big
+/// terrain tiles tolerate a far origin, so a wide grid means rarer rebuilds.
+/// Different precision needs, different grids.)
 pub const ORIGIN_GRID_CM: f64 = 25_600.0;
 
 /// Snap a world-cm position to the [`ORIGIN_GRID_CM`] lattice, per axis.

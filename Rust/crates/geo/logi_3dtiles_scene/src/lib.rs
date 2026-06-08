@@ -1,10 +1,12 @@
-//! The 3D-Tiles **scene** crate (ADR-0009, Milestone F). M1 = the AGI_HQ sample building: decode the
-//! `.dae`, transform it into Unreal render space (cm, Z-up left-handed), and pass the texture through for
-//! the C++ side to upload. The geodetic ECEF origin is computed and exposed for globe placement (M2+);
-//! M1 renders the building at the local origin to prove the texture + mesh path.
+//! The 3D-Tiles **scene** crate (ADR-0009, Milestone F): the full streaming real-world-terrain stack.
+//! It runs the pipeline select → io → decode → ECEF→ENU rebase → a `bevy_ecs` Geo World on a Rust-owned
+//! stream thread (ADR-0012) → a published render frame the renderer polls. The streaming world is
+//! [`GeoWorld`] (an ECS World where tiles are entities), driven across threads by [`GlobeStreamer`]; the
+//! cross-thread handoff pins decoded geometry behind `Arc<TileGeometry>` so a polled frame outlives
+//! eviction. See [`geo_world`], [`stream_thread`], and [`streaming`].
 //!
-//! This grows into the full streaming scene (select → io → decode → cache → frame packet, with the
-//! camera-tracking RTC rebase) once the M1 vertical slice renders.
+//! A minor side lane, [`load_building`], decodes a single COLLADA `.dae` into Unreal render space (cm,
+//! Z-up left-handed) and computes its WGS84 ECEF origin — a standalone mesh path independent of streaming.
 
 #![forbid(unsafe_code)]
 
@@ -37,7 +39,8 @@ pub struct BuildingMesh {
     pub texture_jpeg: Vec<u8>,
     pub bounds_center: [f32; 3],
     pub bounds_radius: f32,
-    /// The building's WGS84 ECEF position (metres) — for globe placement once the globe lane lands.
+    /// The building's WGS84 ECEF position (metres), from its geodetic `placement` — exposed for the caller
+    /// to position the mesh on the globe (the mesh vertices themselves are at the local origin).
     pub ecef_origin: [f64; 3],
 }
 
@@ -55,10 +58,10 @@ fn wr(b: &mut [u8], o: usize, v: f32) {
     b[o..o + 4].copy_from_slice(&v.to_le_bytes());
 }
 
-/// Load the AGI_HQ-style building: decode the COLLADA `dae_xml`, scale to cm, convert COLLADA (Z-up
-/// right-handed) → Unreal (Z-up left-handed) by negating Y + flipping triangle winding + flipping the V
-/// texcoord, and carry the raw `jpg_bytes` through. `placement` gives the geodetic origin (used for the
-/// ECEF, applied to the mesh once the globe lane exists).
+/// Load a textured COLLADA building: decode the `dae_xml`, scale to cm, convert COLLADA (Z-up right-handed)
+/// → Unreal (Z-up left-handed) by negating Y + flipping triangle winding + flipping the V texcoord, and
+/// carry the raw `jpg_bytes` through. `placement` gives the geodetic origin, returned as the `ecef_origin`
+/// for the caller to position the mesh on the globe.
 pub fn load_building(dae_xml: &str, jpg_bytes: Vec<u8>, placement: &Placement) -> Result<BuildingMesh, SceneError> {
     let mesh = decode_collada(dae_xml).map_err(SceneError::Collada)?;
     let scale = mesh.unit_meters * 100.0; // document units → metres → cm

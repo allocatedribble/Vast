@@ -17,10 +17,10 @@ glTF / quantized-mesh decode) — *not* linking the C++ cesium-native library, a
 actor-based Cesium-for-Unreal plugin. A large rewrite of the synthetic-terrain stack is accepted; no
 backward-compatibility is preserved.
 
-**Why this is tractable (the linchpin):** LogiUE **already owns Rust ports of cesium-native's hardest
+**Why this is tractable (the linchpin):** Vast **already owns Rust ports of cesium-native's hardest
 runtime pieces.** A module-by-module comparison:
 
-| cesium-native runtime piece | LogiUE today | Reuse |
+| cesium-native runtime piece | Vast today | Reuse |
 |---|---|---|
 | Screen-space-error LOD | `logi_terrain_lod::screen_space_error` — **byte-for-byte the same formula** | as-is |
 | Frustum culling (6 inward planes) | `logi_terrain_stream::culling::Frustum` | extend to box/region |
@@ -112,7 +112,7 @@ glTF/quantized-mesh geometry with no rework — they already take generic interl
 
 ## 4. The render side — geometry reused, texture path is the one new piece
 
-LogiUE has **never built a runtime texture path**; that is the single render-side gap between "terrain
+Vast has **never built a runtime texture path**; that is the single render-side gap between "terrain
 works" and "render a textured building / photoreal tile."
 
 - **FFI:** add a per-tile albedo channel. The packet already carries a `material_page_uploads`
@@ -159,7 +159,7 @@ works" and "render a textured building / photoreal tile."
 - **Determinism preserved.** Keep `SyntheticProvider` (derives latency from the tile id) as the
   deterministic replay/test source behind the `TileContentSource` trait; the live `ureq` provider is
   production-only. The selection's anti-thrash hysteresis (`prev_refined`, `SSE_HYSTERESIS=0.25`) — a
-  LogiUE refinement cesium-native lacks — is kept; it protects the C++ Nanite re-encode lane.
+  Vast refinement cesium-native lacks — is kept; it protects the C++ Nanite re-encode lane.
 
 ---
 
@@ -335,7 +335,7 @@ The geometry packet is otherwise unchanged (the C++ geometry path is untouched).
 ### 9.4 Globe coordinate, precision & depth pipeline (resolves ADR-0009 #1 — smooth orbital→street zoom)
 
 The world IS the WGS84 ellipsoid in **ECEF f64**; there is no flat plane. Continuous orbital→street zoom
-is a solved pattern (Cesium-for-Unreal / Outerra) that reuses what LogiUE already has.
+is a solved pattern (Cesium-for-Unreal / Outerra) that reuses what Vast already has.
 
 ```
 tile content local (glTF Y-up tile-local / qmesh)
@@ -429,5 +429,5 @@ tile content local (glTF Y-up tile-local / qmesh)
 - UE Mesh Terrain (rejected): `EngineE/Plugins/Experimental/{MeshTerrainMode,MeshPartition}` @ dev-5.8.
 - Rust deps: `gltf`, `ktx2`, `basis-universal`, `meshopt`, `ureq`, `flate2`, `crossbeam`, `serde`,
   `glam` (existing); Draco vendored via `cc`.
-- LogiUE reused: `logi_terrain_{lod,stream(culling,scheduler),cache,scene,geo,core}`; sample
+- Vast reused: `logi_terrain_{lod,stream(culling,scheduler),cache,scene,geo,core}`; sample
   `C:\Users\premi\Downloads\AGI_HQ.kmz` (KML + Assimp COLLADA Z-up + one diffuse atlas).

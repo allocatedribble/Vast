@@ -19,12 +19,12 @@ fn reads_python_baked_store() {
     assert_eq!(m.format_version, 1);
     assert_eq!(m.tiling.grid_n, 9);
     assert_eq!(m.tiles.len(), 5, "pyramid: level 0 root + 4 level-1 tiles");
-    assert_eq!(store.tile_ids().len(), 5);
 
-    // Every tile decodes (CRC-32 validated inside) and triangulates to the expected mesh shape.
+    // Every tile decodes (CRC-32 validated inside) and triangulates to the expected mesh shape. Read via
+    // the production entry path (`read_tile_entry`, as `BakedWorld::open_with` does), iterating the manifest.
     let n = m.tiling.grid_n as usize;
-    for id in store.tile_ids() {
-        let tile = store.read_tile(id).expect("decode python-written tile");
+    for entry in &store.manifest().tiles {
+        let tile = store.read_tile_entry(entry).expect("decode python-written tile");
         assert_eq!(tile.grid_n as usize, n);
         assert_eq!(tile.heights.len(), n * n);
         assert!(tile.h_min.is_finite() && tile.h_max >= tile.h_min);
@@ -83,8 +83,14 @@ fn sse_select_coarsens_far_and_refines_near() {
 #[test]
 fn specific_tile_is_present_and_addressable() {
     let store = BakedStore::open(FIXTURE).expect("open fixture store");
-    // The SW leaf must exist and round-trip its id.
+    // The SW leaf must exist and round-trip its id (found in the manifest, read via the entry path).
     let sw = TileId::new(1, 0, 0);
-    let tile = store.read_tile(sw).expect("SW tile present");
+    let entry = store
+        .manifest()
+        .tiles
+        .iter()
+        .find(|t| t.level == sw.level && t.x == sw.x && t.y == sw.y)
+        .expect("SW tile present");
+    let tile = store.read_tile_entry(entry).expect("decode SW tile");
     assert_eq!(tile.id, sw);
 }

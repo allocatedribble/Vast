@@ -11,6 +11,12 @@ editor_inspector = []
 
 [dependencies]
 bevy_ecs.workspace = true
+hashbrown.workspace = true
 logi_schema = { path = "../logi_schema" }
 logi_sim = { path = "../logi_sim" }
 logi_render_extract = { path = "../logi_render_extract" }
+
+[dev-dependencies]
+# The determinism guard forces a real multi-thread ComputeTaskPool (the global pool is a one-shot singleton,
+# so it must be sized before either run) — see `parallel_execution_matches_single_threaded_bit_for_bit`.
+bevy_tasks.workspace = true

@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-06-06
-- **Deciders:** LogiUE architecture
+- **Deciders:** Vast architecture
 - **Amends:** [ADR-0005](ADR-0005-Bevy-ECS-Authority.md) — the single-owner-thread invariant
   (`is_owner_thread`, the historical §11 runtime rule) is **relocated off the Unreal game thread**, and the
   FFI *advance* call (`logi_world_tick`, `logi_*_world_step`) becomes a **non-blocking poll**. The
@@ -53,7 +53,7 @@ valid only "until the next `step`", a contract that cannot survive an async prod
 
 > **The FFI advance call becomes a poll. Unreal, on its game thread, only *pushes* the latest view/input
 > and *pulls* the latest published snapshot — it never drives, and never blocks on, the simulation or
-> streaming loop. Each world is advanced by exactly one Rust-owned thread; Logi-rs is internally as parallel
+> streaming loop. Each world is advanced by exactly one Rust-owned thread; Vast-rs is internally as parallel
 > as its determinism contract allows.**
 
 Concretely:
@@ -81,28 +81,27 @@ Concretely:
    shared mutable state. §1C's "no shared mutable state across the boundary → no data race" therefore still
    holds: the producer and consumer touch disjoint, fenced slots, never the same mutable datum.
 
-5. **Retained, refcounted handoff — no use-after-free across the ABI.** Both engines use the ring (≥3 slots,
-   publish/retire fence). Geo additionally holds its per-tile geometry as **`Arc<TileGeometry>`**: a polled
-   frame clones the `Arc`s of the tiles it references, so eviction merely drops the *world's* reference and
-   the buffer is freed only when the last frame holding it is released. (This also deletes the audit's M11
-   texture-copy: the decoder produces one shared `Arc<[u8]>`.) The FFI still hands raw pointers into those
-   buffers — zero-copy across the boundary, with the `Arc` guaranteeing lifetime.
+5. **Retained, refcounted handoff — no use-after-free across the ABI.** Geo holds its per-tile geometry as
+   **`Arc<TileGeometry>`**: a polled frame clones the `Arc`s of the tiles it references, so eviction merely
+   drops the *world's* reference and the buffer is freed only when the last frame holding it is released. The
+   `Arc` clone is the lifetime guarantee, so Geo's cross-thread slot is a single **latest-wins mailbox**
+   (`Mutex<Option<frame>>`, no `release`); gameplay, whose ordered deterministic snapshot stream needs
+   retained intermediates, uses the **`SnapshotRing`** (≥3 slots, publish/retire fence, `logi_buffer_release`).
+   (The `Arc` also deletes the audit's M11 texture-copy: the decoder produces one shared `Arc<[u8]>`.) The FFI
+   still hands raw pointers into those buffers — zero-copy across the boundary, with the `Arc` guaranteeing
+   lifetime.
 
 6. **Determinism split.** Gameplay advances on a **fixed-timestep** loop on its sim thread, draining a
    **timestamped** input queue at each step boundary, so a recorded input sequence replays bit-identically
    regardless of wall-clock; the render side may interpolate between the two latest snapshots for smoothness.
    Geo runs **free** (latest-view-wins, no fixed step, no replay obligation).
 
-7. **Migration is a temporary shim, then gone.** `logi_*_world_step(view) -> frame` survives transitionally
-   as `set_view(view); advance_once(); poll()` behind a flag for A/B, then is **retired** (ADR-0004: no
-   permanent compatibility code).
-
 ```
             UNREAL GAME THREAD                         RUST-OWNED THREADS
   set_view / push_input  ───────────────►  ┌─ stream thread (owns TilesetWorld) ── fans → job pool
-  poll_latest  ◄──── ring (≥3, Arc) ──────  └─ sim thread   (owns World, fixed-step) ─ fans → job pool
-  release(old_id)  ───────────────────────►     (HTTP fetch pool unchanged)
-   builds only tiles whose id changed
+  poll_latest  ◄──── Arc handoff ─────────  └─ sim thread   (owns World, fixed-step) ─ fans → job pool
+  release(old_id) [gameplay ring only] ──►       (HTTP fetch pool unchanged)
+   builds only tiles whose id changed          Geo: latest-wins mailbox; gameplay: SnapshotRing
 ```
 
 ## Consequences
@@ -131,7 +130,7 @@ Concretely:
 ## Alternatives considered
 
 - **Keep the synchronous `step` (status quo).** Simplest, but the heavy work stays on the game thread →
-  hitches, and "Logi-rs as parallel as possible" is unreachable. Rejected — it is the problem.
+  hitches, and "Vast-rs as parallel as possible" is unreachable. Rejected — it is the problem.
 - **Run the heavy work on Unreal's task graph (C++ threads calling into Rust).** Would force the Rust side
   to be thread-safe for arbitrary external callers and shatter the single-owner invariant. Rejected —
   keep exactly one Rust owner per world; Unreal stays a consumer (ADR-0005 §1).
@@ -188,7 +187,7 @@ under load, with a separate capped pool as the fallback (plan §7).
   multithreading constraints Addendum A rests on).
 - [ADR-0005](ADR-0005-Bevy-ECS-Authority.md) (§1 boundary, amended owner-thread), [ADR-0007](ADR-0007-Actorless-Rust-Terrain.md)
   (render non-authoritative — permits async Geo), [ADR-0009](ADR-0009-Native-Rust-3DTiles-Stack.md) (the
-  streaming stack), [ADR-0004](ADR-0004-No-Compatibility-Code.md) (the shim is temporary).
+  streaming stack), [ADR-0004](ADR-0004-No-Compatibility-Code.md) (no compatibility code — `step` is replaced outright by `poll`, not bridged).
 - [AGENTS.md](../../AGENTS.md) §0 (determinism), §1 (the one-directional boundary), §1C (no shared mutable
   state; Unreal pulls a batched snapshot), §3.9 (the snapshot-extract contract).
 - `logi_runtime` `SnapshotRing` / `is_owner_thread` — the existing retained-handoff precedent this generalizes.

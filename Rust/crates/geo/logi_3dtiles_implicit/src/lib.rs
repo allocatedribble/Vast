@@ -121,30 +121,38 @@ impl Subtree {
         }
     }
 
+    /// Whether `(x, y, z)` is representable without aliasing. The octree Morton (`spread3`) packs only 21
+    /// bits per axis, so a coordinate ≥ 2^21 would silently alias another tile's availability bit; the
+    /// quadtree Morton (`spread2`) carries full 32-bit x/y losslessly, so only octree needs the guard. The
+    /// single home of this rule (was inlined only in `is_child_subtree_available`). A real tileset nests far
+    /// shallower; an out-of-range coordinate is treated as unavailable everywhere.
+    #[inline]
+    fn coord_in_range(&self, x: u32, y: u32, z: u32) -> bool {
+        !(self.child_count == 8 && (x | y | z) >= (1 << 21))
+    }
+
     /// Is the tile at local `(level, x, y[, z])` available in this subtree?
     pub fn is_tile_available(&self, level: u32, x: u32, y: u32, z: u32) -> bool {
-        self.tile_availability
-            .get(bit_index(level, self.morton(x, y, z), self.child_count))
+        self.coord_in_range(x, y, z)
+            && self
+                .tile_availability
+                .get(bit_index(level, self.morton(x, y, z), self.child_count))
     }
 
     /// Is content `content_index` available at local `(level, x, y[, z])`?
     pub fn is_content_available(&self, content_index: usize, level: u32, x: u32, y: u32, z: u32) -> bool {
-        self.content_availability
-            .get(content_index)
-            .map(|a| a.get(bit_index(level, self.morton(x, y, z), self.child_count)))
-            .unwrap_or(false)
+        self.coord_in_range(x, y, z)
+            && self
+                .content_availability
+                .get(content_index)
+                .map(|a| a.get(bit_index(level, self.morton(x, y, z), self.child_count)))
+                .unwrap_or(false)
     }
 
     /// Does a child subtree exist rooted at local `(x, y[, z])` (indexed at the deepest+1 level, i.e. the
     /// subtree-root coordinates — no level offset)?
     pub fn is_child_subtree_available(&self, x: u32, y: u32, z: u32) -> bool {
-        // The octree Morton (`spread3`) packs 21 bits per axis; a coordinate ≥ 2^21 would silently alias
-        // to another subtree's availability bit (the `bit_index` tile path already saturates similarly).
-        // A real tileset nests far shallower; treat an out-of-range coordinate as unavailable.
-        if self.child_count == 8 && (x | y | z) >= (1 << 21) {
-            return false;
-        }
-        self.child_subtree_availability.get(self.morton(x, y, z))
+        self.coord_in_range(x, y, z) && self.child_subtree_availability.get(self.morton(x, y, z))
     }
 }
 
@@ -168,8 +176,6 @@ struct SubtreeJson {
 struct BufferJson {
     #[serde(default)]
     uri: Option<String>,
-    #[allow(dead_code)]
-    byte_length: u64,
 }
 
 #[derive(Deserialize)]
@@ -230,7 +236,7 @@ pub fn parse_subtree(bytes: &[u8], child_count: u32) -> Result<Subtree, Implicit
         }
         let view_idx = a.bitstream.ok_or(ImplicitError::BadBufferView)?;
         let view = meta.buffer_views.get(view_idx).ok_or(ImplicitError::BadBufferView)?;
-        // v1 supports only the internal binary buffer (a buffer with no `uri`).
+        // Only the internal binary buffer is supported (a buffer with no `uri`); an external `uri` errors.
         let buffer = meta.buffers.get(view.buffer).ok_or(ImplicitError::BadBufferView)?;
         if buffer.uri.is_some() {
             return Err(ImplicitError::ExternalBufferUnsupported);

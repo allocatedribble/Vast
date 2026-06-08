@@ -12,7 +12,7 @@
 
 ## Context
 
-LogiUE needs **real-world terrain + buildings** (and optionally photorealistic city meshes) — i.e.
+Vast needs **real-world terrain + buildings** (and optionally photorealistic city meshes) — i.e.
 OGC **3D Tiles** / Cesium content. Two off-the-shelf paths were researched and rejected as the
 *authority*:
 

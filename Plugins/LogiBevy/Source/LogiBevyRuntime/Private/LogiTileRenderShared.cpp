@@ -5,7 +5,6 @@
 #include "Engine/GameViewportClient.h"      // UGameViewportClient::GetViewportSize
 #include "GameFramework/PlayerController.h"
 #include "Camera/PlayerCameraManager.h"     // APlayerCameraManager::GetFOVAngle
-#include "ProceduralMeshComponent.h"
 
 #if WITH_EDITOR
 #include "LevelEditorViewport.h"            // GCurrentLevelEditingViewportClient
@@ -68,47 +67,6 @@ bool LogiResolveStreamView(UWorld* World, FLogiStreamView& Out)
 	}
 #endif
 	return false;
-}
-
-void LogiBuildTileSection(UProceduralMeshComponent* Mesh, int32 Section,
-	const uint8* Vertices, uint32 Stride, uint64 VerticesLen, uint32 VertexCount,
-	const uint8* Indices, uint32 IndexCount)
-{
-	if (Mesh == nullptr || Stride < 32 || Vertices == nullptr || Indices == nullptr) { return; }
-	const uint32 VCount = FMath::Min<uint32>(VertexCount, static_cast<uint32>(VerticesLen / Stride));
-
-	TArray<FVector> Positions;
-	TArray<FVector> Normals;
-	TArray<FVector2D> UVs;
-	Positions.Reserve(VCount);
-	Normals.Reserve(VCount);
-	UVs.Reserve(VCount);
-	for (uint32 v = 0; v < VCount; ++v)
-	{
-		// Aligned copy (audit C++ L1): the Rust vertex buffer is byte-aligned (`*const u8`); a direct
-		// `(const float*)` deref is UB on strict-alignment targets. Matches the building lane's Memcpy.
-		float F[8]; FMemory::Memcpy(F, Vertices + static_cast<uint64>(v) * Stride, sizeof(F));
-		Positions.Add(FVector(F[0], F[1], F[2])); // already cm, Z-up LH
-		Normals.Add(FVector(F[3], F[4], F[5]));
-		UVs.Add(FVector2D(F[6], F[7]));
-	}
-
-	// Indices are `index_count` tightly-packed little-endian u32 (the ABI contract: buffer = index_count*4
-	// bytes, Rust-guaranteed). No separate indices_len crosses the FFI to clamp against (audit C++ L2), so
-	// the vertex-range check below is the bounds safety net; each index is read via an aligned Memcpy (L1).
-	TArray<int32> Triangles;
-	Triangles.Reserve(IndexCount);
-	for (uint32 t = 0; t + 3 <= IndexCount; t += 3)
-	{
-		uint32 Tri[3]; FMemory::Memcpy(Tri, Indices + static_cast<uint64>(t) * 4, sizeof(Tri));
-		if (Tri[0] >= VCount || Tri[1] >= VCount || Tri[2] >= VCount) { continue; }
-		Triangles.Add(static_cast<int32>(Tri[0]));
-		Triangles.Add(static_cast<int32>(Tri[1]));
-		Triangles.Add(static_cast<int32>(Tri[2]));
-	}
-
-	Mesh->CreateMeshSection_LinearColor(Section, Positions, Triangles, Normals, UVs,
-		TArray<FLinearColor>(), TArray<FProcMeshTangent>(), /*bCreateCollision=*/false);
 }
 
 #if LOGI_GEO_NANITE_LANE

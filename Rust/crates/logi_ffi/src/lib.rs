@@ -17,6 +17,13 @@ use logi_render_extract::{LogiActorUpdate, LogiStaticBatch};
 use logi_runtime::{LogiWorld, WorldConfig};
 use logi_schema::{LogiCameraView, LogiEntityId, LogiPlayerIntent, LogiSpawnCommand};
 
+/// mimalloc backs every Rust allocation inside this cdylib. It cuts fragmentation and speeds up
+/// multithreaded alloc/free on the snapshot/extract hot paths versus the system CRT allocator, and it
+/// governs *only* this DLL's Rust heap — Unreal keeps its own allocator. Safe because the FFI hands Unreal
+/// pointer+len views into Rust-owned buffers (§1A), never ownership, so nothing is freed across the boundary.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Editor-only entity introspection ABI (ADR-0006); compiled only with the
 /// `editor_inspector` feature, never in shipping builds.
 #[cfg(feature = "editor_inspector")]

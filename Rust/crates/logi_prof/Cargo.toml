@@ -1,0 +1,26 @@
+[package]
+name = "logi_prof"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[features]
+# OFF by default. With `prof` off, `profile_scope!` / `counter!` expand to a no-op guard and the recording
+# engine is not compiled in — zero shipping cost (mirrors the `editor_inspector` posture, ADR-0006).
+# Consumers turn it on by enabling `logi_prof/prof` (usually via their own forwarding `prof` feature).
+default = []
+prof = []
+
+# No third-party dependencies: pure safe Rust over std. (The optional Tracy sink, Plan P5, will add an
+# opt-in `tracy` feature + `tracy-client` here; not part of the always-on backbone.)
+[dependencies]
+
+[dev-dependencies]
+divan = { workspace = true }
+
+# The instrumentation's own per-scope / per-frame overhead — measure-first (§1B) before trusting it
+# always-on. Run with the engine compiled in: `cargo bench -p logi_prof --features prof`.
+# (With `prof` off the same bench measures the no-op path ≈ 0, demonstrating zero shipping cost.)
+[[bench]]
+name = "overhead"
+harness = false

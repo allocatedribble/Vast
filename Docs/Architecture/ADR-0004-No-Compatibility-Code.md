@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-06-01
-- **Deciders:** LogiUE architecture
+- **Deciders:** Vast architecture
 - **Related:** [ADR-0001](ADR-0001-Mass-First-Unreal.md), [ADR-0005](ADR-0005-Bevy-ECS-Authority.md)
 
 > **Reinforced by [ADR-0005](ADR-0005-Bevy-ECS-Authority.md).** The same rule now applies to Rust: depend
@@ -15,7 +15,7 @@
 
 ## Context
 
-LogiUE descends from a Unity/DOTS project and runs on a single, current engine: **Unreal Engine 5.8**.
+Vast descends from a Unity/DOTS project and runs on a single, current engine: **Unreal Engine 5.8**.
 There is a strong temptation, when migrating, to (a) preserve old DOTS type names "for continuity," and
 (b) keep fallback paths for older engine versions or alternate renderers "just in case." Both are traps.
 A compatibility layer ossifies the worst of both worlds: it imports Unity's mental model into an engine
@@ -70,4 +70,4 @@ scale, that tax compounds.
 
 ## References
 
-- LogiUE [`AGENTS.md`](../../AGENTS.md) § 3 rules 9–10, 12.
+- Vast [`AGENTS.md`](../../AGENTS.md) § 3 rules 9–10, 12.

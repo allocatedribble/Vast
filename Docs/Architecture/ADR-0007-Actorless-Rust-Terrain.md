@@ -15,7 +15,7 @@ actor* as a shell. At planetary scale (a 262,144-tile logical world under a hard
 memory budget, streamed by screen-space error) a per-tile `AActor` — or even one
 big terrain actor owning state — is the wrong model: it can't scale, it leaks
 truth into Unreal, and it fights World Partition / Nanite streaming. The prior
-Unity Logi terrain kernel already proved the correct split (Rust owns streaming,
+Unity-era terrain kernel already proved the correct split (Rust owns streaming,
 memory, decode, LOD, telemetry; the engine owns only renderer-facing resources).
 
 ## Decision

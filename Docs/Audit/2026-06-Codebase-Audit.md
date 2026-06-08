@@ -1,4 +1,4 @@
-# LogiUE Codebase Audit — Terrain · Render · Algorithms (2026-06-05)
+# Vast Codebase Audit — Terrain · Render · Algorithms (2026-06-05)
 
 A microscopic pass focused on the two overlapping terrain stacks, the C++ render plumbing, the SSE/LOD
 math, the mesher, and the offline bake — plus the consolidation needed to reach **one terrain engine**.

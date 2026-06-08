@@ -28,7 +28,7 @@ use crate::{crc32, SemanticError, TileId};
 
 /// `.lst` magic bytes.
 pub const LST_MAGIC: [u8; 4] = *b"LSTL";
-/// Current tile format version. The runtime refuses any other major (no silent misread).
+/// Current tile format version. The runtime refuses any other version (no silent misread).
 pub const LST_VERSION: u16 = 1;
 
 /// Header byte length preceding the height grid.

@@ -1,4 +1,4 @@
-# LogiUE — Deep Quality / Logic / Duplication Audit
+# Vast — Deep Quality / Logic / Duplication Audit
 
 **Date:** 2026-06-05
 **Method:** Six parallel microscopic audits (terrain kernel, glTF/mesh/IO decode, 3D-Tiles selection + geospatial + semantic, core sim/runtime/FFI, the C++ `LogiBevy` bridge, and a whole-repo cross-cutting pass for duplication / dependency hygiene / docs drift). Every in-scope source file was read in full and checked against [`AGENTS.md`](../../AGENTS.md).

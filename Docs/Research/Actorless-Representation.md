@@ -1,4 +1,4 @@
-# Research: Can LogiUE represent entities without Unreal Actors?
+# Research: Can Vast represent entities without Unreal Actors?
 
 **Question.** Bevy owns entity truth. Unreal renders. Can we render entities with
 **no `AActor` per entity** — and could we go to **zero actors** entirely (and would
@@ -37,7 +37,7 @@ crowd). Processors drive the ISM↔actor transition by distance/significance. Th
 is precisely "real where you look": **significant → pooled actor; everything else
 → ISM instance, simulated as data.**
 
-## The three tiers, mapped to LogiUE
+## The three tiers, mapped to Vast
 
 | Tier | Unreal mechanism | Owns an actor? |
 |---|---|---|

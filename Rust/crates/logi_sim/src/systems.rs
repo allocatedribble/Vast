@@ -17,18 +17,24 @@ use std::cmp::Ordering;
 const SIGNIFICANCE_DISTANCE_FALLOFF: f64 = 1.0e-4;
 
 /// Integrate motion deterministically: translation += linear_velocity * dt.
+///
+/// `par_iter_mut` fans the per-entity integration across the compute pool (scales to 1M agents). Each entity
+/// touches only its OWN `Transform3d` — no cross-entity reads, no reduction — so the result is bit-identical
+/// regardless of thread count / batch order, preserving replay determinism (ADR-0001). Under the
+/// single-threaded mode (no pool) it runs serially, the golden-replay reference. Work is uniform + cheap, so
+/// the default batching (≈one batch per worker) is the right fit (no work-stealing needed).
 pub fn integrate_motion(clock: Res<SimClock>, mut query: Query<(&mut Transform3d, &Velocity3d)>) {
     let dt = f64::from(clock.seconds_per_tick());
-    for (mut transform, vel) in &mut query {
+    query.par_iter_mut().for_each(|(mut transform, vel)| {
         // Skip stationary entities so we don't mark Transform3d changed (keeps the
         // render-extract delta minimal -- §8 change detection).
         if vel.linear_cm_s == [0.0, 0.0, 0.0] {
-            continue;
+            return;
         }
         transform.translation_cm[0] += f64::from(vel.linear_cm_s[0]) * dt;
         transform.translation_cm[1] += f64::from(vel.linear_cm_s[1]) * dt;
         transform.translation_cm[2] += f64::from(vel.linear_cm_s[2]) * dt;
-    }
+    });
 }
 
 /// Compute each entity's significance score from nearest-camera proximity
@@ -39,9 +45,13 @@ pub fn integrate_motion(clock: Res<SimClock>, mut query: Query<(&mut Transform3d
 /// constant defaults and contribute nothing (audit Low). When a culling system
 /// lands, re-add `&CullState` and fold the screen-area term back in.
 pub fn compute_significance(input: Res<UnrealFrameInput>, mut query: Query<(&Transform3d, &mut Representation)>) {
-    for (transform, mut rep) in &mut query {
+    // `par_iter_mut` over the agents (scales to 1M). Each entity reads the shared, read-only camera list and
+    // writes only its OWN `significance` — independent per entity, no reduction — so it's bit-identical at any
+    // thread count (replay-deterministic, ADR-0001). `cameras` is borrowed once and shared across workers.
+    let cameras = input.cameras.as_slice();
+    query.par_iter_mut().for_each(|(transform, mut rep)| {
         let mut nearest_sq = f64::MAX;
-        for cam in &input.cameras {
+        for cam in cameras {
             let dx = transform.translation_cm[0] - cam.position[0];
             let dy = transform.translation_cm[1] - cam.position[1];
             let dz = transform.translation_cm[2] - cam.position[2];
@@ -63,7 +73,7 @@ pub fn compute_significance(input: Res<UnrealFrameInput>, mut query: Query<(&Tra
         if rep.significance != significance {
             rep.significance = significance;
         }
-    }
+    });
 }
 
 /// One entry in the per-frame significance ranking.
@@ -206,8 +216,8 @@ mod tests {
     use crate::resources::RepresentationBudget;
     use crate::schedules::LogiSchedule;
     use bevy_ecs::prelude::*;
+    use hashbrown::HashMap;
     use logi_schema::{LogiEntityId, RepresentationTier};
-    use std::collections::HashMap;
 
     #[test]
     fn budget_allocates_tiers_top_down_by_significance() {

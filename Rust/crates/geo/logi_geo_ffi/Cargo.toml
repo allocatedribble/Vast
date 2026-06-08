@@ -19,3 +19,7 @@ logi_3dtiles_io = { path = "../logi_3dtiles_io" }
 logi_semantic = { path = "../logi_semantic" }
 # Procedural-terrain origin (lon/lat/height) → ECEF for the one-engine procedural lane.
 logi_geospatial = { path = "../logi_geospatial" }
+# Global allocator for the logi_geo.dll Rust heap (set in lib.rs). Same contract as logi_ffi.
+mimalloc = { workspace = true }
+# SwissTable membership set reused on the per-frame baked-tile select path (ffi_baked).
+hashbrown = { workspace = true }

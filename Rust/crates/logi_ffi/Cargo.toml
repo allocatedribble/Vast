@@ -22,3 +22,6 @@ logi_runtime = { path = "../logi_runtime" }
 logi_render_extract = { path = "../logi_render_extract" }
 logi_schema = { path = "../logi_schema" }
 thiserror = { workspace = true }
+# Global allocator for this cdylib's Rust heap (set in lib.rs). Governs only logi_ffi.dll's own
+# allocations; Unreal keeps its allocator. FFI hands out pointer+len views, never ownership (§1A).
+mimalloc = { workspace = true }

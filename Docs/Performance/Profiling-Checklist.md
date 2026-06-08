@@ -4,6 +4,12 @@ How to measure each budget in [Budgets.md](Budgets.md), and what must hold befor
 **Profile before you optimize, and profile per world view** — orbital and street-level have entirely
 different cost shapes ([ADR-0003](../Architecture/ADR-0003-Representation-LOD.md)).
 
+> **Parked Geo optimizations:** three Geo perf items are deliberately *not* implemented because they're
+> constant-factor wins on paths no profile has flagged — see
+> [Deferred Optimizations](../Audit/2026-06-06-Geo-Audit-Deferred-Optimizations.md). Each names the exact
+> flamegraph signal that would justify doing it. If your capture here hits one of those signals, that doc is
+> where to start (and remove the entry once landed with a backing benchmark).
+
 > **Updated by [ADR-0005](../Architecture/ADR-0005-Bevy-ECS-Authority.md):** the **simulation** is profiled
 > in Rust — `cargo` benches, Tracy / `puffin`, and deterministic `cargo test` for replay equality (headless,
 > no editor). **MassInsights is retired for the sim.** Unreal Insights + `stat` commands now cover the

@@ -7,8 +7,16 @@ publish = false
 
 [dependencies]
 glam = { workspace = true }
+# SwissTable maps for per-tile selection state + dedup (keyed by child-index path).
+hashbrown = { workspace = true }
 logi_geospatial = { path = "../logi_geospatial" }
 logi_3dtiles_tileset = { path = "../logi_3dtiles_tileset" }
 logi_geo_lod = { path = "../logi_geo_lod" }
 # Structured logging (workspace standard) — warns when a tileset requests the unsupported ADD refinement.
 tracing = { workspace = true }
+
+[dev-dependencies]
+# The implicit-tiling codec (subtree availability bitstreams + Morton). Used ONLY by the implicit-path unit
+# tests, which build in-memory `Subtree`s to drive the `AvailabilityProvider` seam — proving the codec→traversal
+# wiring without the scene/fetch layer. Production traversal stays codec-free (the scene's provider calls it).
+logi_3dtiles_implicit = { path = "../logi_3dtiles_implicit" }

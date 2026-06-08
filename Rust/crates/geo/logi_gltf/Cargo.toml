@@ -6,13 +6,16 @@ license.workspace = true
 publish = false
 
 [dependencies]
-# `utils` gives the accessor Reader; default-features off avoids the filesystem-import + image deps
-# (we extract raw texture bytes, decode them on the renderer side). `KHR_materials_unlit` so the gltf
-# crate accepts Google P3DT tiles (they list it as a REQUIRED extension); P3DT is otherwise plain glTF
-# (no Draco / no KTX2), so the standard accessor reader decodes the geometry directly.
-gltf = { version = "1", default-features = false, features = ["utils", "KHR_materials_unlit"] }
+# `utils` gives the accessor Reader; `extensions` exposes the per-primitive `KHR_draco_mesh_compression`
+# JSON (the Draco bufferView + attribute unique-ids). default-features off avoids the filesystem-import +
+# image deps (we extract raw texture bytes, decode them on the renderer side). `KHR_materials_unlit` so the
+# gltf crate accepts Google P3DT tiles (they list it as a REQUIRED extension).
+gltf = { version = "1", default-features = false, features = ["utils", "extensions", "KHR_materials_unlit"] }
 # Compose the glTF node hierarchy's world transforms (P3DT bakes each tile's ECEF placement into its
 # node transform — the renderer MUST apply it, else geometry collapses to the geocenter).
 glam = { workspace = true }
 # Shared vertex-layout home: interleave + VERTEX_STRIDE (AGENTS.md §1A — one home per shared contract).
 logi_geo_mesh = { path = "../logi_geo_mesh" }
+# Draco mesh decompression (KHR_draco_mesh_compression): Google P3DT + Cesium fine-LOD tiles ship Draco —
+# without it they decode to 0 primitives (the planet never reaches full detail). ADR-0009's Draco exception.
+logi_draco = { path = "../logi_draco" }

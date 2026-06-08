@@ -24,15 +24,27 @@ public class LogiBevyRuntime : ModuleRules
 			"Engine",
 			"Projects",                // IPluginManager (locating the staged DLL at runtime)
 			"DeveloperSettings",       // ULogiBevyDeveloperSettings (Project Settings)
-			"ProceduralMeshComponent", // actorless terrain debug-lane mesh (ADR-0007 / D)
+			"ProceduralMeshComponent", // M1 building lane mesh (LogiBuildingSubsystem); ADR-0007 / D
 			"ImageWrapper",            // decode per-tile P3DT JPEG/PNG atlases into runtime textures (Milestone F M2)
-			"RenderCore",              // UTexture2D transient mip upload (PF_B8G8R8A8)
+			"RenderCore",              // UTexture2D transient mip upload + render-thread tile mesh upload (T1)
+			"RHI",                     // ULogiTileMeshComponent scene proxy: FRHICommandList / RHI buffer upload (T1)
 		});
+
+		// Intel ISPC texture compressor (External module): runtime BC7 encode of the P3DT JPEG atlases. BC1
+		// (the old hand-rolled path) crushed each 4x4 texel block to 2 colours, which pixelated the photographic
+		// ground (grass especially); BC7 is near-lossless at 2x BC1's VRAM — half of uncompressed, safely within
+		// an 8 GB GPU at the streaming tile count. `CompressBlocksBC7` from ispc_texcomp.h.
+		PrivateDependencyModuleNames.Add("IntelISPCTexComp");
 
 		if (Target.bBuildEditor)
 		{
 			// Editor-only: feed the level-viewport camera so terrain streams in-editor (D).
 			PrivateDependencyModuleNames.Add("UnrealEd");
+			// Editor-only: wire DepthBiasCm -> Pixel Depth Offset into the globe tile material at runtime
+			// (UMaterialEditingLibrary). The Python material API doesn't expose Pixel Depth Offset, so the
+			// depth-priority refinement (finer tiles occlude coarser) is set up here in C++. See
+			// ALogiBakedGeoTerrain::EnsureGlobeMaterialPdo.
+			PrivateDependencyModuleNames.Add("MaterialEditor");
 			// Editor-only Nanite terrain lane (Milestone E): build transient Nanite UStaticMeshes
 			// per tile through the engine build path. The Nanite *encoder* (NaniteBuilder) is an
 			// editor-only Developer module, so this lane only exists in WITH_EDITOR targets; a

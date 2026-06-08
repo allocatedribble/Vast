@@ -4,7 +4,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-06-01
-- **Deciders:** LogiUE architecture
+- **Deciders:** Vast architecture
 - **Supersedes:** the **Mass-authority decision of [ADR-0001](ADR-0001-Mass-First-Unreal.md)**. The
   data-oriented *intent* is preserved; the Mass *implementation* of runtime authority is withdrawn.
 - **Generalizes:** [ADR-0002](ADR-0002-Rust-Terrain-Kernel.md) — the Rust-owns-truth / narrow-C-ABI
@@ -138,4 +138,4 @@ uses NO `AActor`, only renderer-facing component/proxy shells**, (4) UI/HUD, (5)
 - [ADR-0001](ADR-0001-Mass-First-Unreal.md) (superseded in part), [ADR-0002](ADR-0002-Rust-Terrain-Kernel.md)
   (generalized), [ADR-0003](ADR-0003-Representation-LOD.md) (significance model preserved),
   [ADR-0004](ADR-0004-No-Compatibility-Code.md) (mature-tech / no-compat).
-- LogiUE [`AGENTS.md`](../../AGENTS.md) §§ 1–3.
+- Vast [`AGENTS.md`](../../AGENTS.md) §§ 1–3.

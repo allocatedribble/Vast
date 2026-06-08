@@ -35,6 +35,19 @@ bool LogiBevy_IsTerrainAbiOk()
 }
 #endif // LOGI_BEVY_HAVE_GEO
 
+// BC7 encoder (ispc_texcomp.dll) load gate — UNGATED so the tile-texture decode path links in every config.
+// Set true in StartupModule iff the DLL loaded explicitly; the worker-thread tile decode consults it to SKIP
+// BC7 (→ the tile shows a placeholder, NOT a crash) if the delay-load of ispc_texcomp.dll ever fails. (The
+// explicit load itself is Win64 + GEO gated below.)
+namespace
+{
+	bool GLogiIspcOk = false;
+}
+bool LogiBevy_IsIspcTexCompOk()
+{
+	return GLogiIspcOk;
+}
+
 /**
  * LogiBevyRuntime module. Owns the lifetime of the Rust `logi_ffi` DLL handle:
  * the DLL is staged next to this module's binary by RuntimeDependencies, and we
@@ -112,6 +125,22 @@ public:
 				}
 			}
 		}
+
+		// Intel ISPC texture compressor DLL (BC7 encode of the P3DT atlases). It is delay-loaded (Build.cs
+		// PublicDelayLoadDLLs), and the FIRST CompressBlocksBC7 call runs on a worker thread whose delay-load
+		// helper can't locate the engine ThirdParty DLL by name — that crashed with 0xC06D007E (MOD_NOT_FOUND).
+		// Load it explicitly here (game thread, full engine path) so it is resident before any tile decode; the
+		// later worker-thread delay-load then resolves the already-loaded module by name. GLogiIspcOk gates the
+		// BC7 path off (→ placeholder) if this ever fails, so a missing DLL degrades instead of crashing.
+		{
+			const FString IspcPath = FPaths::Combine(FPaths::EngineDir(),
+				TEXT("Binaries"), TEXT("ThirdParty"), TEXT("Intel"), TEXT("ISPCTexComp"), TEXT("Win64-Release"), TEXT("ispc_texcomp.dll"));
+			IspcDllHandle = FPlatformProcess::GetDllHandle(*IspcPath);
+			GLogiIspcOk = (IspcDllHandle != nullptr);
+			UE_CLOG(IspcDllHandle == nullptr, LogLogiBevy, Warning,
+				TEXT("Failed to load ispc_texcomp.dll ('%s'); BC7 tile-texture compression disabled (tiles show a placeholder, no crash)."), *IspcPath);
+			UE_CLOG(IspcDllHandle != nullptr, LogLogiBevy, Log, TEXT("Loaded ispc_texcomp.dll (BC7 encoder)."));
+		}
 #endif // PLATFORM_WINDOWS && LOGI_BEVY_HAVE_GEO
 	}
 
@@ -127,11 +156,17 @@ public:
 			FPlatformProcess::FreeDllHandle(TerrainDllHandle);
 			TerrainDllHandle = nullptr;
 		}
+		if (IspcDllHandle != nullptr)
+		{
+			FPlatformProcess::FreeDllHandle(IspcDllHandle);
+			IspcDllHandle = nullptr;
+		}
 	}
 
 private:
 	void* DllHandle = nullptr;
 	void* TerrainDllHandle = nullptr;
+	void* IspcDllHandle = nullptr;
 };
 
 IMPLEMENT_MODULE(FLogiBevyRuntimeModule, LogiBevyRuntime);

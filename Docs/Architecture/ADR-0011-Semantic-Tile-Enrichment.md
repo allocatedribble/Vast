@@ -15,7 +15,7 @@
 
 ## Context
 
-ADR-0009 gives LogiUE a native Rust path to stream real-world 3D Tiles (Cesium ion; Google Photorealistic
+ADR-0009 gives Vast a native Rust path to stream real-world 3D Tiles (Cesium ion; Google Photorealistic
 3D Tiles). That content is **inadequate for first-person fidelity** and **carries no object semantics**:
 
 - Google/Cesium photoreal tiles are **fused photogrammetry meshes** — cars, trees, water, and buildings are

@@ -321,7 +321,7 @@ open-data-only subset be carved later (Google as reference) without re-architect
 - **Bake QA report** (machine-readable + human summary): per-class counts, confidence histograms, coverage
   %, rejected-feature log, **datum residuals**, override-merge log, source provenance.
 - **Runtime telemetry:** extend `LogiTerrainTelemetry` with resident instance/feature counts per tile so the
-  Logi telemetry panel surfaces enrichment cost.
+  Vast telemetry panel surfaces enrichment cost.
 - **Tile Editor:** every edit appended to the per-tile override file = a complete, replayable audit trail.
 
 ---
@@ -387,6 +387,6 @@ applicable §9 gates** (build/lint/test/golden/determinism/CI) + the §10 budget
   [MS GlobalMLBuildingFootprints](https://github.com/microsoft/GlobalMLBuildingFootprints/).
 - Format: [3D Tiles Next — EXT_mesh_gpu_instancing + EXT_structural_metadata](https://cesium.com/blog/2021/11/10/introducing-3d-tiles-next/).
 - AI materials: [StableMaterials](https://huggingface.co/gvecchio/StableMaterials) · [Chord (image→PBR)](https://arxiv.org/pdf/2509.09952).
-- LogiUE: [ADR-0011](../Architecture/ADR-0011-Semantic-Tile-Enrichment.md) · [Milestone-F plan](Milestone-F-3DTiles-Rust-Stack.md)
+- Vast: [ADR-0011](../Architecture/ADR-0011-Semantic-Tile-Enrichment.md) · [Milestone-F plan](Milestone-F-3DTiles-Rust-Stack.md)
   · [ADR-0006](../Architecture/ADR-0006-Editor-Inspectability.md) · [ADR-0007](../Architecture/ADR-0007-Actorless-Rust-Terrain.md)
   · [ADR-0008](../Architecture/ADR-0008-Terrain-Nanite-Lane.md).

@@ -8,7 +8,7 @@
 
 use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::*;
-use std::collections::HashMap;
+use hashbrown::{HashMap, HashSet};
 use std::thread::ThreadId;
 
 use logi_render_extract::{
@@ -212,13 +212,13 @@ pub struct LogiWorld {
     /// externally-requested). `allocate_id` skips occupied indices so an auto id
     /// can never collide with a hand-authored one (audit M3); maintained in lockstep
     /// with `id_map` on spawn/despawn.
-    used_indices: std::collections::HashSet<u64>,
+    used_indices: HashSet<u64>,
     next_index: u64,
     shard: u16,
     accumulator: f64,
     fixed_dt: f64,
     #[cfg(feature = "editor_inspector")]
-    pinned: std::collections::HashSet<LogiEntityId>,
+    pinned: HashSet<LogiEntityId>,
     #[cfg(feature = "editor_inspector")]
     editor_query_buf: Vec<LogiEntitySummary>,
 }
@@ -235,7 +235,7 @@ impl LogiWorld {
         world.insert_resource(SimClock { tick: 0, fixed_hz: hz });
         world.insert_resource(SimRng::new(config.deterministic_seed));
         // Terrain is the CANONICAL shared field (logi_geo_procgen::canonical) — the SAME surface
-        // the renderer draws (the retired render-scene crate), so agents sit on the terrain you see. The terrain
+        // the renderer draws, so agents sit on the terrain you see. The terrain
         // is a fixed designed world; deterministic_seed drives agent RNG, not terrain geography.
         // (Supersedes audit M1's per-seed terrain: the holistic fix is one shared field, not two.)
         world.insert_resource(TerrainResource(Terrain::canonical()));
@@ -265,13 +265,13 @@ impl LogiWorld {
             schedules,
             ring: SnapshotRing::new(),
             id_map: HashMap::new(),
-            used_indices: std::collections::HashSet::new(),
+            used_indices: HashSet::new(),
             next_index: 1,
             shard: 0,
             accumulator: 0.0,
             fixed_dt: 1.0 / hz as f64,
             #[cfg(feature = "editor_inspector")]
-            pinned: std::collections::HashSet::new(),
+            pinned: HashSet::new(),
             #[cfg(feature = "editor_inspector")]
             editor_query_buf: Vec::new(),
         }
@@ -801,7 +801,7 @@ mod tests {
         assert_eq!(published.actor_updates[0].entity.index, 50);
     }
 
-    /// The terrain is the CANONICAL shared field — the same surface the renderer (the retired render-scene crate)
+    /// The terrain is the CANONICAL shared field — the same surface the renderer
     /// draws — so it deliberately does NOT vary with the world seed (a fixed designed world; the seed
     /// drives agent RNG, not terrain geography). Supersedes M1's per-seed terrain.
     #[test]
@@ -821,7 +821,7 @@ mod tests {
             sample_world(2),
             "terrain must be the canonical shared field, independent of seed"
         );
-        // ...and it equals Terrain::canonical (the exact field the retired render-scene crate renders).
+        // ...and it equals Terrain::canonical (the exact field the renderer renders).
         let canonical = Terrain::canonical()
             .sample_surface(LogiTileId::new(1), 1234.0, 5678.0)
             .height_cm;
@@ -882,5 +882,75 @@ mod tests {
         let again = w.spawn(&spawn_cmd(40, 2.0));
         assert_eq!(again.index, 40);
         assert_eq!(w.id_map.len(), 1);
+    }
+
+    /// Phase 4 safety net (§7): the parallel executor + `par_iter_mut` agent systems must produce state
+    /// **bit-identical** to the single-threaded golden reference. The hot per-entity systems
+    /// (`integrate_motion`, `compute_significance`) write only each entity's own components — no reduction,
+    /// no cross-entity reads — so the result is independent of thread count / batch order. This runs the SAME
+    /// scenario (moving agents + a camera, exercising motion, significance, and budgeting) under both modes
+    /// and asserts equality; a regression that smuggles order-dependence into a `par_iter` system fails here.
+    #[test]
+    fn parallel_execution_matches_single_threaded_bit_for_bit() {
+        use logi_sim::components::{Representation, StableId, Transform3d, Velocity3d};
+
+        fn run(flags: u32) -> Vec<(u64, [f64; 3], f32, u8)> {
+            let cfg = WorldConfig {
+                fixed_step_hz: 16,
+                deterministic_seed: 99,
+                worker_thread_count: 8, // request a real multi-thread pool for the BoundedParallel run
+                flags,
+                high_res_actor_budget: 8,
+                low_res_actor_budget: 32,
+                instanced_mesh_budget: 1024,
+            };
+            let mut w = LogiWorld::new(cfg);
+            let cmds: Vec<_> = (0..500u64).map(|i| spawn_cmd(i, i as f64 * 137.0)).collect();
+            w.submit_spawn_commands(&cmds);
+            // Give each agent a distinct non-zero velocity so `integrate_motion` does varying work.
+            {
+                let mut q = w.world.query::<(&StableId, &mut Velocity3d)>();
+                for (sid, mut vel) in q.iter_mut(&mut w.world) {
+                    let i = sid.0.index as f32;
+                    vel.linear_cm_s = [10.0 + i, -5.0 + 0.5 * i, 2.0];
+                }
+            }
+            // A camera off to the side so per-agent distance (→ significance → tier) varies.
+            let cam = [LogiCameraView {
+                position: [25_000.0, 0.0, 0.0],
+                forward: [0.0, 1.0, 0.0],
+                fov_degrees: 60.0,
+                screen_height_px: 1080.0,
+            }];
+            for _ in 0..20 {
+                w.tick(0.0625, 1, &cam, &[]);
+            }
+            // Final per-agent state, keyed + sorted by stable index (order-independent comparison).
+            let mut state = w.world.query::<(&StableId, &Transform3d, &Representation)>();
+            let mut out: Vec<(u64, [f64; 3], f32, u8)> = state
+                .iter(&w.world)
+                .map(|(s, t, r)| (s.0.index, t.translation_cm, r.significance, r.current_tier as u8))
+                .collect();
+            out.sort_by_key(|e| e.0);
+            out
+        }
+
+        // The global `ComputeTaskPool` is a one-shot singleton: whichever mode runs first fixes its size for
+        // the whole process. Init a genuinely multi-threaded pool HERE (4 threads regardless of core count, so
+        // it is real even on small CI runners) before either run, so the BoundedParallel run actually fans
+        // `par_iter` across threads instead of silently degrading to serial-vs-serial. No hard thread-count
+        // assert: in a full `cargo test` another test may have already initialized the singleton, and the
+        // equality below is the real guard. (A rigorous serial-vs-parallel `par_iter` comparison would need a
+        // separate process; this asserts the multi-threaded EXECUTOR matches the single-threaded one — the
+        // concurrency the `multi_threaded` feature actually introduces.)
+        bevy_tasks::ComputeTaskPool::get_or_init(|| bevy_tasks::TaskPoolBuilder::new().num_threads(4).build());
+
+        let single = run(LOGI_FLAG_FORCE_SINGLE_THREADED);
+        let parallel = run(0); // default BoundedParallel: MultiThreaded executor + pooled par_iter
+        assert_eq!(single.len(), 500, "all agents present");
+        assert_eq!(
+            single, parallel,
+            "parallel execution diverged from the single-threaded reference — replay determinism is broken"
+        );
     }
 }

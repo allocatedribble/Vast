@@ -6,14 +6,21 @@ license.workspace = true
 publish = false
 
 [dependencies]
-# M1: the AGI_HQ building scene — decode the .dae + transform into UE render space. Grows into the full
-# streaming scene (select + io + decode + rebase) once the M1 texture/placement path is proven.
+# COLLADA decode for the standalone `load_building` side lane (.dae → UE render space).
 logi_collada = { path = "../logi_collada" }
 logi_geospatial = { path = "../logi_geospatial" }
 glam = { workspace = true }
+# SwissTable maps/sets for the streaming bookkeeping (tile index, in-flight, grafts, mesh cache).
+hashbrown = { workspace = true }
 # The streaming tileset world (3D Tiles): traversal + worker-pool fetch + glTF decode + ECEF→ENU rebase.
 logi_3dtiles_tileset = { path = "../logi_3dtiles_tileset" }
 logi_3dtiles_select = { path = "../logi_3dtiles_select" }
+# Implicit tiling (3D Tiles 1.1): the `.subtree` codec the scene fetches + caches to drive the implicit
+# traversal (`select_tree_implicit`). NOTE: production Google P3DT (tile.googleapis.com) is actually
+# GRAFTED-EXPLICIT — a tree of external `tileset.json` files joined by `content.uri` references and grafted at
+# runtime (`graft_external`), NOT implicit subtrees; this codec serves the implicit lane for other providers /
+# the implicit P3DT variant. (Earlier comment wrongly said P3DT subdivides procedurally — it does not.)
+logi_3dtiles_implicit = { path = "../logi_3dtiles_implicit" }
 logi_3dtiles_io = { path = "../logi_3dtiles_io" }
 logi_gltf = { path = "../logi_gltf" }
 # Shared render-geometry home: ENU<->UE conversion + AABB sphere (audit M21/DUP-5, AGENTS.md §1A).

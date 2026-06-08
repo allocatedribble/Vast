@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-06-01
-- **Deciders:** LogiUE architecture
+- **Deciders:** Vast architecture
 - **Related:** [ADR-0005](ADR-0005-Bevy-ECS-Authority.md), [ADR-0001](ADR-0001-Mass-First-Unreal.md), [Budgets](../Performance/Budgets.md)
 
 > **Still in force under [ADR-0005](ADR-0005-Bevy-ECS-Authority.md).** The unified significance-score model
@@ -89,4 +89,4 @@ guessed.
 - Unreal: MassGameplay representation & LOD (High-res/Low-res Actor, ISM, None; High/Medium/Low/Off;
   separate representation/simulation/replication LOD clients).
 - Unreal: MetaHuman LODSync (Forced LOD, Min LOD), MetaHuman LOD specs, Animation Budget Allocator.
-- LogiUE [`AGENTS.md`](../../AGENTS.md) § 3 rule 11; [Budgets](../Performance/Budgets.md).
+- Vast [`AGENTS.md`](../../AGENTS.md) § 3 rule 11; [Budgets](../Performance/Budgets.md).

@@ -1,6 +1,6 @@
 //! The `.logipack` single-file container: header + concatenated page payloads + directory.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use crate::page::{content_id, Compression, PackError, PageDescriptor, PageId, PageKind, DESCRIPTOR_LEN};
 
@@ -42,7 +42,6 @@ impl PackageBuilder {
             kind,
             compression: Compression::None,
             license_id,
-            uncompressed_len: payload.len() as u32,
             stored_len: payload.len() as u32,
             offset,
         });
@@ -75,7 +74,6 @@ impl PackageBuilder {
             out.push(d.compression as u8);
             out.push(0u8); // pad
             out.extend_from_slice(&d.license_id.to_le_bytes());
-            out.extend_from_slice(&d.uncompressed_len.to_le_bytes());
             out.extend_from_slice(&d.stored_len.to_le_bytes());
             out.extend_from_slice(&(d.offset + HEADER_LEN as u64).to_le_bytes());
             // absolute
@@ -122,7 +120,12 @@ impl<'a> Package<'a> {
         let dir_offset = rd_u64(bytes, 20)? as usize;
         let dir_len = rd_u64(bytes, 28)? as usize;
 
-        if dir_len != count * DESCRIPTOR_LEN || dir_offset.checked_add(dir_len).is_none_or(|end| end > bytes.len()) {
+        // `checked_mul`: `count` is an untrusted u32 from the header; `count * DESCRIPTOR_LEN` (×36) could
+        // wrap on a 32-bit `usize` target and let a crafted count pass the `dir_len` check, after which
+        // `Vec::with_capacity(count)` would try to reserve ~gigabytes. On 64-bit it cannot wrap; the check is
+        // identical there. Treat an overflowing directory size as malformed.
+        let dir_bytes = count.checked_mul(DESCRIPTOR_LEN).ok_or(PackError::BadDirectory)?;
+        if dir_len != dir_bytes || dir_offset.checked_add(dir_len).is_none_or(|end| end > bytes.len()) {
             return Err(PackError::BadDirectory);
         }
 
@@ -134,9 +137,8 @@ impl<'a> Package<'a> {
             let kind = PageKind::from_u16(rd_u16(bytes, at + 16)?)?;
             let compression = Compression::from_u8(bytes[at + 18])?;
             let license_id = rd_u32(bytes, at + 20)?;
-            let uncompressed_len = rd_u32(bytes, at + 24)?;
-            let stored_len = rd_u32(bytes, at + 28)?;
-            let offset = rd_u64(bytes, at + 32)?;
+            let stored_len = rd_u32(bytes, at + 24)?;
+            let offset = rd_u64(bytes, at + 28)?;
             if offset
                 .checked_add(stored_len as u64)
                 .is_none_or(|end| end > bytes.len() as u64)
@@ -148,7 +150,6 @@ impl<'a> Package<'a> {
                 kind,
                 compression,
                 license_id,
-                uncompressed_len,
                 stored_len,
                 offset,
             });

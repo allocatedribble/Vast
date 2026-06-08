@@ -8,9 +8,15 @@ publish = false
 [dependencies]
 # Production HTTP backend: blocking ureq (rustls TLS) + the url crate for tile-URL resolution. NO tokio —
 # the streaming kernel is single-owner-thread; HTTP runs on a worker pool draining into poll_completed.
-ureq = "2"
+# `gzip` is pinned EXPLICITLY (it is a ureq default, but P3DT/tileset decode depends on transparent
+# `Content-Encoding: gzip` inflation in `into_reader()` — a future `default-features = false` would otherwise
+# silently break all GLB/tileset decoding with no compile error).
+ureq = { version = "2", features = ["gzip"] }
 url = "2"
-crossbeam-channel = "0.5"
+# MPMC channels for the fetch worker pool: request fan-out to N workers, results drained on the owner thread.
+flume = { workspace = true }
+# SwissTable maps/sets for the pending / in-flight / disk-cache bookkeeping.
+hashbrown = { workspace = true }
 
 [dev-dependencies]
 # For the live P3DT streaming example (resolve → fetch → parse → fetch a tile → attempt decode).

@@ -1,4 +1,4 @@
-//! Procedural terrain generation (rendering-strategy.md §5, data-model.md ProcSeedPage/HeightPage).
+//! Procedural terrain generation (rendering-strategy.md §5, data-model.md HeightPage).
 //!
 //! Deterministic, dependency-light: heights are a fractal of hashed value noise (no RNG/clock), so the
 //! same world position always yields the same height — which is exactly what gives **crack-free borders**
@@ -47,7 +47,7 @@ fn value_noise(x: f64, z: f64, seed: u64) -> f64 {
 }
 
 /// **Canonical terrain seed** — the SINGLE SOURCE OF TRUTH for which world the terrain *is*, shared
-/// by BOTH the gameplay sampler (`logi_sim`) and the render scene (`the retired render-scene crate`). Build the
+/// by BOTH the gameplay sampler (`logi_sim`) and the render scene. Build the
 /// shared field via [`TerrainHeights::canonical`]; never hardcode a different seed in one consumer,
 /// or the gameplay ground and the rendered ground describe different surfaces (agents float).
 pub const DEFAULT_SEED: u64 = 0xA11CE;
@@ -119,6 +119,9 @@ impl TerrainHeights {
     pub fn height_page(&self, origin_x: f64, origin_z: f64, size: f64, res: u16) -> HeightPage {
         // FIX 12: downstream height_mesh requires >=2 samples per edge (it builds quads).
         assert!(res >= 2, "height page needs >=2 samples per edge");
+        // `res` is engine-supplied tile resolution, never untrusted input; a sane upper bound documents the
+        // expected range and trips in debug before a wild value drives a multi-GB `with_capacity` (audit #9).
+        debug_assert!(res <= 8192, "height page resolution {res} unexpectedly large");
         let n = res as usize;
         let step = size / (res as f64 - 1.0).max(1.0);
         let mut heights = Vec::with_capacity(n * n);

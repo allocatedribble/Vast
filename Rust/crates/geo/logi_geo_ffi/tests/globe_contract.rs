@@ -33,8 +33,8 @@ fn sample_view(cx: f64, cy: f64, cz: f64) -> LogiGlobeView {
 #[test]
 fn globe_structs_have_the_documented_abi_layout() {
     assert_eq!(size_of::<LogiGlobeCreateInfo>(), 56, "LogiGlobeCreateInfo");
-    assert_eq!(size_of::<LogiGlobeTile>(), 80, "LogiGlobeTile");
-    assert_eq!(size_of::<LogiGlobeFrame>(), 48, "LogiGlobeFrame");
+    assert_eq!(size_of::<LogiGlobeTile>(), 88, "LogiGlobeTile");
+    assert_eq!(size_of::<LogiGlobeFrame>(), 80, "LogiGlobeFrame"); // v8: +delta lists +counts +frame_id (was 48)
     assert_eq!(size_of::<LogiGlobeView>(), 104, "LogiGlobeView"); // 13 × f64
 }
 
@@ -50,7 +50,7 @@ fn globe_null_args_rejected_not_crashed() {
         origin_height_m: 0.0,
         max_tile_distance_m: 6000.0,
         workers: 4,
-        _reserved: 0,
+        mesh_cache_budget_mb: 0, // 0 = leave the in-memory mesh cache at its default budget
         cache_budget_bytes: 0,
     };
     // Non-null info but null token is still rejected (no resolve attempted).
@@ -95,7 +95,7 @@ fn globe_streams_live() {
         origin_height_m: 0.0,
         max_tile_distance_m: 6000.0,
         workers: 8,
-        _reserved: 0,
+        mesh_cache_budget_mb: 256, // exercise the in-memory mesh-cache budget path alongside the disk budget
         cache_budget_bytes: 512 * 1024 * 1024,
     };
     let world = unsafe { logi_globe_world_create(&info as *const _, token.as_ptr(), cache_dir_c.as_ptr()) };

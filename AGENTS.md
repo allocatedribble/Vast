@@ -1,4 +1,4 @@
-# LogiUE — Agent Constitution
+# Vast — Agent Constitution
 
 > This is the top-level instruction set for **any** automated or human agent writing code in this
 > repository. Read it before writing a single line. If a change you are about to make violates a rule
@@ -6,7 +6,7 @@
 > [`Docs/Architecture/`](Docs/Architecture/) proposing the exception. Exceptions are documents, not
 > code comments.
 
-LogiUE is **Bevy-first**: a Rust `bevy_ecs` simulation owns gameplay truth, and Unreal Engine 5.8 is its
+Vast is **Bevy-first**: a Rust `bevy_ecs` simulation owns gameplay truth, and Unreal Engine 5.8 is its
 renderer / animator / host. This supersedes the earlier Mass-first design — see
 [ADR-0005](Docs/Architecture/ADR-0005-Bevy-ECS-Authority.md). Translate intent, never API shape.
 
@@ -32,9 +32,10 @@ The constitution is refined by ADRs in [`Docs/Architecture/`](Docs/Architecture/
 
 ## 0. North Star
 
-LogiUE is a **near-Earth-scale logistics simulation**:
+Vast is a **near-Earth-scale, dynamic planet simulation** — a first- and third-person game in a living
+world. The logistics layer the project was named for is now **one mode** inside it:
 
-- **Planetary / near-Earth scale**, continuous zoom from orbital flows down to **one courier carrying one package**.
+- **Planetary / near-Earth scale**, continuous zoom from orbital flows down to **a single character on foot** (or one courier carrying one package).
 - **Millions of simulated agents.**
 - **"Real where you look, faked where you don't"** — full fidelity inside the player's attention; aggregate modeling elsewhere.
 - **Deterministic, fixed-step simulation** wherever replay or snapshot equality is required.

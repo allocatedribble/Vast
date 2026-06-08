@@ -10,7 +10,7 @@
 //!
 //! HE-0 scope = **terrain only**. Trees/foliage (instance batches), water, and buildings extend the
 //! format + this crate in later HE milestones; the format is **versioned** so the runtime refuses an
-//! unknown major rather than misreading it.
+//! unknown version rather than misreading it.
 
 #![forbid(unsafe_code)]
 
@@ -92,6 +92,10 @@ pub enum SemanticError {
     Crc,
     #[error("bad grid (grid_n < 2 or height count mismatch)")]
     BadGrid,
+    #[error(
+        "procedural world too large (~{estimated_vertices} vertices > {max} ceiling); reduce leaf_level or grid_n"
+    )]
+    TooLarge { estimated_vertices: u64, max: u64 },
     #[error("tile {0:?} not in store")]
     TileNotFound(TileId),
     #[error("io: {0}")]

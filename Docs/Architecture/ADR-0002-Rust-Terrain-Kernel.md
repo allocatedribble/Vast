@@ -4,7 +4,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-06-01
-- **Deciders:** LogiUE architecture
+- **Deciders:** Vast architecture
 - **Related:** [ADR-0005](ADR-0005-Bevy-ECS-Authority.md) (generalizes this ADR), [ADR-0001](ADR-0001-Mass-First-Unreal.md), [ADR-0003](ADR-0003-Representation-LOD.md)
 
 > **Generalized by [ADR-0005](ADR-0005-Bevy-ECS-Authority.md).** This ADR's principle — Rust owns truth
@@ -13,7 +13,7 @@
 
 ## Context
 
-LogiUE renders a planet. Terrain at near-Earth scale must be **deterministic** (the same tile must
+Vast renders a planet. Terrain at near-Earth scale must be **deterministic** (the same tile must
 resolve to the same identity and source data on every machine and every run, to support replay and
 distributed/streamed play), **portable** (terrain truth must not be hostage to Unreal's asset or
 streaming lifecycle), and **fast to query** at simulation rates independent of rendering.
@@ -82,5 +82,5 @@ FFI; data crosses it, types do not.
 
 ## References
 
-- LogiUE [`AGENTS.md`](../../AGENTS.md) § 3 rule 6.
+- Vast [`AGENTS.md`](../../AGENTS.md) § 3 rule 6.
 - Unreal: World Partition & HLOD, Nanite Landscape, Runtime Virtual Texturing, Virtual Shadow Maps.

@@ -69,6 +69,18 @@ struct StreamShared {
     resident_tiles: AtomicUsize,
     in_flight: AtomicUsize,
     cached_bytes: AtomicU64,
+    /// Cumulative tiles that GAVE UP loading, mirrored from `GeoStats` for the game thread (lock-free
+    /// telemetry). Split so a diagnostic can tell the two reasons a tile stays stuck at its coarse (blurry)
+    /// ancestor apart: `fetch_failed` = the bytes never arrived (dead URL / network / expired session, after
+    /// retries); `decode_failed` = bytes arrived but didn't parse (unsupported format like Draco/KTX2, or
+    /// corrupt). A climbing `fetch_failed` points at the network; a climbing `decode_failed` at the codec.
+    decode_failed: AtomicU64,
+    fetch_failed: AtomicU64,
+    /// External-tileset manifests that fetched but failed to GRAFT (subtree never appears → region stuck
+    /// coarse), and selected tiles whose content URI failed to RESOLVE (never fetched → region stuck coarse).
+    /// Both were silent before; a climbing count is the patchy-stuck-blur cause. Mirrored from `GeoStats`.
+    graft_failed: AtomicU64,
+    url_resolve_failed: AtomicU64,
 }
 
 /// The game-thread handle to a decoupled Geo stream. Owns the worker thread; dropping it stops + joins it.
@@ -93,10 +105,18 @@ impl GlobeStreamer {
             resident_tiles: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             cached_bytes: AtomicU64::new(0),
+            decode_failed: AtomicU64::new(0),
+            fetch_failed: AtomicU64::new(0),
+            graft_failed: AtomicU64::new(0),
+            url_resolve_failed: AtomicU64::new(0),
         });
         let thread_shared = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("LogiGeoStream".to_string())
+            // Generous stack: the tileset traversal recurses up to `MAX_TILE_DEPTH` (512) levels for a deeply
+            // grafted "tree of trees", and each level's frame × 512 exceeds the 2 MB default spawned-thread
+            // stack. 32 MiB leaves ample margin so a pathologically deep (but capped) tileset can never overflow.
+            .stack_size(32 * 1024 * 1024)
             .spawn(move || run_stream(world, thread_shared, idle_park))
             .expect("spawn Geo stream thread");
         Self {
@@ -146,6 +166,26 @@ impl GlobeStreamer {
     /// Bytes resident in the persistent disk cache (telemetry, lock-free).
     pub fn cached_bytes(&self) -> u64 {
         self.shared.cached_bytes.load(Ordering::Relaxed)
+    }
+    /// Cumulative tiles that gave up DECODING — bytes arrived but didn't parse (unsupported format like
+    /// Draco/KTX2, or corrupt). Terminal; the tile stays at its coarse ancestor (telemetry, lock-free).
+    pub fn decode_failed(&self) -> u64 {
+        self.shared.decode_failed.load(Ordering::Relaxed)
+    }
+    /// Cumulative tiles that gave up FETCHING after retries — bytes never arrived (dead URL / network /
+    /// expired session). Terminal; the tile stays at its coarse ancestor (telemetry, lock-free).
+    pub fn fetch_failed(&self) -> u64 {
+        self.shared.fetch_failed.load(Ordering::Relaxed)
+    }
+    /// Cumulative external-tileset manifests that fetched but FAILED TO GRAFT — the subtree never appears, so
+    /// its region is stuck at the coarse parent (telemetry, lock-free).
+    pub fn graft_failed(&self) -> u64 {
+        self.shared.graft_failed.load(Ordering::Relaxed)
+    }
+    /// Cumulative selected tiles whose content URI FAILED TO RESOLVE — never fetched, region stuck coarse
+    /// (telemetry, lock-free).
+    pub fn url_resolve_failed(&self) -> u64 {
+        self.shared.url_resolve_failed.load(Ordering::Relaxed)
     }
     /// Frames the stream thread has published (telemetry).
     pub fn produced(&self) -> u64 {
@@ -216,6 +256,19 @@ fn run_stream(mut world: GeoWorld, shared: Arc<StreamShared>, idle_park: Duratio
                 shared.resident_tiles.store(world.resident_tiles(), Ordering::Relaxed);
                 shared.in_flight.store(world.in_flight(), Ordering::Relaxed);
                 shared.cached_bytes.store(world.cached_bytes(), Ordering::Relaxed);
+                let stats = world.stats();
+                shared
+                    .decode_failed
+                    .store(u64::from(stats.decode_failed_total), Ordering::Relaxed);
+                shared
+                    .fetch_failed
+                    .store(u64::from(stats.fetch_failed_total), Ordering::Relaxed);
+                shared
+                    .graft_failed
+                    .store(u64::from(stats.graft_failed_total), Ordering::Relaxed);
+                shared
+                    .url_resolve_failed
+                    .store(u64::from(stats.url_resolve_failed_total), Ordering::Relaxed);
                 std::thread::park_timeout(SHORT_PARK);
             }
             _ => std::thread::park_timeout(idle_park),

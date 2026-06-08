@@ -43,13 +43,13 @@ Rules that make this safe:
 
 ## Consequences
 
-- The editor gets a first-class Logi Outliner + Details experience over a Rust
+- The editor gets a first-class Vast Outliner + Details experience over a Rust
   world, with virtualized rows and a single selection proxy.
 - **Zero shipping cost:** no `logi_editor_*` symbols and no editor Slate code in
   Shipping/Test. Enforced by CI:
   - Shipping build contains no `logi_editor_*` symbols.
   - `LogiBevyEditor` is not loaded outside the editor.
-  - With no Logi panel open, zero editor-introspection FFI calls occur.
+  - With no Vast panel open, zero editor-introspection FFI calls occur.
   - The Outliner pages 100k entities without allocating 100k UObjects.
 - Introspection is sampling-based, so it never perturbs determinism or the fixed
   step; it observes published snapshots, it does not drive the sim.

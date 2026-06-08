@@ -10,3 +10,7 @@ bevy_tasks.workspace = true
 logi_schema = { path = "../logi_schema" }
 # Coarse deterministic ground for gameplay queries (ADR-0007 / plan §10).
 logi_geo_procgen = { path = "../geo/logi_geo_procgen" }
+
+[dev-dependencies]
+# Test-only: a result map keyed by entity index for the representation-budget assertions.
+hashbrown = { workspace = true }

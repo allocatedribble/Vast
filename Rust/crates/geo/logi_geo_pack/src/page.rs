@@ -52,26 +52,12 @@ fn fnv1a64(bytes: &[u8], mut h: u64) -> u64 {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PageKind {
     Height = 0,
-    Normal = 1,
-    Material = 2,
-    Vector = 3,
-    ProcSeed = 4,
-    Collision = 5,
-    Attribution = 6,
-    RenderPatch = 7,
 }
 
 impl PageKind {
     pub fn from_u16(v: u16) -> Result<Self, PackError> {
         Ok(match v {
             0 => Self::Height,
-            1 => Self::Normal,
-            2 => Self::Material,
-            3 => Self::Vector,
-            4 => Self::ProcSeed,
-            5 => Self::Collision,
-            6 => Self::Attribution,
-            7 => Self::RenderPatch,
             other => return Err(PackError::UnknownKind(other)),
         })
     }
@@ -100,11 +86,10 @@ pub struct PageDescriptor {
     pub kind: PageKind,
     pub compression: Compression,
     pub license_id: u32,
-    pub uncompressed_len: u32,
     pub stored_len: u32,
     /// Absolute byte offset of the stored payload within the package.
     pub offset: u64,
 }
 
 /// Serialized size of one directory entry.
-pub(crate) const DESCRIPTOR_LEN: usize = 40;
+pub(crate) const DESCRIPTOR_LEN: usize = 36;

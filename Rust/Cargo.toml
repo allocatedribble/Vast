@@ -15,6 +15,9 @@ members = [
 	"crates/logi_sim",
 	"crates/logi_render_extract",
 	"crates/logi_schema",
+	# Cross-cutting: in-process profiling/benchmarking instrumentation (Docs/Research/UE-5.8-Frame-Profiling-
+	# and-Rust-Benchmarking.md). Off by default (zero shipping cost); consumers opt in via `logi_prof/prof`.
+	"crates/logi_prof",
 	# Geo engine — the real-world terrain / earth stack (renamed from "terrain"; ADR-0007/0009/0011),
 	# grouped under crates/geo/. Kernel = pack/procgen/lod/ffi; plus the 3D-Tiles + semantic crates.
 	"crates/geo/logi_geo_mesh",     # shared render-geometry contract: vertex layout, ENU<->UE, AABB sphere
@@ -28,6 +31,7 @@ members = [
 	"crates/geo/logi_3dtiles_implicit",
 	"crates/geo/logi_3dtiles_select",
 	"crates/geo/logi_gltf",
+	"crates/geo/logi_draco",        # vendored-Draco FFI decoder (ADR-0009 exception) for KHR_draco_mesh_compression
 	"crates/geo/logi_3dtiles_io",
 	"crates/geo/logi_collada",
 	"crates/geo/logi_3dtiles_scene",
@@ -41,13 +45,38 @@ version = "0.1.0"
 license = "Proprietary"
 
 [workspace.dependencies]
-bevy_ecs = "0.18.1"
-bevy_tasks = "0.18.1"
+# `multi_threaded` is OFF in bevy's default features — without it `par_iter`/`par_iter_mut` degrade to a
+# serial fold and the "MultiThreaded" executor runs on a 1-thread pool (all our parallelism was a no-op).
+# Enabling it turns on the real work-stealing pool the geo `decode` + per-agent gameplay systems fan out
+# over. Pulls in only `arrayvec` + `async-channel` (no GPU/runtime crates) — within the §10 / ADR-0004 rule.
+# Pinned EXACTLY (`=`) to the 0.19.0 release candidate: pre-releases can carry breaking changes between
+# RCs, so `cargo update` must not silently jump to rc.3 / 0.19.0-final. Re-pin deliberately when bumping.
+bevy_ecs = { version = "=0.19.0-rc.2", features = ["multi_threaded"] }
+bevy_tasks = { version = "=0.19.0-rc.2", features = ["multi_threaded"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
-glam = "0.30"
+# One glam for the whole workspace: its math types (DVec3/DMat4/Quat/…) cross our crate boundaries
+# (geo math -> FFI -> sim -> render-extract), so every crate MUST compile against the SAME version or the
+# "same" type becomes two incompatible types that won't unify at the boundary. Kept in lockstep with the
+# glam that bevy_reflect transitively pulls (bevy 0.19 -> glam 0.32) so the tree holds exactly ONE glam
+# copy rather than a 0.30 + 0.32 split. Resolves to 0.32.1 in Cargo.lock.
+glam = "0.32"
+# SwissTable maps with the foldhash default hasher — faster than std's SipHash and already in the tree
+# (bevy_ecs pulls hashbrown transitively). Iteration order is randomized like std, so the existing
+# sort-before-output discipline (§8 determinism) is unchanged. No `serde` feature: no map is serialized.
+hashbrown = "0.17"
+# MPMC channels for the Geo tile-fetch worker pool (replaces crossbeam-channel). default-features = false
+# drops the async/select/fairness extras we don't use, keeping the dependency lean (§1B).
+flume = { version = "0.11", default-features = false }
+# Global allocator for the shipped cdylibs (logi_ffi.dll / logi_geo.dll). Lower fragmentation and faster
+# multithreaded alloc/free on the streaming + extract hot paths; governs only each DLL's own Rust heap.
+mimalloc = "0.1"
+# Microbenchmark harness (dev-only). Chosen over criterion for the parameterized scaling sweeps this
+# project lives on (`#[divan::bench(args = [1k..1M])]`) and its CI-stable low-overhead sampling. See
+# Docs/Research/UE-5.8-Frame-Profiling-and-Rust-Benchmarking.md §A. Used only behind `[[bench]]` targets.
+divan = "0.1"
 
 [profile.release]
 panic = "abort"

@@ -6,3 +6,5 @@ license.workspace = true
 publish = false
 
 [dependencies]
+# SwissTable map for page-dedup during packing.
+hashbrown = { workspace = true }

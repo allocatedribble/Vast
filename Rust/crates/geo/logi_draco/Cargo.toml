@@ -1,0 +1,25 @@
+# logi_draco — Draco mesh decompression for the actorless 3D-Tiles geo stack (ADR-0009's reserved
+# "one vendored-Draco FFI exception"). Google Photorealistic 3D Tiles and Cesium World Terrain ship
+# fine-LOD glTF tiles whose geometry is `KHR_draco_mesh_compression`; `logi_gltf` decodes the
+# uncompressed primitives and hands the Draco ones here. We vendor the DECODER subset of Google Draco
+# 1.5.7 (Apache-2.0, under vendor/draco/) and build it with `cc` + a minimal C FFI shim — no cmake at
+# consumer build time, no system draco, the whole boundary owned in-tree. There is NO usable pure-Rust
+# Draco decoder yet (draco-oxide's decoder is unimplemented/WIP; draco_decoder/draco-rs are themselves
+# C++ FFI wrappers), so this is the leanest controllable option.
+[package]
+name = "logi_draco"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+# Pin the C++ shim/vendored sources as the build trigger so `cargo` reruns build.rs when they change.
+build = "build.rs"
+
+[dependencies]
+# Typed, hostile-input-safe errors (network bytes, §1A discipline) — matches the workspace's thiserror.
+thiserror = { workspace = true }
+
+[build-dependencies]
+# C/C++ toolchain driver. We compile the vendored Draco decoder + our shim as a static lib; `cc` finds
+# MSVC on Windows. No cmake (Draco's CMake is for its full build; we glob just the decode subset).
+cc = "1"

@@ -4,13 +4,13 @@
 //! deterministic, no-network local source — the actorless selection/cache/scheduler reuse unchanged).
 
 use crate::format::SemanticTile;
-use crate::{SemanticError, TileId};
+use crate::SemanticError;
+use hashbrown::HashSet;
 use logi_3dtiles_io::{Loaded, RequestId, TileContentSource};
 use serde::Deserialize;
-use std::collections::HashSet;
 use std::path::PathBuf;
 
-/// Current manifest schema version (refuse an unknown major rather than misread).
+/// Current manifest schema version (refuse an unknown version rather than misread).
 pub const MANIFEST_FORMAT_VERSION: u32 = 1;
 
 /// The AOI origin: the ENU frame origin (and its WGS84 ECEF), from which every tile's metric offsets are
@@ -85,28 +85,6 @@ impl BakedStore {
         &self.manifest
     }
 
-    /// All tile ids in the store (manifest order).
-    pub fn tile_ids(&self) -> Vec<TileId> {
-        self.manifest
-            .tiles
-            .iter()
-            .map(|t| TileId::new(t.level, t.x, t.y))
-            .collect()
-    }
-
-    /// Read + decode one tile by id (validating its CRC-32). This does a linear scan of the manifest to
-    /// find the entry; when reading **every** tile, iterate [`Manifest::tiles`] and call
-    /// [`Self::read_tile_entry`] instead (avoids the O(n²) repeated scan — see `BakedWorld::open_with`).
-    pub fn read_tile(&self, id: TileId) -> Result<SemanticTile, SemanticError> {
-        let entry = self
-            .manifest
-            .tiles
-            .iter()
-            .find(|t| t.level == id.level && t.x == id.x && t.y == id.y)
-            .ok_or(SemanticError::TileNotFound(id))?;
-        self.read_tile_entry(entry)
-    }
-
     /// Read + decode the tile named by a manifest `entry` (validating its CRC-32). O(1) — no manifest scan.
     pub fn read_tile_entry(&self, entry: &ManifestTile) -> Result<SemanticTile, SemanticError> {
         let bytes = std::fs::read(self.dir.join(&entry.file)).map_err(|e| SemanticError::Io(e.to_string()))?;
@@ -150,7 +128,9 @@ impl TileContentSource for BakedTileSource {
             Vec::new()
         });
         self.in_flight.insert(id);
-        self.ready.push(Loaded { id, bytes });
+        // A local read failure degrades to an empty body (logged above). Wrapped `Ok` to match the typed
+        // fetch contract (audit A10); the baked owner treats an empty body as the missing-tile sentinel.
+        self.ready.push(Loaded { id, result: Ok(bytes) });
     }
 
     fn poll_completed(&mut self, _now_tick: u64, out: &mut Vec<Loaded>) {
@@ -209,12 +189,12 @@ mod tests {
 
         let store = BakedStore::open(&dir).unwrap();
         assert_eq!(store.manifest().seed, 7);
-        assert_eq!(store.tile_ids(), vec![id]);
-        assert_eq!(store.read_tile(id).unwrap(), t);
-        assert!(matches!(
-            store.read_tile(TileId::new(1, 1, 1)),
-            Err(SemanticError::TileNotFound(_))
-        ));
+        // The manifest lists the one tile, and reading it through the production entry path
+        // (`read_tile_entry`, as `BakedWorld::open_with` does) decodes back to the original.
+        let entries = &store.manifest().tiles;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(TileId::new(entries[0].level, entries[0].x, entries[0].y), id);
+        assert_eq!(store.read_tile_entry(&entries[0]).unwrap(), t);
     }
 
     #[test]
@@ -243,7 +223,7 @@ mod tests {
         src.poll_completed(0, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, 42);
-        assert_eq!(SemanticTile::decode(&out[0].bytes).unwrap(), t);
+        assert_eq!(SemanticTile::decode(out[0].result.as_ref().unwrap()).unwrap(), t);
         assert_eq!(src.in_flight(), 0);
 
         // A missing file is an empty (failed) load, not a panic.
@@ -251,6 +231,6 @@ mod tests {
         let mut out2 = Vec::new();
         src.poll_completed(0, &mut out2);
         assert_eq!(out2.len(), 1);
-        assert!(out2[0].bytes.is_empty());
+        assert!(out2[0].result.as_ref().unwrap().is_empty());
     }
 }

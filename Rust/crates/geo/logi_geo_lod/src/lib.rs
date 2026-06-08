@@ -21,35 +21,9 @@ pub fn screen_space_error(geometric_error: f64, distance: f64, fov_y_radians: f6
     geometric_error * pixels_per_unit
 }
 
-/// The level (0..=`max_level`) to render at, given the target screen-space error. **Higher level =
-/// finer** (geometric error halves each level), so this returns the **finest level required** to bring
-/// SSE within `sse_target_pixels` at `distance` — the smallest level whose SSE already meets the target,
-/// since refining past it is wasted. A smaller (stricter) target therefore yields a higher level. The
-/// loop stops at the first satisfying level and never exceeds `max_level`.
-pub fn desired_level(
-    base_geometric_error: f64,
-    distance: f64,
-    fov_y_radians: f64,
-    viewport_height: f64,
-    sse_target_pixels: f64,
-    max_level: u8,
-) -> u8 {
-    let mut level = 0u8;
-    while level < max_level {
-        // FIX 5: multiply by 0.5^level instead of dividing by `1 << level` — no shift overflow past
-        // level 63 and exact enough for the SSE comparison.
-        let ge = base_geometric_error * 0.5f64.powi(level as i32);
-        if screen_space_error(ge, distance, fov_y_radians, viewport_height) <= sse_target_pixels {
-            break;
-        }
-        level += 1;
-    }
-    level
-}
-
 /// Parameters for SSE-driven hierarchical refinement — the single criterion both the baked quadtree
 /// selector (`logi_semantic::world::BakedWorld::select`) and the 3D-Tiles pointer-tree selector
-/// (`logi_3dtiles_select::select_tree`) descend by (audit M22/DUP-2). The tree-walks stay separate (they
+/// (`logi_3dtiles_select::select_tree_implicit`) descend by (audit M22/DUP-2). The tree-walks stay separate (they
 /// traverse structurally different trees — an indexed quadtree vs a pointer tree threading a world
 /// transform and a streaming fallback); only the refine *decision* below is shared.
 #[derive(Clone, Copy, Debug)]
@@ -86,70 +60,15 @@ pub fn should_refine(geometric_error: f64, distance: f64, params: &RefineParams,
     sse > threshold
 }
 
-/// Render bands (rendering-strategy.md §5.3): the detail/behavior tier a patch belongs to.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TerrainBand {
-    Near,
-    Mid,
-    Far,
-    Orbital,
-}
-
-/// Classify a patch into a render band by camera `distance` (world units), given the band radii.
-pub fn classify_band(distance: f64, near: f64, mid: f64, far: f64) -> TerrainBand {
-    if distance <= near {
-        TerrainBand::Near
-    } else if distance <= mid {
-        TerrainBand::Mid
-    } else if distance <= far {
-        TerrainBand::Far
-    } else {
-        TerrainBand::Orbital
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bands_classify_by_distance() {
-        assert_eq!(classify_band(50.0, 100.0, 1000.0, 10000.0), TerrainBand::Near);
-        assert_eq!(classify_band(500.0, 100.0, 1000.0, 10000.0), TerrainBand::Mid);
-        assert_eq!(classify_band(5000.0, 100.0, 1000.0, 10000.0), TerrainBand::Far);
-        assert_eq!(classify_band(50000.0, 100.0, 1000.0, 10000.0), TerrainBand::Orbital);
-    }
 
     #[test]
     fn sse_decreases_with_distance() {
         let near = screen_space_error(10.0, 100.0, 1.0, 1080.0);
         let far = screen_space_error(10.0, 10000.0, 1.0, 1080.0);
         assert!(near > far);
-    }
-
-    #[test]
-    fn coarser_sse_target_picks_lower_level() {
-        let fine = desired_level(4096.0, 5000.0, 1.0, 1080.0, 1.0, 12);
-        let coarse = desired_level(4096.0, 5000.0, 1.0, 1080.0, 64.0, 12);
-        assert!(
-            fine > coarse,
-            "smaller SSE target -> finer level: fine {fine} vs coarse {coarse}"
-        );
-    }
-
-    /// H7: doc/name/test all agree that **higher level = finer**. The closer the camera (smaller
-    /// distance ⇒ larger SSE), the more refinement is required, so the returned level must be monotone
-    /// non-increasing in distance.
-    #[test]
-    fn higher_level_is_finer_closer_camera_refines_more() {
-        let near = desired_level(4096.0, 200.0, 1.0, 1080.0, 4.0, 16);
-        let far = desired_level(4096.0, 50_000.0, 1.0, 1080.0, 4.0, 16);
-        assert!(
-            near >= far,
-            "closer camera needs an equal-or-finer (higher) level: near {near} vs far {far}"
-        );
-        // And a strictly closer camera at this scale should strictly out-refine the orbital one.
-        assert!(near > far, "near should out-refine far: near {near} vs far {far}");
     }
 
     /// M1 (SSE edge): a feature with zero geometric error has zero screen-space error at every distance —
@@ -159,8 +78,6 @@ mod tests {
         assert_eq!(screen_space_error(0.0, 0.0, 1.0, 1080.0), 0.0);
         assert_eq!(screen_space_error(0.0, 1e-9, 1.0, 1080.0), 0.0);
         assert_eq!(screen_space_error(0.0, 10_000.0, 1.0, 1080.0), 0.0);
-        // A zero-error base field stays at the coarsest level regardless of how close the camera gets.
-        assert_eq!(desired_level(0.0, 1e-9, 1.0, 1080.0, 1.0, 12), 0);
     }
 
     #[test]

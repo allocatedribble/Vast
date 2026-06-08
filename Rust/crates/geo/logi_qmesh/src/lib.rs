@@ -21,7 +21,18 @@ pub enum QmError {
     UnexpectedEof,
     /// A decoded triangle index referenced a vertex `>= vertex_count` (corrupt high-watermark stream).
     BadIndex,
+    /// A header vertex/triangle count exceeded the per-tile ceiling ([`MAX_QMESH_VERTICES`] /
+    /// [`MAX_QMESH_TRIANGLES`]) — a crafted/corrupt count that must not drive a large pre-allocation.
+    TooLarge,
 }
+
+/// Defense-in-depth ceilings on a single tile's vertex / triangle counts (audit #9). The `Reader`'s
+/// `remaining() < n*size` checks already bound each count to the (caller-bounded) buffer length, so these
+/// are a belt-and-suspenders cap that keeps a crafted huge header count from pre-sizing a large `Vec` even
+/// if an unbounded buffer ever reaches [`parse`]. Real quantized-mesh tiles are tiny; 4 M of each is far
+/// above any production tile (and the `u16` vertex transport caps a tile at 65536 vertices anyway).
+pub const MAX_QMESH_VERTICES: usize = 4 * 1024 * 1024;
+pub const MAX_QMESH_TRIANGLES: usize = 4 * 1024 * 1024;
 
 // ---- bit/byte building blocks (pub for reuse + direct testing) -------------------------------------
 
@@ -29,13 +40,6 @@ pub enum QmError {
 #[inline]
 pub fn zigzag_decode(value: u16) -> i32 {
     ((value >> 1) as i32) ^ (-((value & 1) as i32))
-}
-
-/// Zig-zag encode a signed delta to `u16` (inverse of [`zigzag_decode`]; the encoder side, for tooling
-/// and tests).
-#[inline]
-pub fn zigzag_encode(n: i32) -> u16 {
-    ((n << 1) ^ (n >> 31)) as u16
 }
 
 /// Decode an oct-encoded unit normal (extension 1): two `u8`s → a unit `DVec3`. Per cesium-native
@@ -98,11 +102,6 @@ impl IndexBuffer {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    /// Widen to `u32` for uniform downstream use.
-    pub fn to_u32(&self) -> Vec<u32> {
-        self.iter_u32().collect()
-    }
-
     /// Borrowing iterator over the indices widened to `u32` — no allocation, no clone (audit M10). Lets
     /// callers walk the index buffer (normals, triangle filtering) without materialising a `Vec<u32>` copy.
     pub fn iter_u32(&self) -> impl Iterator<Item = u32> + '_ {
@@ -197,9 +196,8 @@ impl<'a> Reader<'a> {
     fn read_u8(&mut self) -> Result<u8, QmError> {
         Ok(self.read_array::<1>()?[0])
     }
-    fn read_u16(&mut self) -> Result<u16, QmError> {
-        Ok(u16::from_le_bytes(self.read_array()?))
-    }
+    // (scalar `read_u16` retired: the bulk `read_u16_vec` now decodes runs directly, and nothing else
+    // reads a lone u16 — see audit D4.)
     fn read_u32(&mut self) -> Result<u32, QmError> {
         Ok(u32::from_le_bytes(self.read_array()?))
     }
@@ -222,23 +220,37 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
     fn read_u16_vec(&mut self, n: usize) -> Result<Vec<u16>, QmError> {
-        if self.remaining() < n.saturating_mul(2) {
+        // Bound the whole run once (`saturating_mul` so a crafted huge `n` can't wrap the byte count),
+        // then decode the validated slice in one bulk pass. `chunks_exact(2)` yields exactly `n` full
+        // 2-byte chunks (the slice is `n*2` bytes), so per-element bounds re-checks are gone and the
+        // `u16::from_le_bytes` map auto-vectorizes — same O(n), ~4-8× smaller constant than the old
+        // per-element `read_u16` loop (audit D4). LE semantics are unchanged.
+        let nbytes = n.saturating_mul(2);
+        if self.remaining() < nbytes {
             return Err(QmError::UnexpectedEof);
         }
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(self.read_u16()?);
-        }
+        let end = self.pos + nbytes;
+        let out = self.buf[self.pos..end]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        self.pos = end;
         Ok(out)
     }
     fn read_u32_vec(&mut self, n: usize) -> Result<Vec<u32>, QmError> {
-        if self.remaining() < n.saturating_mul(4) {
+        // u32 analogue of `read_u16_vec`: validate the `n*4`-byte run once, then bulk-decode the slice via
+        // `chunks_exact(4)` (exactly `n` chunks) — no per-element re-check, vectorizable, same error
+        // behaviour and LE semantics (audit D4).
+        let nbytes = n.saturating_mul(4);
+        if self.remaining() < nbytes {
             return Err(QmError::UnexpectedEof);
         }
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(self.read_u32()?);
-        }
+        let end = self.pos + nbytes;
+        let out = self.buf[self.pos..end]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        self.pos = end;
         Ok(out)
     }
     /// Advance to the next `n`-byte boundary (the IndexData alignment pad).
@@ -253,17 +265,22 @@ impl<'a> Reader<'a> {
 // ---- delta/zig-zag + high-watermark decode --------------------------------------------------------
 
 /// Resolve the zig-zag + prefix-sum encoding of a `u`/`v`/`height` array (result each `0..=32767`).
-fn decode_delta_zigzag(raw: &[u16]) -> Vec<u16> {
+///
+/// Decodes IN PLACE, consuming the raw buffer `read_u16_vec` already allocated and reusing it for the
+/// result (both are `Vec<u16>`) — so the three axes cost three allocs/tile total instead of six (audit D6).
+/// Semantics are byte-for-byte the prior `map(...).collect()`: each slot becomes the running `wrapping_add`
+/// of the zig-zag-decoded deltas, truncated `as u16`.
+fn decode_delta_zigzag(mut raw: Vec<u16>) -> Vec<u16> {
     let mut acc: i32 = 0;
-    raw.iter()
-        .map(|&z| {
-            // `wrapping_add`: the running sum can overflow i32 on hostile/corrupt input (many max
-            // deltas); the result is truncated `as u16` anyway, so wrapping is the intended semantics
-            // and avoids a debug-build overflow panic on untrusted bytes.
-            acc = acc.wrapping_add(zigzag_decode(z));
-            acc as u16
-        })
-        .collect()
+    for slot in &mut raw {
+        // `wrapping_add`: the running sum can overflow i32 on hostile/corrupt input (many max deltas); the
+        // result is truncated `as u16` anyway, so wrapping is the intended semantics and avoids a
+        // debug-build overflow panic on untrusted bytes. Read the encoded delta from the slot, then
+        // overwrite the slot with the resolved absolute value.
+        acc = acc.wrapping_add(zigzag_decode(*slot));
+        *slot = acc as u16;
+    }
+    raw
 }
 
 /// High-watermark / forward-difference index decode: `index = highest - code; if code==0 { highest++ }`.
@@ -279,7 +296,10 @@ fn decode_indices_hw(raw: impl Iterator<Item = u32>, vertex_count: usize) -> Res
     for code in raw {
         let index = highest.wrapping_sub(code);
         if code == 0 {
-            highest += 1;
+            // `wrapping_add` (matching the `wrapping_sub` above): a hostile all-zero code stream could drive
+            // `highest` past u32::MAX, which would panic in an overflow-checks build. The exact `index >= vc`
+            // bound below rejects any wrapped value, so wrapping here is sound and abort-proof on bad bytes.
+            highest = highest.wrapping_add(1);
         }
         // `>=` (not `>`) — a valid index is `0..vertex_count`. `wrapping_sub` underflow surfaces here as a
         // huge value that fails the bound, so a malformed forward-difference stream errors cleanly.
@@ -293,6 +313,13 @@ fn decode_indices_hw(raw: impl Iterator<Item = u32>, vertex_count: usize) -> Res
 
 fn read_edge_ring(r: &mut Reader, use_u32: bool) -> Result<Vec<u32>, QmError> {
     let n = r.read_u32()? as usize;
+    // Cap the edge-ring count symmetrically with the vertex/triangle counts (audit D8). An edge ring lists
+    // perimeter VERTEX indices, so a ring can't sanely exceed the tile's vertex ceiling. Without this the
+    // count was bounded only by the reader's saturating capacity check; this is the same defense-in-depth
+    // post-bounds rejection used for the vertex/triangle counts, against a crafted huge `n`.
+    if n > MAX_QMESH_VERTICES {
+        return Err(QmError::TooLarge);
+    }
     if use_u32 {
         r.read_u32_vec(n)
     } else {
@@ -354,19 +381,26 @@ pub fn parse(bytes: &[u8]) -> Result<QuantizedMeshTile, QmError> {
     };
 
     let vertex_count = r.read_u32()? as usize;
-    let u = decode_delta_zigzag(&r.read_u16_vec(vertex_count)?);
-    let v = decode_delta_zigzag(&r.read_u16_vec(vertex_count)?);
-    let height = decode_delta_zigzag(&r.read_u16_vec(vertex_count)?);
+    // Reject an absurd vertex count before any per-vertex `with_capacity` (audit #9).
+    if vertex_count > MAX_QMESH_VERTICES {
+        return Err(QmError::TooLarge);
+    }
+    let u = decode_delta_zigzag(r.read_u16_vec(vertex_count)?);
+    let v = decode_delta_zigzag(r.read_u16_vec(vertex_count)?);
+    let height = decode_delta_zigzag(r.read_u16_vec(vertex_count)?);
 
     // IndexData — index width depends on vertex count; pad to its alignment first.
     let use_u32 = vertex_count > 65536;
     r.align_to(if use_u32 { 4 } else { 2 });
-    // checked_mul: the only unchecked size multiply in the parser. On the 64-bit target `u32::MAX * 3`
-    // fits `usize`; on a 32-bit target it would silently wrap in the default release profile (overflow
-    // checks off) — and would panic→abort only if `overflow-checks` were enabled. Using `checked_mul`
-    // regardless makes the behaviour identical on every target/profile: an absurd triangle count is treated
-    // as truncated input rather than corrupting the index count.
-    let index_count = (r.read_u32()? as usize).checked_mul(3).ok_or(QmError::UnexpectedEof)?;
+    let triangle_count = r.read_u32()? as usize;
+    if triangle_count > MAX_QMESH_TRIANGLES {
+        return Err(QmError::TooLarge);
+    }
+    // The `MAX_QMESH_TRIANGLES` cap above is the real guard here: it bounds `triangle_count` so
+    // `* 3` cannot overflow `usize` on any supported target. The `checked_mul` is belt-and-suspenders
+    // — it keeps the `* 3` from wrapping even if that cap were ever relaxed (a wrapped count would
+    // corrupt the index read), folding the impossible case to truncated-input rather than a bad count.
+    let index_count = triangle_count.checked_mul(3).ok_or(QmError::UnexpectedEof)?;
     // Decode with a u32 accumulator and reject any index past `vertex_count` (audit M30). For the u16 arm
     // every accepted index is `< vertex_count ≤ 65536`, i.e. `≤ 65535`, so the narrowing back to `u16` for
     // the compact transport representation is now lossless (no silent 65536 → 0 aliasing).
@@ -376,7 +410,19 @@ pub fn parse(bytes: &[u8]) -> Result<QuantizedMeshTile, QmError> {
     } else {
         let raw = r.read_u16_vec(index_count)?;
         let decoded = decode_indices_hw(raw.into_iter().map(u32::from), vertex_count)?;
-        IndexBuffer::U16(decoded.into_iter().map(|i| i as u16).collect())
+        IndexBuffer::U16(
+            decoded
+                .into_iter()
+                .map(|i| {
+                    // Load-bearing invariant: on the u16 arm `vertex_count <= 65536`, and `decode_indices_hw`
+                    // accepts only `index < vertex_count`, so every `i <= 65535` and the narrowing is
+                    // lossless. Pin it with a debug assert so a future relaxation of that bound trips in
+                    // tests instead of silently aliasing (e.g. 65536 -> vertex 0) — audit D9.
+                    debug_assert!(i <= u16::MAX as u32, "decoded index {i} exceeds u16 in the u16 arm");
+                    i as u16
+                })
+                .collect(),
+        )
     };
 
     let edges = EdgeRings {
@@ -533,6 +579,15 @@ mod tests {
     use super::*;
     use std::f64::consts::{FRAC_PI_2, PI};
 
+    /// Zig-zag encode a signed delta to `u16` — the inverse of [`zigzag_decode`]. Test-only: the live path
+    /// only ever DECODES tiles; this exists solely to build the encoded byte fixtures the tests parse back
+    /// (the roundtrip below and `encode_tile`'s `enc_delta_zigzag`), so it lives in `#[cfg(test)]` rather
+    /// than on the shipping surface.
+    #[inline]
+    fn zigzag_encode(n: i32) -> u16 {
+        ((n << 1) ^ (n >> 31)) as u16
+    }
+
     #[test]
     fn zigzag_known_values_and_roundtrip() {
         assert_eq!(zigzag_decode(0), 0);
@@ -566,7 +621,7 @@ mod tests {
     #[test]
     fn delta_zigzag_resolves_running_sum() {
         // values 0, 32767, 0  ->  deltas 0, +32767, -32767  ->  zigzag 0, 65534, 65533
-        assert_eq!(decode_delta_zigzag(&[0, 65534, 65533]), vec![0u16, 32767, 0]);
+        assert_eq!(decode_delta_zigzag(vec![0, 65534, 65533]), vec![0u16, 32767, 0]);
     }
 
     #[test]
@@ -766,5 +821,75 @@ mod tests {
             None,
         );
         assert_eq!(parse(&bytes[..40]), Err(QmError::UnexpectedEof)); // cut mid-header
+    }
+
+    #[test]
+    fn bulk_read_u16_vec_roundtrips_and_advances() {
+        // The bulk `chunks_exact` read (audit D4) must yield the same LE-decoded values and leave the
+        // cursor exactly past the run, so a trailing value still reads correctly.
+        let mut bytes = Vec::new();
+        let src = [0u16, 1, 0xBEEF, 0x00FF, 0xFF00, 0x1234];
+        for v in src {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0xAA55u16.to_le_bytes()); // a sentinel after the run
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.read_u16_vec(src.len()).unwrap(), src);
+        // Reading the next value back proves the cursor landed exactly past the bulk run.
+        assert_eq!(r.read_u16_vec(1).unwrap(), vec![0xAA55]);
+    }
+
+    #[test]
+    fn bulk_read_u32_vec_roundtrips_and_advances() {
+        let mut bytes = Vec::new();
+        let src = [0u32, 1, 0xDEAD_BEEF, 0x00FF_00FF, 0x1234_5678];
+        for v in src {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0xCAFE_F00Du32.to_le_bytes());
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.read_u32_vec(src.len()).unwrap(), src);
+        assert_eq!(r.read_u32().unwrap(), 0xCAFE_F00D);
+    }
+
+    #[test]
+    fn bulk_read_vec_rejects_short_buffer() {
+        // One byte short of `n*size` must still be a clean EOF (same behaviour as the old per-element loop),
+        // and `saturating_mul` must keep a crafted huge `n` from wrapping the byte count into a small value.
+        let bytes = [0u8; 5];
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.read_u16_vec(3), Err(QmError::UnexpectedEof)); // needs 6 bytes, has 5
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.read_u32_vec(2), Err(QmError::UnexpectedEof)); // needs 8 bytes, has 5
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.read_u16_vec(usize::MAX), Err(QmError::UnexpectedEof)); // no wrap to a tiny count
+    }
+
+    /// Build a minimal valid stream (0 vertices, 0 triangles) but overwrite the WEST edge-ring `u32` count
+    /// with `count`, exercising `read_edge_ring`'s cap without supplying the bytes the count claims.
+    fn tile_with_west_edge_count(count: u32) -> Vec<u8> {
+        let mut bytes = encode_tile(&sample_header(), &[], &[], &[], &[], &EdgeRings::default(), None);
+        // Layout: 88-byte header, vertexCount u32 (=0), no vertex arrays, already 2-aligned, triangleCount
+        // u32 (=0), no indices, then the four edge-ring u32 counts. The west count is the first of them.
+        let west_count_off = 88 + 4 + 4;
+        bytes[west_count_off..west_count_off + 4].copy_from_slice(&count.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn edge_ring_count_over_cap_is_rejected() {
+        // A crafted edge-ring count past the vertex ceiling is rejected as TooLarge (audit D8) — the count
+        // check fires before any byte read, so the missing payload never matters.
+        let bytes = tile_with_west_edge_count(MAX_QMESH_VERTICES as u32 + 1);
+        assert_eq!(parse(&bytes), Err(QmError::TooLarge));
+    }
+
+    #[test]
+    fn edge_ring_count_at_cap_is_not_rejected_by_the_cap() {
+        // A count exactly at the cap passes the ceiling check; it then fails on the byte read (the tile
+        // doesn't actually carry that many indices) — i.e. UnexpectedEof, NOT TooLarge. This pins that the
+        // cap is `>` (not `>=`) and stays symmetric with the vertex/triangle ceilings.
+        let bytes = tile_with_west_edge_count(MAX_QMESH_VERTICES as u32);
+        assert_eq!(parse(&bytes), Err(QmError::UnexpectedEof));
     }
 }

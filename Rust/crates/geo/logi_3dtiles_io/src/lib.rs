@@ -3,27 +3,42 @@
 //! kernel's existing `Provider`. The selection traversal decides *which* tiles to load; a
 //! [`TileContentSource`] fetches their content bytes and hands them back when ready.
 //!
-//! v1 ships only the deterministic [`SyntheticSource`] (latency + payload derived from the request id —
-//! reproducible, no network, the test/offline lane). The production source (HTTP via `ureq` + gzip + an
-//! on-disk cache, fetched on a worker pool and drained here) is the network-phase follow-up and slots in
-//! behind the same trait.
+//! Two sources implement the same trait: the deterministic [`SyntheticSource`] (latency + payload derived
+//! from the request id — reproducible, no network, the test/offline lane) and the production [`HttpSource`]
+//! (HTTP via `ureq` + gzip + an on-disk cache, fetched on a worker pool and drained here).
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+
+use hashbrown::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// Identifies an in-flight request (the caller's tile id / URL hash).
 pub type RequestId = u64;
 
-/// A completed fetch: the request id + the raw content bytes (already gzip-inflated by the source).
+/// A completed fetch handed back to the owner thread: the request id + a **typed** outcome.
+///
+/// Why a `Result` rather than a bare `Vec<u8>` (audit A10): the old payload was `bytes: Vec<u8>` filled
+/// via `http_get(&url).unwrap_or_default()`, which collapsed *every* outcome — 404, 429, 503, a connect
+/// timeout, a DNS failure, AND a legitimate empty-200 body — to an empty `Vec`. The owner literally could
+/// not tell "the server said this tile doesn't exist, give up" from "the server is rate-limiting us, back
+/// off and retry" from "the tile is genuinely 0 bytes, that's a success". Carrying a [`Result`] lets the
+/// owner branch on the **failure class** ([`FetchError::is_transient`] / [`FetchError::retry_after`]):
+/// retry transient errors with backoff, abandon terminal ones immediately, and accept an empty body as the
+/// success it is. The actual *when-to-retry* policy lives on the owner (`geo_world`), not here — see the
+/// crate docs / [`FetchError`] for the contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Loaded {
     pub id: RequestId,
-    pub bytes: Vec<u8>,
+    /// `Ok(bytes)` — the content, already gzip-inflated by the source; an empty `Vec` is a valid empty-200.
+    /// `Err(e)` — a classified failure the owner can act on without guessing.
+    pub result: Result<Vec<u8>, FetchError>,
 }
 
 /// An async tile-content source driven on the owner thread: `request` enqueues, `poll_completed` drains
@@ -115,9 +130,11 @@ impl TileContentSource for SyntheticSource {
         done.sort_unstable();
         for id in done {
             let (_, len) = self.pending.remove(&id).unwrap_or((0, 0));
+            // The synthetic lane never fails — every request "downloads" successfully (audit A10: the
+            // payload is `Ok`, not bare bytes, so it shares the typed channel with the HTTP source).
             out.push(Loaded {
                 id,
-                bytes: synthetic_payload(id, len),
+                result: Ok(synthetic_payload(id, len)),
             });
         }
     }
@@ -137,14 +154,106 @@ impl TileContentSource for SyntheticSource {
 // `access_token`) onto child requests; `http_get` is a blocking fetch. The worker-pool TileContentSource
 // impl that drains these into `poll_completed` lands with the scene wiring.
 
-/// A fetch / URL-resolution error.
+/// A fetch / URL-resolution error, **classified** so the owner can decide whether to retry (audit A1).
+///
+/// The fetch worker only *classifies*; it never sleeps or retries. The owner (`geo_world`'s
+/// `select_request` / `fail_fetch`) reads [`is_transient`](Self::is_transient) and
+/// [`retry_after`](Self::retry_after) and runs the backoff loop. The split that matters:
+///
+/// * **Transient** (retry-worthy): HTTP 429 + any 5xx, and every transport-level failure (connect/read/
+///   write timeout, DNS, connection reset). These are "try again later", not "this will never work".
+/// * **Terminal** (give up immediately — retrying only wastes bandwidth and a worker slot): 4xx other than
+///   429 (404 the tile doesn't exist, 403 the key is wrong, 400 a malformed URL), a URL that won't parse,
+///   and an over-cap body ([`TooLarge`](Self::TooLarge) — a server streaming junk won't stream less next
+///   time).
+/// * [`Cancelled`](Self::Cancelled) is neither: the owner already moved on, so there is nothing to retry.
+///   It reports `is_transient() == false` so the owner does not re-queue it on the retry path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FetchError {
+    /// The content URI / tileset base wouldn't resolve to a valid absolute URL. **Terminal** — a bad URL
+    /// is bad every time.
     Url(String),
-    Http(String),
+    /// The server returned an HTTP status >= 400. `status` is the code; `retry_after` is the parsed
+    /// `Retry-After` header when the server sent one (429/503 commonly do). Transient iff `status` is 429
+    /// or 5xx; every other 4xx is terminal — see [`is_transient`](Self::is_transient).
+    Http {
+        status: u16,
+        /// Server-supplied "don't come back before this" delay, parsed from the `Retry-After` header
+        /// (delta-seconds form). `None` when absent/unparseable — the owner then uses its own backoff.
+        retry_after: Option<Duration>,
+    },
+    /// A transport-level failure with no HTTP status: connect/read/write timeout, DNS failure, TLS error,
+    /// connection reset, etc. Always **transient** — the host or network hiccuped; a later attempt may
+    /// succeed. The `String` is the underlying error for telemetry only (never matched on).
+    Transport(String),
     /// The response body exceeded [`MAX_TILE_BYTES`] — a hostile/misconfigured server streaming an
-    /// unbounded payload. Treated as a fetch failure rather than letting it OOM the process.
+    /// unbounded payload. **Terminal**: rejected rather than letting it OOM the process, and a server
+    /// streaming an over-cap body will do so again, so retrying is pointless.
     TooLarge,
+    /// The fetch was cancelled mid-flight (the owner called [`HttpSource::cancel`] while the bytes were on
+    /// the wire — see audit A3). Neither transient nor terminal: the owner already discarded this request,
+    /// so there is nothing to retry. Surfaced (instead of silently dropped) so the owner can free the
+    /// in-flight slot and bookkeeping cleanly.
+    Cancelled,
+}
+
+impl FetchError {
+    /// `true` if a later attempt could plausibly succeed (429, 5xx, transport/timeout/DNS). The owner
+    /// retries these with capped exponential backoff; everything else (`false`) it abandons at once. See
+    /// the type-level docs for the full transient-vs-terminal split.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            // 429 (rate-limited) and 5xx (server-side) are temporary; every other 4xx is the client's
+            // fault (404/403/400) and will not change on retry. `>= 500` also catches non-standard 5xx.
+            FetchError::Http { status, .. } => *status == 429 || *status >= 500,
+            // The network/host failed, not the request itself — worth another try.
+            FetchError::Transport(_) => true,
+            // Bad URL, over-cap body, and an owner-initiated cancel are all "do not retry".
+            FetchError::Url(_) | FetchError::TooLarge | FetchError::Cancelled => false,
+        }
+    }
+
+    /// The server's `Retry-After` hint, if it sent one (429/503). The owner should wait *at least* this
+    /// long before retrying — honoring it is what keeps us from hammering a server that explicitly asked us
+    /// to slow down (the North Star: don't melt the tile server). `None` for every non-HTTP error and any
+    /// response without the header; the owner then falls back to its own exponential backoff.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            FetchError::Http { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Url(e) => write!(f, "url resolution failed: {e}"),
+            FetchError::Http { status, retry_after } => match retry_after {
+                Some(d) => write!(f, "http status {status} (retry-after {}s)", d.as_secs()),
+                None => write!(f, "http status {status}"),
+            },
+            FetchError::Transport(e) => write!(f, "transport error: {e}"),
+            FetchError::TooLarge => write!(f, "response body exceeded {MAX_TILE_BYTES} bytes"),
+            FetchError::Cancelled => write!(f, "fetch cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
+
+/// Parse an HTTP `Retry-After` header value into a [`Duration`]. Only the **delta-seconds** form (a bare
+/// integer like `Retry-After: 120`) is handled — that is what `tile.googleapis.com` and Cesium ion send on
+/// 429/503. The HTTP-date form (`Retry-After: Wed, 21 Oct 2025 07:28:00 GMT`) is intentionally NOT parsed:
+/// it would drag in a date-parsing dependency for a case these providers don't use, and the owner's own
+/// backoff is a safe fallback (we just return `None`). A `0` or non-numeric value also yields `None` so a
+/// degenerate header can't pin a retry to "immediately".
+fn parse_retry_after(raw: &str) -> Option<Duration> {
+    let secs: u64 = raw.trim().parse().ok()?;
+    if secs == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(secs))
 }
 
 /// Hard cap on a single tile/tileset response body. Tile content URIs are attacker-influenced (streamed
@@ -171,6 +280,15 @@ pub fn http_agent() -> &'static ureq::Agent {
             .timeout_read(HTTP_IO_TIMEOUT)
             .timeout_write(HTTP_IO_TIMEOUT)
             .timeout(HTTP_OVERALL_TIMEOUT)
+            // Keep connections ALIVE across the whole fetch-worker pool. ureq's default idle pool is tiny
+            // (≈1 per host), so with N workers all hammering ONE host (P3DT's `tile.googleapis.com`) only one
+            // connection is reused — the other N-1 close after each request and re-pay a TLS handshake
+            // (~1-2 RTT) on the next one, throttling throughput to the *handshake* rate, not the link rate.
+            // Sizing the per-host idle pool above the worker cap (32) lets every worker keep reusing a warm
+            // keep-alive connection, so the pool streams at the link's real bandwidth (audit: the #1 reason
+            // 8 fetch threads only managed ~8 MB/s — they were re-handshaking, not downloading).
+            .max_idle_connections(256)
+            .max_idle_connections_per_host(64)
             .build()
     })
 }
@@ -204,14 +322,46 @@ pub fn resolve_url(base: &str, content_uri: &str) -> Result<String, FetchError> 
     Ok(joined.to_string())
 }
 
+/// How many bytes the cancel-aware reader pulls per loop iteration. The cancel flag is probed **once per
+/// chunk** (audit A3), so this trades cancel latency against probe overhead: smaller = a fast camera abort
+/// sees the flag sooner; larger = fewer atomic loads on the steady-state download path. 64 KiB is well
+/// below any tile (so even small tiles get a probe or two) yet large enough that the per-chunk atomic load
+/// is noise next to the socket read — one `Relaxed` load per 64 KiB, not per byte.
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Blocking HTTP GET → raw bytes, over the shared timeout-bounded [`http_agent`]. Run off the kernel's
-/// owner thread (on a worker pool). The body is read through a [`MAX_TILE_BYTES`] cap: a server streaming
-/// more than that yields [`FetchError::TooLarge`] rather than an unbounded allocation (audit H8).
-pub fn http_get(url: &str) -> Result<Vec<u8>, FetchError> {
-    let resp = http_agent()
-        .get(url)
-        .call()
-        .map_err(|e| FetchError::Http(e.to_string()))?;
+/// owner thread (on a worker pool). Three safeguards, all preserved/added here:
+///
+/// * **Size cap** (audit H8): the body is read through a [`MAX_TILE_BYTES`] wall; a server streaming more
+///   yields [`FetchError::TooLarge`] rather than an unbounded allocation.
+/// * **Status classification** (audit A1): a non-2xx status becomes a *classified* [`FetchError::Http`]
+///   (with any `Retry-After`), and a transport failure a [`FetchError::Transport`] — so the owner can tell
+///   "retry later" from "give up" instead of seeing one opaque error. An empty-200 body returns
+///   `Ok(empty)`: a 0-byte tile is a success, not a failure.
+/// * **Mid-download cancel** (audit A3): `cancel` is probed once per 64 KiB read chunk; when the
+///   owner flips it (camera moved on), the read aborts *immediately* with [`FetchError::Cancelled`] instead
+///   of finishing the (up to 64 MiB) download just to discard it — the dominant wasted bandwidth under fast
+///   motion. Pass an already-false flag (or use [`http_get`]) when there is nothing to cancel.
+pub fn http_get_cancellable(url: &str, cancel: &AtomicBool) -> Result<Vec<u8>, FetchError> {
+    // Fast pre-flight: if the owner cancelled before we even opened the socket, don't pay for the request.
+    if cancel.load(Ordering::Relaxed) {
+        return Err(FetchError::Cancelled);
+    }
+    let resp = match http_agent().get(url).call() {
+        Ok(resp) => resp,
+        // ureq 2.x splits errors cleanly: `Status(code, resp)` is any HTTP >= 400 (the connection worked,
+        // the *server* refused), `Transport(_)` is everything below HTTP — connect/read/write timeout, DNS,
+        // TLS, connection reset. We classify on exactly that split (A1).
+        Err(ureq::Error::Status(code, resp)) => {
+            // Pull the `Retry-After` hint off the *error* response (429/503 carry it). Owner honors it.
+            let retry_after = resp.header("Retry-After").and_then(parse_retry_after);
+            return Err(FetchError::Http {
+                status: code,
+                retry_after,
+            });
+        }
+        Err(ureq::Error::Transport(t)) => return Err(FetchError::Transport(t.to_string())),
+    };
     // Pre-size from a sane Content-Length (clamped to the cap so a lying header can't pre-allocate
     // gigabytes), but never trust it as the actual length — the capped reader below is the real bound.
     let hint = resp
@@ -220,17 +370,68 @@ pub fn http_get(url: &str) -> Result<Vec<u8>, FetchError> {
         .unwrap_or(0)
         .min(MAX_TILE_BYTES);
     let mut bytes = Vec::with_capacity(hint);
-    // Read one byte past the cap: if the reader yields MAX_TILE_BYTES+1 the body is over-budget. `.take`
-    // makes the cap a hard wall regardless of the (untrusted) Content-Length.
-    let read = resp
-        .into_reader()
-        .take(MAX_TILE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| FetchError::Http(e.to_string()))?;
-    if read > MAX_TILE_BYTES {
-        return Err(FetchError::TooLarge);
+    // `.take(MAX_TILE_BYTES + 1)` makes the cap a hard wall regardless of the (untrusted) Content-Length:
+    // if the reader can still yield byte MAX+1, the body is over-budget. We read in `READ_CHUNK_BYTES`
+    // chunks (rather than one `read_to_end`) for one reason: to probe `cancel` between chunks (A3). The
+    // previous `read_to_end` had no opportunity to bail — it downloaded the entire tile, *then* the worker
+    // discarded it; under fast camera motion that is the single largest source of wasted bandwidth.
+    let mut reader = resp.into_reader().take(MAX_TILE_BYTES as u64 + 1);
+    let mut chunk = [0u8; READ_CHUNK_BYTES];
+    loop {
+        // One `Relaxed` atomic load per chunk (~per 64 KiB) — cheap, and `Relaxed` is sufficient: we only
+        // need to *eventually* observe the owner's store, not synchronize other memory with it.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(FetchError::Cancelled);
+        }
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|e| FetchError::Transport(e.to_string()))?;
+        if n == 0 {
+            break; // EOF — full body received (possibly empty: a legitimate empty-200).
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+        if bytes.len() > MAX_TILE_BYTES {
+            return Err(FetchError::TooLarge);
+        }
     }
     Ok(bytes)
+}
+
+/// [`http_get_cancellable`] with no cancellation signal — for callers (the ion resolver, the blocking root
+/// fetch) that have nothing to cancel. Keeps the size-cap + status-classification safeguards.
+pub fn http_get(url: &str) -> Result<Vec<u8>, FetchError> {
+    http_get_cancellable(url, &AtomicBool::new(false))
+}
+
+/// One worker's cache-first, cancel-aware fetch of `url`, resolved to a **typed** outcome (audit A10):
+/// serve a disk-cache hit, else download (honoring `cancel` mid-flight, A3) and populate the cache on a
+/// successful non-empty body. Used only by the [`HttpSource`] worker loop; factored out so the cache
+/// hit/miss/populate + cancellation logic lives in one place (and is unit-testable).
+///
+/// Cache invariant (unchanged): only a *successful, non-empty* body is stored. A classified failure
+/// ([`FetchError::Http`]/`Transport`/`TooLarge`) never returns bytes to cache, a cancelled/partial download
+/// is [`FetchError::Cancelled`] (never cached), and an empty-200 is not worth a file — so a 4xx / expired
+/// session / aborted fetch can never poison the cache, exactly as before.
+fn fetch_one(cache: Option<&DiskCache>, url: &str, cancel: &AtomicBool) -> Result<Vec<u8>, FetchError> {
+    // Pre-flight cancel: the owner moved on before this request reached a worker. Bail before touching the
+    // cache or the network — this subsumes the old "skip before dequeue" hard cancel.
+    if cancel.load(Ordering::Relaxed) {
+        return Err(FetchError::Cancelled);
+    }
+    if let Some(c) = cache {
+        // A cache hit costs no bandwidth, so cancellation doesn't matter for it; serve it. (A result the
+        // owner has since cancelled is harmlessly dropped on `poll_completed` via the in-flight backstop.)
+        if let Some(bytes) = c.get(url) {
+            return Ok(bytes);
+        }
+        let bytes = http_get_cancellable(url, cancel)?;
+        if !bytes.is_empty() {
+            c.put(url, &bytes);
+        }
+        Ok(bytes)
+    } else {
+        http_get_cancellable(url, cancel)
+    }
 }
 
 // ----------------------------------------------------------------------------------------------------
@@ -280,16 +481,21 @@ impl CacheIndex {
         self.lru.insert(t, key);
         self.total = self.total.saturating_add(size);
     }
-    fn evict_to(&mut self, budget: u64, dir: &Path) {
-        // The just-inserted key has the highest tick, so `pop_first` (oldest) never evicts it unless it is
-        // the sole entry (budget < one tile — degenerate); LRU recency is preserved.
+    /// Evict the coldest entries from the in-memory index until back within `budget`, returning the keys whose
+    /// files must be unlinked. **Does no filesystem I/O** — the caller unlinks AFTER dropping the index lock
+    /// (H5), so a slow `remove_file` (network FS / Windows) can't serialize every other worker's `get`/`put`
+    /// behind it. The just-inserted key has the highest tick, so `pop_first` (oldest) never evicts it unless
+    /// it is the sole entry (budget < one tile — degenerate); LRU recency is preserved.
+    fn evict_to(&mut self, budget: u64) -> Vec<u128> {
+        let mut to_unlink = Vec::new();
         while self.total > budget {
             let Some((_, key)) = self.lru.pop_first() else { break };
             if let Some(e) = self.entries.remove(&key) {
                 self.total = self.total.saturating_sub(e.size);
-                let _ = std::fs::remove_file(cache_path(dir, key));
+                to_unlink.push(key);
             }
         }
+        to_unlink
     }
 }
 
@@ -398,7 +604,13 @@ impl DiskCache {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let tmp = path.with_extension("tmp");
+        // Unique per-write tmp name: a single fixed ".tmp" per key lets two workers writing the SAME content URL
+        // interleave their bytes into one file, so the rename could promote a torn, same-length-but-corrupt blob
+        // (disk-cache audit Issue D). A process-unique suffix gives every concurrent write its own tmp file; the
+        // rename to the final path stays atomic, so a reader still sees either the complete old or complete new file.
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp{seq}"));
         if std::fs::write(&tmp, bytes).is_err() {
             return;
         }
@@ -406,9 +618,20 @@ impl DiskCache {
             let _ = std::fs::remove_file(&tmp);
             return;
         }
-        if let Ok(mut idx) = self.idx.lock() {
-            idx.insert(key, bytes.len() as u64);
-            idx.evict_to(self.budget, &self.dir);
+        // Update the index under the lock, but unlink the evicted files OUTSIDE it (H5): `remove_file` can be
+        // slow (network FS / Windows), and holding `idx` across it would serialize every other worker's
+        // `get`/`put`/`bytes` behind the disk I/O. The worst case of the wider window is a benign cache miss
+        // (a key re-`put` between unlock and unlink loses its file but keeps its index entry → next `get`
+        // reads a missing file → graceful `None`, then re-fetch) — acceptable for a best-effort cache.
+        let to_unlink = match self.idx.lock() {
+            Ok(mut idx) => {
+                idx.insert(key, bytes.len() as u64);
+                idx.evict_to(self.budget)
+            }
+            Err(_) => return,
+        };
+        for k in to_unlink {
+            let _ = std::fs::remove_file(cache_path(&self.dir, k));
         }
     }
 
@@ -422,51 +645,71 @@ impl DiskCache {
 /// fetch it (blocking ureq), and `poll_completed` drains finished tiles on the owner thread. The caller
 /// (the scene) resolves the URL via [`resolve_url`] before requesting. Workers exit when the source drops.
 /// An optional [`DiskCache`] is consulted before the network and populated after a miss.
+/// The per-request cancel flag, shared between the owner (which flips it) and the worker fetching that
+/// request (which probes it once per read chunk). One `Arc<AtomicBool>` per in-flight id.
+type CancelFlag = Arc<AtomicBool>;
+
+/// The registry of live cancel flags, keyed by request id, shared owner ↔ workers. The owner inserts on
+/// `request`, looks up + flips on `cancel`, and removes on `poll_completed` (when the request's result is
+/// drained — every request, cancelled or not, yields exactly one result, so the entry is always reclaimed
+/// and the map stays bounded by the live in-flight set + a brief drain lag).
+type CancelRegistry = Arc<Mutex<HashMap<RequestId, CancelFlag>>>;
+
 pub struct HttpSource {
-    req_tx: crossbeam_channel::Sender<(RequestId, String)>,
-    done_rx: crossbeam_channel::Receiver<Loaded>,
+    /// `Option` so `Drop` can drop the sender FIRST (disconnecting the channel → workers see `recv()` err and
+    /// exit) before joining the worker handles below. The only `Sender`; workers hold `req_rx` clones. Each
+    /// request carries its own [`CancelFlag`] so the worker can abort the in-progress download (A3).
+    req_tx: Option<flume::Sender<(RequestId, String, CancelFlag)>>,
+    done_rx: flume::Receiver<Loaded>,
+    /// Worker thread handles, joined on `Drop` so teardown never leaves fetch threads running detached (they
+    /// each hold an `Arc<DiskCache>` clone — a thread + cache-retention leak across world re-creation).
+    workers: Vec<JoinHandle<()>>,
     in_flight: HashSet<RequestId>,
     cache: Option<Arc<DiskCache>>,
+    /// Live per-request cancel flags (audit A3). The previous design was a bare `HashSet<RequestId>` checked
+    /// only *before* a worker dequeued a request — so a worker already inside `http_get` downloaded the
+    /// **entire** tile (up to 64 MiB) and discarded it afterward, the dominant wasted bandwidth under fast
+    /// camera motion. Now `cancel` flips the request's `AtomicBool`, which the worker's chunked read loop
+    /// probes each chunk and aborts on — a *real* mid-download cancel. The flag also short-circuits a
+    /// not-yet-started fetch (the worker's pre-flight load), so it subsumes the old hard-cancel too.
+    cancels: CancelRegistry,
 }
 
 impl HttpSource {
     /// Spawn `workers` (clamped ≥ 1) fetch threads, optionally backed by a persistent [`DiskCache`].
     pub fn new(workers: usize, cache: Option<Arc<DiskCache>>) -> Self {
-        let (req_tx, req_rx) = crossbeam_channel::unbounded::<(RequestId, String)>();
-        let (done_tx, done_rx) = crossbeam_channel::unbounded::<Loaded>();
+        let (req_tx, req_rx) = flume::unbounded::<(RequestId, String, CancelFlag)>();
+        let (done_tx, done_rx) = flume::unbounded::<Loaded>();
+        let cancels: CancelRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let mut handles = Vec::with_capacity(workers.max(1));
         for _ in 0..workers.max(1) {
             let req_rx = req_rx.clone();
             let done_tx = done_tx.clone();
             let cache = cache.clone();
-            std::thread::spawn(move || {
-                while let Ok((id, url)) = req_rx.recv() {
-                    // Cache-first: serve a disk hit, else fetch + populate. A failed fetch is empty bytes
-                    // (the owner treats empty as a failed load — no panic, no retry storm); only a
-                    // non-empty result is cached, so a 4xx/expired-session never poisons the cache.
-                    let bytes = match &cache {
-                        Some(c) => match c.get(&url) {
-                            Some(b) => b,
-                            None => {
-                                let b = http_get(&url).unwrap_or_default();
-                                if !b.is_empty() {
-                                    c.put(&url, &b);
-                                }
-                                b
-                            }
-                        },
-                        None => http_get(&url).unwrap_or_default(),
-                    };
-                    if done_tx.send(Loaded { id, bytes }).is_err() {
-                        break; // owner gone
+            let handle = std::thread::Builder::new()
+                .name("LogiTileFetch".to_string())
+                .spawn(move || {
+                    while let Ok((id, url, cancel)) = req_rx.recv() {
+                        // Cache-first, cancel-aware fetch → a TYPED outcome (audit A10): `Ok(bytes)` (incl.
+                        // a legitimate empty-200) or a classified `Err`. `fetch_one` owns the hit/miss/
+                        // populate + cancellation logic and preserves the "only non-empty success is cached"
+                        // invariant, so a failure is never collapsed to empty bytes and never poisons the cache.
+                        let result = fetch_one(cache.as_deref(), &url, &cancel);
+                        if done_tx.send(Loaded { id, result }).is_err() {
+                            break; // owner gone
+                        }
                     }
-                }
-            });
+                })
+                .expect("spawn LogiTileFetch worker");
+            handles.push(handle);
         }
         Self {
-            req_tx,
+            req_tx: Some(req_tx),
             done_rx,
+            workers: handles,
             in_flight: HashSet::new(),
             cache,
+            cancels,
         }
     }
 
@@ -476,28 +719,319 @@ impl HttpSource {
     }
 }
 
+impl Drop for HttpSource {
+    fn drop(&mut self) {
+        // Drop the sender FIRST: that disconnects the request channel, so every idle worker's `req_rx.recv()`
+        // returns `Err` and it exits. THEN join, so teardown never leaves fetch threads running detached —
+        // each holds an `Arc<DiskCache>` clone, so a detached worker would leak both a thread and the cache
+        // retention on every world re-creation / editor hot-reload. A worker mid-`http_get` finishes that one
+        // fetch before observing the disconnect; `HTTP_OVERALL_TIMEOUT` bounds that wait. Mirrors
+        // `GlobeStreamer`'s join-on-`Drop` (the sibling that already did this correctly).
+        drop(self.req_tx.take());
+        for h in self.workers.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
 impl TileContentSource for HttpSource {
     fn request(&mut self, id: RequestId, url: &str, _now_tick: u64) {
-        if self.req_tx.send((id, url.to_string())).is_ok() {
-            self.in_flight.insert(id);
+        // `req_tx` is `Some` for the whole live lifetime; it is taken only in `Drop`, after which no method
+        // runs. Treat a (impossible-in-practice) `None` as "channel closed" → no enqueue.
+        if let Some(tx) = self.req_tx.as_ref() {
+            // Mint this request's cancel flag and register it BEFORE sending, so a `cancel` racing in right
+            // after the worker dequeues still finds the flag and can abort the in-progress download (A3).
+            let flag: CancelFlag = Arc::new(AtomicBool::new(false));
+            if let Ok(mut c) = self.cancels.lock() {
+                c.insert(id, Arc::clone(&flag));
+            }
+            if tx.send((id, url.to_string(), flag)).is_ok() {
+                self.in_flight.insert(id);
+            } else {
+                // Channel closed (only possible during/after teardown): undo the registry insert so it can't
+                // leak — no worker will ever drain a result for this id to clean it up.
+                if let Ok(mut c) = self.cancels.lock() {
+                    c.remove(&id);
+                }
+            }
         }
     }
     fn poll_completed(&mut self, _now_tick: u64, out: &mut Vec<Loaded>) {
         while let Ok(loaded) = self.done_rx.try_recv() {
-            // Drop results for cancelled requests (no longer in-flight).
+            // This request is finished (success, classified failure, or cancelled) → retire its cancel flag
+            // from the registry. Every request yields exactly one result, so this is the single, definitive
+            // reclamation point — the map stays bounded by the live in-flight set + a brief drain lag.
+            if let Ok(mut c) = self.cancels.lock() {
+                c.remove(&loaded.id);
+            }
+            // Backstop soft-drop: if the owner cancelled AFTER the bytes were already fully on the wire (too
+            // late for the mid-download abort), the id is gone from `in_flight` → drop the stale result.
             if self.in_flight.remove(&loaded.id) {
                 out.push(loaded);
             }
         }
     }
     fn cancel(&mut self, id: RequestId) {
-        self.in_flight.remove(&id); // the in-progress fetch still runs; its result is dropped on poll.
+        if self.in_flight.remove(&id) {
+            // Flip the live cancel flag (A3): a worker mid-download probes it each chunk and aborts early
+            // (returning `Err(Cancelled)` instead of finishing up to 64 MiB it would then discard); a
+            // not-yet-started worker's pre-flight load short-circuits the fetch entirely. Either way the
+            // request still produces one result, which `poll_completed` drains + removes from the registry.
+            // We do NOT remove the registry entry here — the worker may still be reading it; `poll_completed`
+            // owns reclamation. The `Relaxed` store pairs with the worker's `Relaxed` loads (eventual
+            // visibility is all we need; no other memory is published through this flag).
+            if let Ok(c) = self.cancels.lock() {
+                if let Some(flag) = c.get(&id) {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+        }
     }
     fn in_flight(&self) -> usize {
         self.in_flight.len()
     }
     fn cached_bytes(&self) -> u64 {
         self.cache.as_ref().map(|c| c.bytes()).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    // ---- A1: status classification (transient vs terminal) ------------------------------------------
+
+    #[test]
+    fn http_status_classification_transient_vs_terminal() {
+        // Transient (retry-worthy): 429 + every 5xx.
+        for code in [429u16, 500, 502, 503, 504, 599] {
+            let e = FetchError::Http {
+                status: code,
+                retry_after: None,
+            };
+            assert!(e.is_transient(), "HTTP {code} must be transient (retry-worthy)");
+        }
+        // Terminal (give up now): every 4xx except 429.
+        for code in [400u16, 401, 403, 404, 410, 451] {
+            let e = FetchError::Http {
+                status: code,
+                retry_after: None,
+            };
+            assert!(!e.is_transient(), "HTTP {code} must be terminal (do not retry)");
+        }
+        // Transport failures are always transient; URL / TooLarge / Cancelled are terminal (never retried).
+        assert!(FetchError::Transport("dns".into()).is_transient());
+        assert!(!FetchError::Url("bad".into()).is_transient());
+        assert!(!FetchError::TooLarge.is_transient());
+        assert!(
+            !FetchError::Cancelled.is_transient(),
+            "a cancelled fetch must not be re-queued on the retry path"
+        );
+    }
+
+    // ---- A1: Retry-After parsing --------------------------------------------------------------------
+
+    #[test]
+    fn retry_after_parses_delta_seconds_only() {
+        assert_eq!(parse_retry_after("120"), Some(Duration::from_secs(120)));
+        assert_eq!(
+            parse_retry_after("  30 "),
+            Some(Duration::from_secs(30)),
+            "trims whitespace"
+        );
+        // 0 / non-numeric / HTTP-date → None (owner falls back to its own backoff; a 0 can't mean "now").
+        assert_eq!(parse_retry_after("0"), None);
+        assert_eq!(parse_retry_after("soon"), None);
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2025 07:28:00 GMT"), None);
+        // The hint surfaces on the error and via the accessor; non-HTTP errors have no hint.
+        let e = FetchError::Http {
+            status: 503,
+            retry_after: Some(Duration::from_secs(5)),
+        };
+        assert_eq!(e.retry_after(), Some(Duration::from_secs(5)));
+        assert_eq!(FetchError::Transport("x".into()).retry_after(), None);
+    }
+
+    // ---- A1/A3 live-server fetch tests --------------------------------------------------------------
+    //
+    // A one-shot local HTTP/1.1 server on an ephemeral 127.0.0.1 port — no test-server dependency. Each
+    // helper spawns a thread that accepts ONE connection, serves a hand-rolled response, and returns the
+    // bound URL. `ureq` drives a real socket against it, so these exercise the actual `http_get_cancellable`
+    // read path (status branch, empty-200, chunked cancel) end to end.
+
+    /// Accept one connection and write `response_head` (status line + headers + blank line) followed by
+    /// `body`, then close. Returns the `http://127.0.0.1:<port>/` URL to GET.
+    fn serve_once(response_head: &'static str, body: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                // Read (and ignore) the request line/headers up to the blank line so the client can finish
+                // writing before we respond — otherwise a write-then-close can RST the request on some OSes.
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut sock, &mut buf);
+                let _ = sock.write_all(response_head.as_bytes());
+                let _ = sock.write_all(&body);
+                let _ = sock.flush();
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn empty_200_is_ok_not_failure() {
+        // The crux of A10/A1: a legitimate empty-200 body must be `Ok(empty)`, NOT collapsed to a failure.
+        let url = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", Vec::new());
+        let cancel = AtomicBool::new(false);
+        let got = http_get_cancellable(&url, &cancel);
+        assert_eq!(got, Ok(Vec::new()), "empty-200 is success, not an error");
+    }
+
+    #[test]
+    fn ok_200_returns_body_bytes() {
+        let url = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", b"hello".to_vec());
+        let cancel = AtomicBool::new(false);
+        assert_eq!(http_get_cancellable(&url, &cancel), Ok(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn status_404_is_terminal_http_error() {
+        let url = serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n", Vec::new());
+        let cancel = AtomicBool::new(false);
+        match http_get_cancellable(&url, &cancel) {
+            Err(e @ FetchError::Http { status: 404, .. }) => {
+                assert!(!e.is_transient(), "404 is terminal")
+            }
+            other => panic!("expected terminal HTTP 404, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_503_with_retry_after_is_transient_and_carries_hint() {
+        // A rate-limited / overloaded server: transient, and we capture its Retry-After so the owner honors
+        // it instead of hammering back immediately (the North Star: don't melt the tile server).
+        let url = serve_once(
+            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 7\r\nContent-Length: 0\r\n\r\n",
+            Vec::new(),
+        );
+        let cancel = AtomicBool::new(false);
+        match http_get_cancellable(&url, &cancel) {
+            Err(e @ FetchError::Http { status: 503, .. }) => {
+                assert!(e.is_transient(), "503 is transient");
+                assert_eq!(e.retry_after(), Some(Duration::from_secs(7)), "Retry-After captured");
+            }
+            other => panic!("expected transient HTTP 503, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preflight_cancel_skips_the_fetch() {
+        // Flag already set before the read starts → bail without downloading (subsumes the old "skip before
+        // dequeue" hard cancel). The body is large enough that if we DID download it the test would notice.
+        let url = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n", b"data".to_vec());
+        let cancel = AtomicBool::new(true);
+        assert_eq!(http_get_cancellable(&url, &cancel), Err(FetchError::Cancelled));
+    }
+
+    #[test]
+    fn mid_download_cancel_aborts_early() {
+        // The core A3 fix: a worker already INSIDE the read loop must abort the instant the owner cancels —
+        // not finish the (up to 64 MiB) download and discard it. We drip a large body in chunks; once the
+        // first chunk is on the wire we flip the flag and assert the read returns `Cancelled` having pulled
+        // only a SMALL fraction of the declared body (proving it didn't download the whole thing).
+        const TOTAL: usize = 8 * 1024 * 1024; // 8 MiB declared
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (first_chunk_tx, first_chunk_rx) = mpsc::channel::<()>();
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut sock, &mut buf);
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {TOTAL}\r\n\r\n");
+            if sock.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            let chunk = vec![0u8; READ_CHUNK_BYTES];
+            let mut sent = 0usize;
+            // Drip with a small per-chunk sleep so the client reliably observes the cancel flag within a
+            // chunk or two — and so the WHOLE body would take ~hundreds of ms, far longer than the abort.
+            while sent < TOTAL {
+                if sock.write_all(&chunk).is_err() {
+                    break; // client dropped the connection on cancel — expected, stop dripping.
+                }
+                let _ = sock.flush();
+                if sent == 0 {
+                    let _ = first_chunk_tx.send(()); // signal: bytes are now flowing.
+                }
+                sent += chunk.len();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_fetch = Arc::clone(&cancel);
+        let url_for_fetch = url.clone();
+        let started = Instant::now();
+        let fetcher = std::thread::spawn(move || http_get_cancellable(&url_for_fetch, &cancel_for_fetch));
+
+        // Wait until the server has actually put the first chunk on the wire, THEN cancel — guarantees we
+        // are testing the mid-download read-loop abort, not the pre-flight short-circuit.
+        first_chunk_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server should send a first chunk");
+        cancel.store(true, Ordering::Relaxed);
+
+        let got = fetcher.join().expect("fetch thread");
+        let elapsed = started.elapsed();
+        let _ = server.join();
+
+        assert_eq!(
+            got,
+            Err(FetchError::Cancelled),
+            "mid-download cancel must yield Cancelled"
+        );
+        // Aborted EARLY: dripping all 8 MiB at 2ms/64KiB would take ~250ms+; the abort returns well before
+        // that. A generous 3s ceiling keeps this robust on a loaded CI box while still proving we did not
+        // wait out the full body.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "cancel should abort promptly, took {elapsed:?}"
+        );
+    }
+
+    // ---- HttpSource end-to-end cancel ---------------------------------------------------------------
+
+    #[test]
+    fn httpsource_cancel_frees_in_flight() {
+        // The public surface: a cancelled id leaves the in-flight set and never surfaces from poll_completed
+        // (the result, whatever it is, is dropped). Point it at a dead port so the fetch fails fast.
+        let mut src = HttpSource::new(2, None);
+        src.request(1, "http://127.0.0.1:1/never", 0);
+        src.request(2, "http://127.0.0.1:1/never", 0);
+        assert_eq!(src.in_flight(), 2);
+        src.cancel(1);
+        assert_eq!(src.in_flight(), 1, "cancel drops the id from in-flight immediately");
+
+        // Drain until id 2's (failed) result arrives; id 1 must NEVER appear.
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            src.poll_completed(0, &mut out);
+            if out.iter().any(|l| l.id == 2) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(out.iter().any(|l| l.id == 2), "id 2's result should surface");
+        assert!(!out.iter().any(|l| l.id == 1), "cancelled id 1 must never surface");
+        assert_eq!(src.in_flight(), 0, "all in-flight resolved");
     }
 }
 
@@ -521,6 +1055,62 @@ mod http_tests {
         // a child URI that already has the param isn't duplicated.
         let u = resolve_url("https://h/r.json?key=A", "/c.glb?key=B").unwrap();
         assert_eq!(u, "https://h/c.glb?key=B");
+    }
+}
+
+#[cfg(test)]
+mod disk_cache_tests {
+    use super::*;
+
+    /// A unique, self-cleaning temp dir for one test (no `tempfile` dep). Removed on construction (idempotent
+    /// re-run) and again by the caller at the end.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("logi_dc_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn put_evicts_oldest_and_unlinks_its_file_within_budget() {
+        let dir = temp_dir("evict");
+        let cache = DiskCache::open(&dir, 100).expect("open");
+
+        cache.put("https://h/u1.glb", &[1u8; 60]); // total 60 ≤ 100 → kept
+        cache.put("https://h/u2.glb", &[2u8; 60]); // total 120 > 100 → evict the oldest (u1) back to 60
+
+        // The cold entry is gone from BOTH the index (get → None) and the disk (the file was unlinked — H5
+        // does this after releasing the lock; this proves the deferred unlink still actually deletes).
+        assert!(cache.get("https://h/u1.glb").is_none(), "u1 should have been evicted");
+        assert!(
+            !cache_path(&dir, cache_key("https://h/u1.glb")).exists(),
+            "u1's file must be unlinked on eviction"
+        );
+        // The fresh entry survives and is readable; the byte total reflects only it.
+        assert_eq!(
+            cache.get("https://h/u2.glb"),
+            Some(vec![2u8; 60]),
+            "u2 should still be cached"
+        );
+        assert_eq!(cache.bytes(), 60, "byte total reflects the single surviving entry");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_is_session_independent_and_survives_reopen() {
+        let dir = temp_dir("reopen");
+        {
+            let cache = DiskCache::open(&dir, 10_000).expect("open");
+            // Same PATH, different auth query → same key → one cached entry, replayable across sessions.
+            cache.put("https://h/t.glb?session=A", &[7u8; 128]);
+            assert_eq!(cache.get("https://h/t.glb?session=B"), Some(vec![7u8; 128]));
+        }
+        // Reopen: the index is rebuilt by scanning the dir, so the entry is still served (survives restart).
+        let reopened = DiskCache::open(&dir, 10_000).expect("reopen");
+        assert_eq!(reopened.get("https://h/t.glb?session=C"), Some(vec![7u8; 128]));
+        assert_eq!(reopened.bytes(), 128);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -559,7 +1149,8 @@ mod tests {
         src.poll_completed(latency, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, id);
-        assert_eq!(out[0].bytes, synthetic_payload(id, src.bytes_for(id)));
+        // The synthetic lane always succeeds → `Ok(payload)` (audit A10: typed outcome, not bare bytes).
+        assert_eq!(out[0].result, Ok(synthetic_payload(id, src.bytes_for(id))));
         assert_eq!(src.in_flight(), 0);
     }
 

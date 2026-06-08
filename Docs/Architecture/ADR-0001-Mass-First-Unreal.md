@@ -2,7 +2,7 @@
 
 - **Status:** **Superseded in part by [ADR-0005](ADR-0005-Bevy-ECS-Authority.md)**
 - **Date:** 2026-06-01
-- **Deciders:** LogiUE architecture
+- **Deciders:** Vast architecture
 - **Supersedes:** the prior Unity/DOTS data-oriented architecture (intent preserved, implementation discarded)
 
 > ⚠️ **Superseded in part by [ADR-0005 — Bevy ECS Authority](ADR-0005-Bevy-ECS-Authority.md).**
@@ -14,7 +14,7 @@
 
 ## Context
 
-LogiUE must simulate **millions of logistics agents** at near-Earth scale while rendering a small,
+Vast must simulate **millions of logistics agents** at near-Earth scale while rendering a small,
 moving window of them at full fidelity ("real where you look, faked where you don't"). The prior
 project established the necessary shape: **data-oriented first, deterministic fixed-step simulation,
 simulation LOD, aggregate modeling**.
@@ -107,4 +107,4 @@ Simulation that participates in **replay or snapshot equality** must be determin
 ## References
 
 - Unreal Engine MassEntity documentation (Fragments, Archetypes, Processors, EntityQuery, command buffer).
-- LogiUE [`AGENTS.md`](../../AGENTS.md) §§ 1–3.
+- Vast [`AGENTS.md`](../../AGENTS.md) §§ 1–3.

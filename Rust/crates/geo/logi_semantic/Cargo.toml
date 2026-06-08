@@ -18,6 +18,8 @@ logi_geo_lod = { path = "../logi_geo_lod" }
 logi_geo_procgen = { path = "../logi_geo_procgen" }
 # Shared render-geometry home: VERTEX_STRIDE + AABB sphere (AGENTS.md §1A).
 logi_geo_mesh = { path = "../logi_geo_mesh" }
+# SwissTable map/sets for the tile index + refinement diff (membership only — no serialized map).
+hashbrown = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

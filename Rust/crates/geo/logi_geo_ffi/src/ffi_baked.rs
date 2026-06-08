@@ -1,23 +1,25 @@
-//! Additive C ABI for the **baked semantic-tile world** (ADR-0011, Milestone HE-0).
+//! C ABI for the **baked semantic-tile world** (ADR-0011, Milestone HE-0) and the procedural terrain lane.
 //!
-//! Mirrors the globe API's shape: open a baked store, then hand back every tile's mesh in Unreal render
-//! space (cm, Z-up LH) as **zero-copy** views into Rust-owned memory, valid until `destroy`. HE-0 serves
-//! the whole AOI statically (no camera-driven streaming yet — that lands in a later HE), so a single
-//! `get_frame` is enough; the C++ side caches one proc-mesh section per `tile_key`.
+//! Mirrors the globe API's shape: open a baked store (or build a procedural pyramid), then hand back each
+//! tile's mesh in Unreal render space (cm, Z-up LH) as **zero-copy** views into Rust-owned memory, valid
+//! until `destroy`. `select` returns the SSE-LOD tile set for the camera; the C++ side caches one proc-mesh
+//! section per `tile_key`.
 //!
 //! No Unreal types cross; Rust never calls Unreal (AGENTS.md §1). Errors are status codes / null — no
 //! panic unwinds across the boundary.
 
-use crate::ffi::{guard_i32, guard_ptr, set_last_error};
+use crate::ffi::{guard_i32, guard_ptr, set_last_error, LogiStatus};
 use logi_geospatial::{Cartographic, Ellipsoid};
-use logi_semantic::{within_cull_distance, BakedWorld, MeshingMode, TerrainHeights, VERTEX_STRIDE};
+use logi_semantic::{BakedWorld, MeshingMode, TerrainHeights, VERTEX_STRIDE};
 use std::ffi::{c_char, CStr};
 
-/// Status codes (mirror `logi_geo_ffi.h`: OK=0, NULL_ARG=-1, PANIC=-3, INTERNAL=-4).
-const LOGI_OK: i32 = 0;
-const LOGI_NULL_ARG: i32 = -1;
+// The baked lane returns raw `i32` codes (not [`LogiStatus`]), but the *values* have a single source of
+// truth: the `LogiStatus` enum in `ffi.rs` (whose discriminants the header mirrors as `LOGI_GEO_*`). We
+// derive the three the baked lane uses from it, so they can never drift from the enum or the header.
+const LOGI_OK: i32 = LogiStatus::Ok as i32;
+const LOGI_NULL_ARG: i32 = LogiStatus::NullArg as i32;
 /// A Rust panic was caught at this entry point (mapped here instead of unwinding across the C ABI — UB).
-const LOGI_PANIC: i32 = -3;
+const LOGI_PANIC: i32 = LogiStatus::Panic as i32;
 
 /// One baked tile for the renderer: a 32-byte-vertex mesh (`pos f3 | normal f3 | uv f2`, Unreal cm) +
 /// `u32` indices, both zero-copy views valid until [`logi_baked_world_destroy`].
@@ -32,9 +34,13 @@ pub struct LogiBakedTile {
     pub vertex_stride: u32, // == 32
     pub indices: *const u8, // index_count little-endian u32s
     pub index_count: u32,
-    pub _pad: u32,
+    /// Pyramid level / refinement depth (root = 0; higher = more refined). Debug-viz / telemetry only —
+    /// the renderer ignores it. (Occupies the former `_pad` slot, so the head layout is unchanged.)
+    pub depth: u32,
     pub bounds_center: [f32; 3], // Unreal render space (cm)
     pub bounds_radius: f32,
+    /// 3D Tiles geometric error at this tile (metres; lower = finer). Debug-viz / telemetry only.
+    pub geometric_error: f32,
 }
 
 /// One frame's render list (HE-0: the whole AOI). `tiles` points into the world's owned array, valid
@@ -53,11 +59,11 @@ pub struct LogiBakedFrame {
 pub struct LogiBakedWorld {
     world: BakedWorld,
     tiles: Vec<LogiBakedTile>,
-    /// Per-step distance-culled view into `tiles` (rebuilt each `logi_baked_world_step`).
+    /// The selected view into `tiles` (rebuilt each `logi_baked_world_select`).
     frame_scratch: Vec<LogiBakedTile>,
     /// Reused membership set for `logi_baked_world_select` — cleared and refilled each call so the SSE
     /// path allocates no fresh `HashSet` per frame (M6).
-    select_scratch: std::collections::HashSet<u64>,
+    select_scratch: hashbrown::HashSet<u64>,
 }
 
 /// Creation parameters — the **meshing toggle** + skirt. `meshing_mode`: 0 = uniform grid, 1 = adaptive
@@ -126,7 +132,7 @@ pub unsafe extern "C" fn logi_baked_world_create(
             world,
             tiles,
             frame_scratch: Vec::new(),
-            select_scratch: std::collections::HashSet::new(),
+            select_scratch: hashbrown::HashSet::new(),
         }))
     })
 }
@@ -145,9 +151,10 @@ fn build_tile_views(world: &BakedWorld) -> Vec<LogiBakedTile> {
             vertex_stride: VERTEX_STRIDE as u32,
             indices: t.mesh.indices.as_ptr() as *const u8,
             index_count: t.mesh.indices.len() as u32,
-            _pad: 0,
+            depth: t.id.level as u32,
             bounds_center: t.mesh.bounds_center,
             bounds_radius: t.mesh.bounds_radius,
+            geometric_error: t.geometric_error,
         })
         .collect()
 }
@@ -170,11 +177,61 @@ pub struct LogiBakedProceduralInfo {
     pub skirt_depth_m: f32,
 }
 
+// Compile-time ABI locks (M3) for the baked lane — the same discipline the globe lane has in `ffi.rs`.
+// `include/logi_geo_ffi.h` is HAND-MAINTAINED (NOT cbindgen-generated), and the C++ side reads these with
+// `read_unaligned` into the matching header structs, so a silent size *or* field-offset drift would
+// mis-decode every frame and corrupt memory. We lock BOTH the total size AND every field's byte offset via
+// `core::mem::offset_of!`; the expected offsets are the `#[repr(C)]` layout below, cross-checked
+// field-by-field against the header's struct order.
+use core::mem::offset_of;
+const _: () = {
+    // LogiBakedTile — u64 + ptr/u64/u32 + depth(u32) + [f32;3]/f32 + geometric_error(f32) (align 8), size 72
+    // (was 64 before v7: `depth` reuses the old `_pad` slot, `geometric_error` is a new f32 tail). Same head
+    // as LogiGlobeTile but no texture fields (baked tiles carry no per-tile texture).
+    assert!(std::mem::size_of::<LogiBakedTile>() == 72);
+    assert!(offset_of!(LogiBakedTile, tile_key) == 0);
+    assert!(offset_of!(LogiBakedTile, vertices) == 8);
+    assert!(offset_of!(LogiBakedTile, vertices_len) == 16);
+    assert!(offset_of!(LogiBakedTile, vertex_count) == 24);
+    assert!(offset_of!(LogiBakedTile, vertex_stride) == 28);
+    assert!(offset_of!(LogiBakedTile, indices) == 32);
+    assert!(offset_of!(LogiBakedTile, index_count) == 40);
+    assert!(offset_of!(LogiBakedTile, depth) == 44);
+    assert!(offset_of!(LogiBakedTile, bounds_center) == 48);
+    assert!(offset_of!(LogiBakedTile, bounds_radius) == 60);
+    assert!(offset_of!(LogiBakedTile, geometric_error) == 64);
+
+    // LogiBakedFrame — ptr + 2 × u32 + [f64;3] (align 8), size 40.
+    assert!(std::mem::size_of::<LogiBakedFrame>() == 40);
+    assert!(offset_of!(LogiBakedFrame, tiles) == 0);
+    assert!(offset_of!(LogiBakedFrame, tile_count) == 8);
+    assert!(offset_of!(LogiBakedFrame, _pad) == 12);
+    assert!(offset_of!(LogiBakedFrame, origin_ecef) == 16);
+
+    // LogiBakedCreateInfo — u32 + 2 × f32 (align 4), size 12.
+    assert!(std::mem::size_of::<LogiBakedCreateInfo>() == 12);
+    assert!(offset_of!(LogiBakedCreateInfo, meshing_mode) == 0);
+    assert!(offset_of!(LogiBakedCreateInfo, tin_max_error_m) == 4);
+    assert!(offset_of!(LogiBakedCreateInfo, skirt_depth_m) == 8);
+
+    // LogiBakedProceduralInfo — u64 + 4 × f64 + 3 × u32 + 2 × f32 (align 8), size 64 (60 bytes + 4 tail pad).
+    assert!(std::mem::size_of::<LogiBakedProceduralInfo>() == 64);
+    assert!(offset_of!(LogiBakedProceduralInfo, seed) == 0);
+    assert!(offset_of!(LogiBakedProceduralInfo, origin_lon_deg) == 8);
+    assert!(offset_of!(LogiBakedProceduralInfo, origin_lat_deg) == 16);
+    assert!(offset_of!(LogiBakedProceduralInfo, origin_height_m) == 24);
+    assert!(offset_of!(LogiBakedProceduralInfo, radius_m) == 32);
+    assert!(offset_of!(LogiBakedProceduralInfo, leaf_level) == 40);
+    assert!(offset_of!(LogiBakedProceduralInfo, grid_n) == 44);
+    assert!(offset_of!(LogiBakedProceduralInfo, meshing_mode) == 48);
+    assert!(offset_of!(LogiBakedProceduralInfo, tin_max_error_m) == 52);
+    assert!(offset_of!(LogiBakedProceduralInfo, skirt_depth_m) == 56);
+};
+
 /// Create a **procedural** terrain world (no store on disk): generate the SSE-LOD pyramid from the
-/// canonical fractal field — the one-engine procedural lane (the old `the retired render-scene crate`'s role). The
-/// handle is otherwise identical to a store-backed one (same `step`/`select`/`get_frame`/`destroy`).
-/// Returns null on a null `info` or a build failure. Blocking (meshes the whole bounded pyramid) — call
-/// off the render thread.
+/// canonical fractal field — the one-engine procedural lane. The handle is otherwise identical to a
+/// store-backed one (same `select`/`destroy`). Returns null on a null `info` or a build failure. Blocking
+/// (meshes the whole bounded pyramid) — call off the render thread.
 ///
 /// # Safety
 /// `info` must be null or point to a valid `LogiBakedProceduralInfo`.
@@ -229,55 +286,15 @@ pub unsafe extern "C" fn logi_baked_world_create_procedural(
             world,
             tiles,
             frame_scratch: Vec::new(),
-            select_scratch: std::collections::HashSet::new(),
+            select_scratch: hashbrown::HashSet::new(),
         }))
-    })
-}
-
-/// Camera-driven frame: like `get_frame` but distance-culled to tiles within `max_distance_cm` of the
-/// camera (Unreal cm; `<= 0` = no cull). The returned tiles point into the world's owned buffers, valid
-/// until `destroy` or the next `step`/`get_frame` on this world. HE-0 has one tile level, so this is a
-/// distance cull, not SSE-LOD (a baked tile pyramid is a later-HE upgrade).
-///
-/// # Safety
-/// `world` must be a live handle from [`logi_baked_world_create`]; `out` a valid writable pointer.
-#[no_mangle]
-pub unsafe extern "C" fn logi_baked_world_step(
-    world: *mut LogiBakedWorld,
-    camera_x_cm: f32,
-    camera_y_cm: f32,
-    camera_z_cm: f32,
-    max_distance_cm: f32,
-    out: *mut LogiBakedFrame,
-) -> i32 {
-    // CR1: panic → LOGI_PANIC instead of unwinding across the C ABI.
-    guard_i32(LOGI_PANIC, || {
-        if world.is_null() || out.is_null() {
-            return LOGI_NULL_ARG;
-        }
-        let handle = unsafe { &mut *world };
-        let cam = [camera_x_cm, camera_y_cm, camera_z_cm];
-        handle.frame_scratch.clear();
-        for t in &handle.tiles {
-            if within_cull_distance(t.bounds_center, t.bounds_radius, cam, max_distance_cm) {
-                handle.frame_scratch.push(*t);
-            }
-        }
-        let frame = LogiBakedFrame {
-            tiles: handle.frame_scratch.as_ptr(),
-            tile_count: handle.frame_scratch.len() as u32,
-            _pad: 0,
-            origin_ecef: handle.world.origin_ecef(),
-        };
-        unsafe { out.write_unaligned(frame) };
-        LOGI_OK
     })
 }
 
 /// SSE-LOD frame: selects the coarse-far / fine-near tile set by descending the baked **pyramid** and
 /// refining by screen-space error (reusing the kernel's `logi_geo_lod`). `fov_y_radians`,
 /// `viewport_height`, and `sse_target_px` drive the LOD; a single-level store renders everything. The
-/// returned tiles point into owned buffers, valid until `destroy` or the next step/select/get_frame.
+/// returned tiles point into owned buffers, valid until `destroy` or the next `select` on this world.
 ///
 /// **Render-only — not for replay.** `BakedWorld::select` carries per-frame hysteresis state, so its
 /// output is a function of the *camera history*, not the camera alone; never feed it into a deterministic
@@ -329,30 +346,6 @@ pub unsafe extern "C" fn logi_baked_world_select(
     })
 }
 
-/// Fill `out` with the render frame (all resident tiles + the ECEF origin). The tile pointers are valid
-/// until [`logi_baked_world_destroy`].
-///
-/// # Safety
-/// `world` must be a live handle from [`logi_baked_world_create`]; `out` must be a valid writable pointer.
-#[no_mangle]
-pub unsafe extern "C" fn logi_baked_world_get_frame(world: *const LogiBakedWorld, out: *mut LogiBakedFrame) -> i32 {
-    // CR1: panic → LOGI_PANIC instead of unwinding across the C ABI.
-    guard_i32(LOGI_PANIC, || {
-        if world.is_null() || out.is_null() {
-            return LOGI_NULL_ARG;
-        }
-        let handle = unsafe { &*world };
-        let frame = LogiBakedFrame {
-            tiles: handle.tiles.as_ptr(),
-            tile_count: handle.tiles.len() as u32,
-            _pad: 0,
-            origin_ecef: handle.world.origin_ecef(),
-        };
-        unsafe { out.write_unaligned(frame) };
-        LOGI_OK
-    })
-}
-
 /// Destroy a baked world (frees its meshes; any previously returned frame pointers dangle afterwards).
 ///
 /// # Safety
@@ -374,7 +367,7 @@ mod tests {
 
     #[test]
     fn null_args_are_handled() {
-        // create(null) → null; get_frame(null,..) → NULL_ARG; destroy(null) → no-op.
+        // create(null) → null; select(null,..) → NULL_ARG; destroy(null) → no-op.
         assert!(unsafe { logi_baked_world_create(std::ptr::null(), std::ptr::null()) }.is_null());
         let mut frame = LogiBakedFrame {
             tiles: std::ptr::null(),
@@ -382,14 +375,6 @@ mod tests {
             _pad: 0,
             origin_ecef: [0.0; 3],
         };
-        assert_eq!(
-            unsafe { logi_baked_world_get_frame(std::ptr::null(), &mut frame) },
-            LOGI_NULL_ARG
-        );
-        assert_eq!(
-            unsafe { logi_baked_world_step(std::ptr::null_mut(), 0.0, 0.0, 0.0, 1.0, &mut frame) },
-            LOGI_NULL_ARG
-        );
         assert_eq!(
             unsafe { logi_baked_world_select(std::ptr::null_mut(), 0.0, 0.0, 0.0, 1.0, 1080.0, 16.0, &mut frame) },
             LOGI_NULL_ARG
@@ -403,7 +388,7 @@ mod tests {
     /// shared guards that wrap every baked entry point with a closure that panics.
     #[test]
     fn panic_in_a_baked_path_returns_a_code_not_an_abort() {
-        // Status-returning lanes (step/select/get_frame) → LOGI_PANIC.
+        // Status-returning lanes (select) → LOGI_PANIC.
         let code = guard_i32(LOGI_PANIC, || panic!("boom in a baked status path"));
         assert_eq!(code, LOGI_PANIC);
         // Pointer-returning lanes (create/_create_procedural) → null.
@@ -430,9 +415,13 @@ mod tests {
         let world = unsafe { logi_baked_world_create_procedural(&info) };
         assert!(!world.is_null(), "procedural build should succeed");
 
-        // get_frame returns the whole AOI; every tile's buffer length must match count * stride.
+        // `select` with a tiny SSE target refines to the whole AOI; every tile's buffer length must match
+        // count * stride.
         let mut frame: LogiBakedFrame = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { logi_baked_world_get_frame(world, &mut frame) }, LOGI_OK);
+        assert_eq!(
+            unsafe { logi_baked_world_select(world, 0.0, 0.0, 0.0, 60f32.to_radians(), 1080.0, 1.0, &mut frame) },
+            LOGI_OK
+        );
         assert!(frame.tile_count > 0, "procedural world should emit tiles");
         assert!(!frame.tiles.is_null());
         let tiles = unsafe { std::slice::from_raw_parts(frame.tiles, frame.tile_count as usize) };
@@ -444,16 +433,6 @@ mod tests {
                 "vertices_len must equal vertex_count * stride"
             );
         }
-
-        // The guarded camera-driven lanes also return OK on this valid world.
-        assert_eq!(
-            unsafe { logi_baked_world_step(world, 0.0, 0.0, 0.0, -1.0, &mut frame) },
-            LOGI_OK
-        );
-        assert_eq!(
-            unsafe { logi_baked_world_select(world, 0.0, 0.0, 0.0, 60f32.to_radians(), 1080.0, 16.0, &mut frame) },
-            LOGI_OK
-        );
 
         unsafe { logi_baked_world_destroy(world) };
     }

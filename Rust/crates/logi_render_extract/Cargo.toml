@@ -6,5 +6,6 @@ publish = false
 
 [dependencies]
 bevy_ecs.workspace = true
+hashbrown.workspace = true
 logi_schema = { path = "../logi_schema" }
 logi_sim = { path = "../logi_sim" }

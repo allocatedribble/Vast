@@ -1,4 +1,4 @@
-# Plan — Async Logi-rs: Poll-Based FFI, Decoupled Sim/Stream Threads, and Geo Performance
+# Plan — Async Vast-rs: Poll-Based FFI, Decoupled Sim/Stream Threads, and Geo Performance
 
 > Status: **active.** [ADR-0012](../Architecture/ADR-0012-Poll-Based-FFI-Decoupled-Sim-Thread.md) accepted;
 > Phase 0 (Geo decouple + poll FFI) **landed and editor-verified**; the Phase-1 rebase matrix-fold landed.
@@ -6,24 +6,23 @@
 > (correctness pass) and **[Docs/Research/ECS-Multithreading-for-Geo.md](../Research/ECS-Multithreading-for-Geo.md)**
 > (the `bevy_ecs`-orchestration research Phase 1 is built on).
 >
-> **Parallelism decision (revised 2026-06-06):** terrain's multi-threading is orchestrated by **`bevy_ecs`
+> **Parallelism decision:** terrain's multi-threading is orchestrated by **`bevy_ecs`
 > (already a project dependency) — NOT `rayon`.** A dedicated Geo `World` on the stream thread runs a
 > schedule whose heavy systems `par_iter` over **tile entities** on the **shared global `ComputeTaskPool`**
-> (gameplay + Geo share one pool → no second pool, no core oversubscription). This revises the original
-> review's "ECS isn't the lever for Geo" verdict: with small Table components, geometry behind `Arc`, **zero
-> structural churn in the hot loop**, and **right-sized systems**, ECS brings what `rayon` alone does not
-> (one pool, change detection, access-conflict scheduling, a unified model with gameplay). The rationale and
-> the hard constraints are in the research doc; the design is **§2A**.
+> (gameplay + Geo share one pool → no second pool, no core oversubscription). With small Table components,
+> geometry behind `Arc`, **zero structural churn in the hot loop**, and **right-sized systems**, ECS brings
+> what `rayon` alone does not (one pool, change detection, access-conflict scheduling, a unified model with
+> gameplay). The rationale and the hard constraints are in the research doc; the design is **§2A**.
 >
 > **Architectural implication:** amends ADR-0005's boundary (owner thread off the game thread) — ADR-0012.
 > The Geo crates gain a `bevy_ecs`/`bevy_tasks` dependency for the orchestration World (they were
-> deliberately bevy-free); this is consistent with ADR-0005's "one ECS / one truth language" and should be
-> recorded as an **ADR-0012 addendum** before Phase 1 lands.
+> deliberately bevy-free); this is consistent with ADR-0005's "one ECS / one truth language" and is recorded
+> in **[ADR-0012 Addendum A](../Architecture/ADR-0012-Poll-Based-FFI-Decoupled-Sim-Thread.md)**.
 
 ## Governing principle (the directive this plan encodes)
 
-> Unreal communicates with Logi-rs **only on the Unreal game thread**, through **cheap, non-blocking**
-> calls. Logi-rs is **as multi-threaded and parallel as the determinism contract allows**. The FFI
+> Unreal communicates with Vast-rs **only on the Unreal game thread**, through **cheap, non-blocking**
+> calls. Vast-rs is **as multi-threaded and parallel as the determinism contract allows**. The FFI
 > **`step` functions become `poll` functions**: Unreal pushes the latest view/input and pulls the
 > **latest** published simulation/terrain update — it never drives, and never blocks on, the heavy work.
 
@@ -43,7 +42,7 @@ from "do the work now" to "hand me the newest result."
 | Who advances the World/TilesetWorld | the **game thread**, inside the FFI call | a **Rust-owned sim/stream thread** |
 | Game-thread FFI cost | the entire drain→decode→rebase→select→evict (geo) / schedule run (gameplay) | **O(1)** push-view + O(visible) snapshot read |
 | Heavy CPU work location | game thread (causes frame hitches) | sim/stream thread + a job pool (off the frame) |
-| Geometry handoff | pointers "valid until next `step`" (fragile) | retained, refcounted slots; up to 3 live (ring) |
+| Geometry handoff | pointers "valid until next `step`" (fragile) | retained, refcounted (Geo: `Arc` mailbox; gameplay: 3-slot ring) |
 | Geo parallelism | HTTP fetch only | fetch **+ decode + rebase + mesh-prep**, all parallel |
 | Cadence | locked to whoever calls `step` (~30 Hz actor tick) | sim runs at its own rate; render polls at frame rate |
 | Determinism (gameplay) | fixed-step, on game thread | fixed-step, on sim thread, timestamped input (preserved) |
@@ -51,8 +50,8 @@ from "do the work now" to "hand me the newest result."
 The gameplay engine is **already 70% of the way** to the "after" column: it has the 3-slot
 [`SnapshotRing`](../../Rust/crates/logi_runtime/src/lib.rs) (publish/retire fence, `find(0)`=latest,
 keeps 3 live so a mid-read consumer is never clobbered) and `logi_buffer_release`. Its only gap is that
-the *advance* (`logi_world_tick`) still runs on the game thread. **Geo has none of this** — building the
-ring/retain layer for Geo is the larger lift.
+the *advance* (`logi_world_tick`) still runs on the game thread. **Geo started with none of this** — its
+retain layer (the `Arc<TileGeometry>` mailbox handoff, §3) was the larger lift.
 
 ---
 
@@ -82,36 +81,32 @@ touches the `World`.
 logi_globe_world_poll(handle, &out_frame /* id + tile descriptor span */) -> status;
 logi_world_poll(handle, &out_snapshot /* id + instance/actor/despawn spans */) -> status;
 ```
-`poll` is the renamed/repurposed read side. It is `SnapshotRing::find(0)` (latest) + mark-retained, plus
-a generation check so an unchanged frame returns `SAME` and the C++ side **skips rebuilding** (this is
-the "fewer lookups / fewer rebuilds" win — most frames the tile set is unchanged). The returned
-descriptors are pointers into **retained** Rust buffers (see §3).
+`poll` is the renamed/repurposed read side: the latest published frame (gameplay `SnapshotRing::find(0)` +
+mark-retained; Geo the latest-wins mailbox + `Arc`-clone, §3a), plus a generation check so an unchanged
+frame returns `SAME` and the C++ side **skips rebuilding** (this is the "fewer lookups / fewer rebuilds"
+win — most frames the tile set is unchanged). The returned descriptors are pointers into **retained** Rust
+buffers (see §3).
 
-### 1c. Release a retained frame (consumer; cheap)
+### 1c. Release a retained frame (consumer; cheap — gameplay ring only)
 ```
-logi_buffer_release(handle, frame_id);   // already exists for gameplay; Geo adopts the same
+logi_buffer_release(handle, frame_id);   // gameplay ring slot retire; Geo's Arc handoff needs no release
 ```
-Marks the ring slot free so the producer can reuse it. The producer's publish fence
+Marks the gameplay ring slot free so the producer can reuse it. The producer's publish fence
 (`acquire_free_slot`: retired **and** not the current latest) already guarantees it never overwrites a
-buffer the consumer holds.
-
-**Migration shim:** keep `logi_*_world_step(view) -> frame` as a thin wrapper = `set_view(view);
-advance_once(); poll()` so the new path can land incrementally and be A/B'd against the old synchronous
-behavior behind a flag, then retired (ADR-0004: no permanent compatibility code — the shim is temporary
-and tracked).
+buffer the consumer holds. (Geo has no `release`: the per-poll `Arc`-clone is the lifetime guarantee, §3a.)
 
 ---
 
-## 2. Internal threading model of Logi-rs (after)
+## 2. Internal threading model of Vast-rs (after)
 
 ```
             UNREAL GAME THREAD                         RUST-OWNED THREADS
   ┌───────────────────────────────┐
   │ per frame (~120 Hz):          │        ┌──────────────────────────────────────────┐
-  │  set_view / push_input  ──────┼──────► │ GEO STREAM THREAD — owns a bevy_ecs World  │
-  │  poll_latest  ◄───────────────┼──────  │  loop: run the Geo schedule (§2A)          │
-  │  release(old_id)              │  ring  │   select → drain → DECODE(par_iter) →       │
-  │                               │        │   sse/cull(fused) → evict → publish        │
+  │  set_view  ───────────────────┼──────► │ GEO STREAM THREAD — owns a bevy_ecs World  │
+  │  poll_latest  ◄───────────────┼─mailbox│  per step (§2A): drain + select (methods),  │
+  │  (Arc-clone, no release)      │ +Arc   │   then schedule (sse/cull(fused) →          │
+  │                               │        │   DECODE(par_iter) → evict → publish)       │
   │  (renderer builds only the    │        │   tiles are entities; heavy systems        │
   │   tiles whose id changed)     │        │   par_iter on the shared pool ──┐          │
   └───────────────────────────────┘        │      └── fans out to ──┐                   │
@@ -184,26 +179,35 @@ same set (uniform archetype); the hot pass touches only small fields:
 The multi-kilobyte geometry is reached **only** by the decode/publish systems through the `Arc` (this is the
 Phase-0 retain, now doubling as the storage-layout win).
 
-**Systems — few, right-sized** (research §5, the granularity rule). Schedule order below; the executor also
-runs any with disjoint component access concurrently:
+**Systems — few, right-sized** (research §5, the granularity rule). The pointer-chasing tree work runs as
+two **pre-schedule** `GeoWorld` methods (sequential by nature; they mutate the tree/IO and acquire pool
+entities before any per-entity system touches them); the `Schedule` itself is **four chained systems** that
+do the per-entity + parallel work. The executor also runs any with disjoint component access concurrently.
 
-1. **`select`** — *sequential*. Descends the tileset tree (pointer-chasing → not `par_iter`-able) marking
-   each visited tile's `TileState`/`Sse`. Cheap; sets fields only. Owns the tree as a `Resource`.
-2. **`drain_fetches`** — *sequential, cheap*. Moves completed HTTP results (the existing crossbeam worker
-   pool, unchanged) into the matching tile's `FetchedBytes` and flips `TileState = Fetched`. Field mutation
-   only — no structural change.
-3. **`decode` — the parallel beneficiary.** `par_iter_mut` over `Query<…, (With<Fetched>, Changed<FetchedBytes>)>`:
+**Pre-schedule (sequential `GeoWorld` methods, run before `schedule.run`):**
+
+- **`drain_fetches`** (`drain_raw`) — moves completed HTTP results (the existing crossbeam worker pool,
+  unchanged) into the matching tile's fetched-bytes and flips its `TileState = Fetched`. Field mutation only —
+  no structural change.
+- **`select`** (`select_request`) — descends the tileset tree (pointer-chasing → not `par_iter`-able)
+  marking each visited tile's `TileState`/`Sse`, and acquiring/requesting pool slots. Owns the tree as a
+  `Resource`.
+
+**Schedule — `(sse_cull_lru, decode, evict, publish).chain()`:**
+
+1. **`sse_cull_lru`** — the **fused cheap pass**: one system computing `CamDistance` + `Sse` + visibility +
+   `LastSeen` for all candidate tiles in a **single coarse-batched `par_iter`** (or serial when few tiles).
+   *Not* four tiny systems and *not* a `par_iter` per cheap op — that is a measured net loss (research §5).
+   It runs **before** `decode` so the decode/evict decisions see this frame's freshly-scored tiles.
+2. **`decode` — the parallel beneficiary.** `par_iter_mut` over `Query<…, (With<Fetched>, Changed<FetchedBytes>)>`:
    each task does the **whole expensive unit** — `decode_glb`/`qmesh::parse` + the folded vertex rebase — and
    writes an `Arc<TileGeometryData>`, flipping to `Resident`. **Explicit `BatchingStrategy` with a small
    batch**: tile cost is highly variable (a tiny tile vs. a dense photogrammetry tile), so small batches let
    the pool **work-steal** the uneven load — the uniform-work default heuristic is wrong here (research §4).
    This is where the cores actually get used.
-4. **`sse_cull_lru`** — the **fused cheap pass**: one system computing `CamDistance` + `Sse` + visibility +
-   `LastSeen` for all candidate tiles in a **single coarse-batched `par_iter`** (or serial when few tiles).
-   *Not* four tiny systems and *not* a `par_iter` per cheap op — that is a measured net loss (research §5).
-5. **`evict`** — *sequential*. Picks LRU victims past the cap, drops their `TileGeometry` `Arc` (frees the
+3. **`evict`** — *sequential*. Picks LRU victims past the cap, drops their `TileGeometry` `Arc` (frees the
    buffer once no published frame holds it), resets the slot to `Free`. **No despawn.**
-6. **`publish`** — builds the render-frame snapshot from `Query<…, With<Resident>>` ∩ visible, gated by
+4. **`publish`** — builds the render-frame snapshot from `Query<…, With<Resident>>` ∩ visible, gated by
    `Changed<TileGeometry>` so unchanged tiles are skipped, and writes it into the §3 mailbox the game thread
    polls. (`Changed` still *scans* matched rows cheaply but skips the build body — research §9.)
 
@@ -217,7 +221,7 @@ with mesh rebase.
 
 **What stays out of the ECS.** The tileset *tree* (a grafting pointer tree) and the HTTP worker pool stay as
 they are — the ECS orchestrates *tile work*, not tree topology or the network. `select` reads the tree
-(`Resource`) and writes tile components; that seam is the bridge. The Phase-0 `GlobeStreamer` mailbox/ring
+(`Resource`) and writes tile components; that seam is the bridge. The Phase-0 `GlobeStreamer` mailbox
 (§3) is unchanged — only the *internals* of how the stream thread advances change (an ECS schedule replaces
 the hand-rolled `advance`).
 
@@ -226,17 +230,19 @@ the hand-rolled `advance`).
 ## 3. The handoff & lifetime safety (the critical correctness work)
 
 The whole plan rests on the consumer reading Rust-owned geometry on a *different* thread than the producer
-mutating it. Get this wrong and you get a use-after-free across the C ABI. Two mechanisms, both already
-proven on the gameplay side:
+mutating it. Get this wrong and you get a use-after-free across the C ABI. Two mechanisms:
 
-### 3a. Ring slots with a publish/retire fence (have it for gameplay; build it for geo)
-Reuse the `SnapshotRing` design: N≥3 slots; `publish` writes into a slot that is **retired and not the
-current latest**; `poll` serves the latest and the consumer `release`s when done. The ring keeps up to N
-frames live, so a consumer still reading frame *k* is never clobbered when *k+1* publishes; over-fast
-producers drop intermediate frames (counted as `dropped_frames` — already instrumented). For render,
-dropping intermediates is correct: only the latest matters.
+### 3a. Latest-wins mailbox (Geo)
+Geo's cross-thread handoff is a single `Mutex<Option<GeoRenderFrame>>` **latest-wins mailbox**: the stream
+thread overwrites it with the newest published frame; the game thread's `poll` takes the latest and walks
+away owning `Arc<TileGeometry>` clones (§3b), so the producer can overwrite the mailbox and evict tiles
+freely without ever dangling a frame the renderer holds. There is **no `release` call** — the per-poll `Arc`
+clone is the lifetime guarantee. At single-producer / single-consumer ~60 Hz the µs `Mutex` hold costs an
+`Arc`-bump's worth, so the safe mailbox is the right call over a lock-free seqlock. (The gameplay engine
+uses the heavier `SnapshotRing` — N≥3 retired-slot fence + `logi_buffer_release` — because its ordered,
+deterministic snapshot stream needs retained intermediates; Geo, latest-only, does not.)
 
-### 3b. Refcounted tile geometry (new for geo — the harder half)
+### 3b. Refcounted tile geometry (the lifetime mechanism)
 Geo's per-tile vertex/index/texture buffers are large and have independent lifetimes (a tile can stay
 resident across many frames, then be evicted while a slightly-stale polled frame still points at it).
 The current "valid until next `step`" contract cannot survive async. Fix: store tile geometry as
@@ -293,7 +299,7 @@ The inversion changes *why* and *how urgently* each earlier finding matters:
 | Priority + preemptive fetch ([streaming.rs:359](../../Rust/crates/geo/logi_3dtiles_scene/src/streaming.rs:359)) | **Higher value** — the stream thread now always selects against the freshest camera, so a priority queue pays off immediately on fast motion. |
 | f32 + matrix-fold rebase (~3–6×) | **Matrix-fold DONE** (f64-exact, ~½ the matrix ops, tested) — it is now the per-task body of the `decode` system, so it compounds with the `par_iter` fan-out. f32-SIMD deferred (precision-validate first). |
 | Incremental cross-frame traversal | Unchanged value; complements the priority queue. |
-| **New, introduced by this plan** | Geo ring + `Arc` retain (§3); input/view queues (§1a); sim-thread lifecycle/shutdown (§7); the ADR-0012 contract change (§9). |
+| **New, introduced by this plan** | Geo mailbox + `Arc` retain (§3); input/view queues (§1a); sim-thread lifecycle/shutdown (§7); the ADR-0012 contract change (§9). |
 
 ---
 
@@ -301,14 +307,18 @@ The inversion changes *why* and *how urgently* each earlier finding matters:
 
 Re-sequenced so the enabling inversion lands first and everything else rides on it.
 
-**Phase 0 — Decouple + poll (the foundation).** ✅ **Landed + editor-verified for Geo** (`Arc` retain,
-`FrameRing`, `GlobeStreamer` thread, `set_view`/`poll` FFI, C++ consumer, editor rebuild). The **gameplay**
+**Phase 0 — Decouple + poll (the foundation).** ✅ **Landed + editor-verified for Geo** (`Arc<TileGeometry>`
+retain, `GlobeStreamer` thread, `set_view`/`poll` FFI, C++ consumer, editor rebuild). The **gameplay**
 sim-thread half is still pending (lower value today — the gameplay sim is trivial; determinism-sensitive).
+
+> **Geo handoff (shipped).** A single `Mutex<Option<GeoRenderFrame>>` latest-wins mailbox + per-poll
+> `Arc`-clone (`stream_thread.rs`) — §3a. Remaining throughput cleanup: the per-poll cost is the whole-frame
+> clone + a per-tile `Arc` atomic bump; handing across one `Arc<[GeoRenderTile]>` collapses that to a single
+> bump.
 - Spawn the sim thread (gameplay) and stream thread (geo) at `world_create`; relocate `is_owner_thread`.
 - Split `logi_world_tick` into: sim-thread `advance+publish` loop, and game-thread `poll`. Gameplay
-  reuses its existing ring; **build the geo ring + `Arc<TileGeometry>` retain** (§3b).
+  reuses its existing ring; Geo uses the `Arc<TileGeometry>` retain + mailbox (§3).
 - Add `set_view` / `push_input` producers (§1a) and the `poll`/`release` consumers (§1b/c).
-- Land the temporary `step`-shim for A/B.
 - Sim-thread lifecycle: clean start on create, signalled stop + join on destroy / PIE end (§7).
 - *Exit criterion:* game-thread FFI time is O(visible) with zero decode/traversal on it; replay golden
   tests still bit-identical.
@@ -332,25 +342,26 @@ sim-thread half is still pending (lower value today — the gameplay sim is triv
 - Parallelize the C++ proc-mesh / Nanite build (UE `Async`/task graph); keep the per-step build budget as a
   smoothing cap, not a throughput cap.
 
-**Phase 2 — Cache + streaming quality (kills residual hitches & pop).**
-- Two-tier cache: in-memory byte (and/or decoded-mesh) LRU in front of `DiskCache`; stop re-decoding on
-  re-entry near the working-set boundary; move eviction file-deletes off the index mutex.
-- Priority + preemptive fetch: bounded priority queue keyed by screen-space importance; actually cancel
-  stale in-flight on fast motion.
-- Incremental cross-frame traversal (cesium-style kick / `ancestorMeetsSse`) + stateful LOD hysteresis on
-  the streaming selector (the dead-band already exists in `logi_geo_lod::should_refine`).
+**Phase 2 — Cache + streaming quality (kills residual hitches & pop).** ✅ **Done.**
+- Decoded-mesh LRU (`MeshCache`) — warm re-entry, no re-decode; decode frees raw bytes; index reconciliation.
+- Priority + preemptive fetch: screen-error × view-direction priority; cancel stale in-flight on fast motion.
+- Cross-frame **kick** (`SelectionState`/`TraversalDetails`) + LOD hysteresis dead-band + `ancestor_meets_sse`
+  fallback load; plus frustum-aware LOD (`Visibility` tri-state + ECEF `ViewFrustum`, culled-SSE shell).
 
-**Phase 3 — Throughput cleanups (sim-thread headroom).**
-- Persistent `in_flight_paths` set → delete the per-iteration `resolved` rebuild.
-- Collapse the FFI double-probe; memoize tile keys; reuse descriptor buffers.
-- `base_for` prefix trie (O(L·G)→O(L·D)); baked `select` O(visible) via index + dedupe child probes.
-- Codec constant-factors: procgen divide-elimination, `Package::find` map, qmesh alloc dedupe,
-  `interleave` 32-byte write.
+**Phase 3 — Throughput cleanups (sim-thread headroom).** ⏳ **Started.**
+- ✅ `base_for` longest-prefix probe (O(|bases|)→O(depth)); ✅ deleted the per-frame `resident` rebuild
+  (probe index+world directly); ✅ baked `select` child-probe dedup. FFI double-probe / memoized keys /
+  reused descriptor buffers were already resolved by the ECS rewire.
+- ⏸ Codec constant-factors (procgen divide, `Package::find` map, qmesh alloc, `interleave`) **deferred** —
+  not on the live P3DT-glTF hot path; want a flamegraph on those lanes first (§1B measure-first).
 
-**Phase 4 — Gameplay parallelism (make the dormant executor earn its keep).**
-- Make the hot ECS systems (`integrate_motion`, `compute_significance`, budget passes) conflict-correct
-  and `par_iter_mut` them — **or** default to `SingleThreadedDeterministic` until agent population
-  justifies the pool, so the `MultiThreaded` executor stops costing coordination overhead for nothing.
+**Phase 4 — Gameplay parallelism (make the dormant executor earn its keep).** ✅ **Done.**
+- `integrate_motion` + `compute_significance` now `par_iter_mut` (per-agent, conflict-free → the 1M-agent
+  scaling lever; the pool now earns its keep via par_iter, not the executor). `par_iter` falls back to a
+  serial walk with no pool, so `SingleThreadedDeterministic` stays the serial golden reference.
+- Determinism verified bit-identical between modes (`parallel_execution_matches_single_threaded_bit_for_bit`).
+- `allocate_representation_budget` stays sequential (a global ranking — `select_nth` O(n) + scratch reuse);
+  par_iter-ing its collect/apply loops is a profiler-gated follow-up. Auto-mode-by-population: optional/low-pri.
 
 ---
 
@@ -366,10 +377,8 @@ sim-thread half is still pending (lower value today — the gameplay sim is triv
 - **Editor / PIE lifecycle** — sim/stream threads must start on world-create and **join cleanly** on stop;
   no detached threads leaking across PIE sessions or surviving a Live Coding reload. (HTTP workers already
   exit on source-drop; the sim/stream threads need the same `AtomicBool running` + channel-close + join.)
-- **Back-pressure** — bounded input queue and bounded in-flight fetches; the ring drops (counts)
-  intermediate frames rather than growing unbounded.
-- **One home per shared contract** (AGENTS.md §1A) — the geo ring should reuse, not re-implement, the
-  gameplay ring's slot/fence logic; factor the ring into a shared place if it's duplicated.
+- **Back-pressure** — bounded input queue and bounded in-flight fetches; the latest-wins handoff drops
+  (counts) intermediate frames rather than growing unbounded.
 - **No structural changes in the Geo hot loop** (research §2/§7) — pre-spawned tile pool + in-place field
   mutation; spawn/despawn/insert/remove are `ApplyDeferred` barriers, so any churn is staged into one
   end-of-step flush. `TileState` is an enum *field*, never an add/removed marker component.
@@ -389,13 +398,12 @@ sim-thread half is still pending (lower value today — the gameplay sim is triv
 ) { /* publish into a seqlock View slot; stream thread reads it each loop iter */ }
 
 // ---- consumer (game thread): O(visible), retained, generation-checked ----
+// Geo: poll takes the latest-wins mailbox frame, cloning its tile `Arc`s — no `release` (§3a).
 #[repr(C)] pub struct LogiPollResult { pub status: u32, pub frame_id: u64,
     pub tiles: *const LogiGlobeTile, pub tile_count: u32 }
 #[no_mangle] pub extern "C" fn logi_globe_world_poll(
     h: *mut GlobeHandle, out: *mut LogiPollResult,
-) -> u32 { /* ring.find(0) + retain; SAME if id unchanged → C++ skips rebuild */ }
-
-#[no_mangle] pub extern "C" fn logi_buffer_release(h: *mut GlobeHandle, frame_id: u64) { /* ring.retire */ }
+) -> u32 { /* take mailbox + Arc-clone; SAME if id unchanged → C++ skips rebuild */ }
 ```
 ```cpp
 // ---- C++ game thread, per frame ----
@@ -403,10 +411,9 @@ World->set_view(Camera, Fov, ViewportH, MaxSse);          // cheap
 LogiPollResult R; uint32 St = World->poll(&R);            // cheap, latest
 if (St == NEW) { BuildOrReuseSectionsFor(R.tiles, R.tile_count); LastId = R.frame_id; }
 // St == SAME → nothing to do; reuse existing sections (no lookups, no rebuild)
-World->release(PrevFrameId); PrevFrameId = R.frame_id;
 ```
-The stream thread, meanwhile, loops independently: read view → drain/decode (job pool) → select →
-request → evict → `publish`, at whatever rate the work allows.
+The stream thread, meanwhile, loops independently: drain + select (methods) → schedule
+(`sse_cull_lru` → decode on the job pool → evict → `publish`), at whatever rate the work allows.
 
 ---
 
@@ -416,7 +423,6 @@ This relocates the single-owner thread (`is_owner_thread`, the historical §11 r
 game thread and redefines the FFI from synchronous `step` to `set_view + poll + release`. That is a
 first-class architecture decision, ratified as
 **[ADR-0012 — Poll-Based FFI / Decoupled Sim Thread](../Architecture/ADR-0012-Poll-Based-FFI-Decoupled-Sim-Thread.md)**
-(Proposed): it amends ADR-0005's boundary (AGENTS.md §1/§1C — which already says *Unreal pulls a snapshot
+(Accepted): it amends ADR-0005's boundary (AGENTS.md §1/§1C — which already says *Unreal pulls a snapshot
 and does not mutate*; this completes that intent), and notes that ADR-0007's non-authoritative-render clause
-is what *permits* Geo to run fully async while gameplay stays fixed-step deterministic. Phase 0 should not
-merge before that ADR is accepted.
+is what *permits* Geo to run fully async while gameplay stays fixed-step deterministic.
