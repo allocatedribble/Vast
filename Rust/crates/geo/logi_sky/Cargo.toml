@@ -1,0 +1,13 @@
+[package]
+name = "logi_sky"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# LogiSky S1 (ADR-0022): the Rust-owned atmosphere model — parameters, the CPU LUT bakers
+# (transmittance + multi-scattering), and the event-gated SkyState/SkyFrame derivation. Headless and
+# deterministic; the FFI lane + UE shell are S2 (Docs/Plans/LogiSky-Atmosphere-Remake.md).
+
+[dependencies]
+glam = { workspace = true }
+logi_geospatial = { path = "../logi_geospatial" }

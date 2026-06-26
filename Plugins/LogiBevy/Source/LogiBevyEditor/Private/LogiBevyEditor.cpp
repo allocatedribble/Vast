@@ -1,6 +1,7 @@
 // Copyright LogiUE. All Rights Reserved.
 
 #include "LogiBevyEditor.h"
+#include "LogiGeoBenchRunner.h"
 #include "Modules/ModuleManager.h"
 
 DEFINE_LOG_CATEGORY(LogLogiBevyEditor);
@@ -15,10 +16,12 @@ public:
 	virtual void StartupModule() override
 	{
 		UE_LOG(LogLogiBevyEditor, Log, TEXT("LogiBevyEditor started (authoring/import tooling)."));
+		FLogiGeoBenchRunner::Init(); // geo bench harness — Bench/_inbox file watcher (Docs/Testing/Geo-Bench.md)
 	}
 
 	virtual void ShutdownModule() override
 	{
+		FLogiGeoBenchRunner::Shutdown();
 	}
 };
 

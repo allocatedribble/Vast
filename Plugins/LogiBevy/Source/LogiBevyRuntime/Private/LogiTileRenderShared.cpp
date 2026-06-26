@@ -8,6 +8,7 @@
 
 #if WITH_EDITOR
 #include "LevelEditorViewport.h"            // GCurrentLevelEditingViewportClient
+#include "Editor.h"                         // GEditor->GetLevelViewportClients (the perspective-pane scan)
 #endif
 
 #if LOGI_GEO_NANITE_LANE
@@ -49,20 +50,42 @@ bool LogiResolveStreamView(UWorld* World, FLogiStreamView& Out)
 		return true;
 	}
 #if WITH_EDITOR
-	if (GCurrentLevelEditingViewportClient != nullptr)
+	// Resolve from a PERSPECTIVE level viewport, never the focus cursor. GCurrentLevelEditingViewportClient
+	// tracks whichever pane was last made current — an ortho pane, or another viewport entirely — so keying
+	// the stream view (and the zenith sun, which follows it) off it raw makes streaming authority jump with
+	// editor focus: an ortho top-down camera is a nonsense SSE/frustum source, and a focus change mid-bench
+	// re-aims the sun at an unchanged runner camera (the 2026-06-11 settled-shot day↔twilight flip suspect).
+	// Use the current client only when it IS a perspective viewport; otherwise scan for the first visible
+	// perspective level viewport (the main editing pane in every standard layout).
+	FLevelEditorViewportClient* Client =
+		(GCurrentLevelEditingViewportClient != nullptr && GCurrentLevelEditingViewportClient->IsPerspective())
+			? GCurrentLevelEditingViewportClient
+			: nullptr;
+	if (Client == nullptr && GEditor != nullptr)
 	{
-		Out.Loc = GCurrentLevelEditingViewportClient->GetViewLocation();
+		for (FLevelEditorViewportClient* Candidate : GEditor->GetLevelViewportClients())
 		{
-			const FQuat Q = GCurrentLevelEditingViewportClient->GetViewRotation().Quaternion();
+			if (Candidate != nullptr && Candidate->IsPerspective() && Candidate->Viewport != nullptr)
+			{
+				Client = Candidate;
+				break;
+			}
+		}
+	}
+	if (Client != nullptr)
+	{
+		Out.Loc = Client->GetViewLocation();
+		{
+			const FQuat Q = Client->GetViewRotation().Quaternion();
 			Out.Dir = Q.GetForwardVector(); // camera forward + up → fetch priority + view frustum
 			Out.Up = Q.GetUpVector();
 		}
-		if (FViewport* VP = GCurrentLevelEditingViewportClient->Viewport)
+		if (FViewport* VP = Client->Viewport)
 		{
 			const FIntPoint Sz = VP->GetSizeXY();
 			if (Sz.X > 0 && Sz.Y > 0) { Out.ViewportWidth = static_cast<float>(Sz.X); Out.ViewportHeight = static_cast<float>(Sz.Y); }
 		}
-		FovYFromHorizontal(GCurrentLevelEditingViewportClient->ViewFOV);
+		FovYFromHorizontal(Client->ViewFOV);
 		return true;
 	}
 #endif

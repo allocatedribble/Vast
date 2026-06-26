@@ -1,11 +1,12 @@
-//! The C-ABI entry points (runtime-model.md §3.1). Every call is wrapped so a Rust panic becomes a
-//! status code / null instead of unwinding across FFI (UB). The world handle is an opaque
-//! `*mut LogiTerrainWorld` (a boxed pointer); null is invalid.
+//! The C-ABI entry points. Every call is wrapped so a Rust panic becomes a status code / null instead
+//! of unwinding across FFI (UB). The handles are opaque boxed pointers — `*mut LogiGlobeWorld` (the
+//! streamed-globe lane) and `*mut LogiBuilding` (the M1 building lane); null is invalid. (The old
+//! streaming `LogiTerrainWorld` was retired in the one-engine merge.)
 
 use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
 
-/// Status codes returned across the boundary. Matches `LogiStatus` (int32) in `logi_geo.h`.
+/// Status codes returned across the boundary. Matches `LogiStatus` (int32) in `logi_geo_ffi.h`.
 #[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LogiStatus {
@@ -48,7 +49,7 @@ fn guard(f: impl FnOnce() -> LogiStatus) -> LogiStatus {
     match panic::catch_unwind(AssertUnwindSafe(f)) {
         Ok(status) => status,
         Err(_) => {
-            set_last_error("panic caught at logi-terrain FFI boundary");
+            set_last_error("panic caught at the logi_geo FFI boundary");
             LogiStatus::Panic
         }
     }
@@ -280,11 +281,24 @@ pub unsafe extern "C" fn logi_building_destroy(building: *mut LogiBuilding) {
 // buffers are **zero-copy views into Rust-owned memory, valid until the next `poll`** (the terrain-lane
 // contract). The C++ side caches one proc-mesh section per `tile_key` and rebuilds only new keys.
 
-use logi_3dtiles_scene::{GeoRenderFrame, GeoWorld, GlobeStreamer, StreamPoll, ViewParams};
+use logi_3dtiles_scene::{
+    FetchBackend, GeoRenderFrame, GeoWorld, GlobeStreamer, StreamPoll, ViewParams, DEFAULT_MAX_RESIDENT,
+    DEFAULT_TILE_POOL_SIZE,
+};
 use std::collections::{HashMap, HashSet};
 #[cfg(debug_assertions)]
 use std::thread::ThreadId;
 use std::time::Duration;
+
+/// FFI fetch-worker-count clamp: a garbage `info.workers` must not spawn unbounded OS threads, nor 0. The max
+/// MUST match the C++ `GlobeFetchWorkers` UPROPERTY ClampMax and the ureq per-host idle-pool size in
+/// `logi_3dtiles_io` (the pool must be ≥ the worker count so every worker keeps a warm keep-alive connection).
+const MIN_FETCH_WORKERS: u32 = 1;
+const MAX_FETCH_WORKERS: u32 = 64;
+
+/// Idle park for the Rust-owned stream thread (ADR-0012): when the camera is still and nothing is in flight it
+/// sleeps this long (~125 Hz) instead of spinning; a `set_view` unparks it so it advances promptly on motion.
+const GEO_IDLE_PARK: Duration = Duration::from_millis(8);
 
 /// Opaque handle to a streaming globe world (boxed). Null is invalid. Owns the decoupled stream thread
 /// (ADR-0012): the `bevy_ecs` `GeoWorld` advances on its own Rust thread; the game thread only pushes views
@@ -298,11 +312,17 @@ use std::time::Duration;
 /// release, so the contract is the caller's to keep.
 pub struct LogiGlobeWorld {
     streamer: GlobeStreamer,
-    /// The latest frame polled from the stream thread — retained so its `Arc` geometry keeps backing the
-    /// pointers in `frame_tiles` until the next New poll replaces it (valid-until-next-poll).
-    current_frame: Option<GeoRenderFrame>,
+    /// The latest frame polled from the stream thread — retained (an `Arc` share of the stream mailbox's
+    /// frame, O(1) to take) so its geometry keeps backing the pointers in `frame_tiles` until the next New
+    /// poll replaces it (valid-until-next-poll).
+    current_frame: Option<std::sync::Arc<GeoRenderFrame>>,
     /// Scratch C descriptor array the returned [`LogiGlobeFrame::tiles`] points into (rebuilt each New poll).
     frame_tiles: Vec<LogiGlobeTile>,
+    /// Hole-clip arena: the per-tile clip OBBs that [`LogiGlobeTile::clip_boxes`] pointers index into. One flat
+    /// `Vec` for the whole frame (reserved to the exact total before the build loop, so appending never
+    /// reallocates and the handed-out pointers stay valid until the next New poll — the same contract as the
+    /// `Arc` geometry behind `frame_tiles`). Empty most frames (only coarse stand-ins contribute boxes).
+    clip_arena: Vec<LogiClipBox>,
     /// Delta scratch (planetary-scale O(Δ) reconcile). `prev_keys` is the set of tile keys handed to the renderer
     /// on the LAST New poll; each New poll diffs the current frame against it to fill `added_indices` (indices into
     /// `frame_tiles` whose key is new) and `removed_keys` (keys that departed), so the renderer applies O(Δ) changes
@@ -312,6 +332,21 @@ pub struct LogiGlobeWorld {
     key_to_index: HashMap<u64, u32>,
     added_indices: Vec<u32>,
     removed_keys: Vec<u64>,
+    /// Planet-true sky anchor (ABI v15), computed once at create from the world's ENU origin: the WGS84
+    /// earth center in UE render-space cm + the origin's geocentric surface radius in km. Read by
+    /// [`logi_globe_world_sky_anchor`] so the renderer can anchor the SkyAtmosphere / VolumetricCloud planet
+    /// model to the streamed globe (geodesy stays single-homed in Rust).
+    sky_anchor: ([f64; 3], f64),
+    /// The ENU frame of this world's origin — the SAME geodesy every streamed vertex was rebased with
+    /// (single-homed); the sky lane uses it to convert the camera/sun between UE render space and ECEF.
+    enu: logi_geospatial::EnuFrame,
+    /// The LogiSky cell (ADR-0022 S2): atmosphere parameters + lazily-baked LUTs + the event-gated
+    /// per-frame derivation. Lives here (game-thread cadence) because the sky is camera-coupled and the
+    /// camera arrives via `set_view`; the ECS-resident move is S3+ (see the plan's S2 design deltas).
+    sky: logi_sky::SkyState,
+    /// The last camera pushed via `set_view` (UE cm) — the sky frame derives from it. `None` until the
+    /// first view (the sky-frame call then reports "no frame yet").
+    last_camera_ue_cm: Option<[f64; 3]>,
     /// The first thread to call `poll`/`set_view` on this world (lazily pinned). Debug-only single-consumer
     /// guard (see the type doc); `None` until the first consumer call. Gated to debug builds so it adds no
     /// field/size in release. Carries no ABI weight regardless — the handle is boxed and never crosses the C
@@ -333,18 +368,48 @@ pub struct LogiGlobeCreateInfo {
     pub max_tile_distance_m: f64,
     pub workers: u32,
     /// In-memory decoded-tile (mesh+texture) cache budget in **MiB** — the warm-restore LRU in front of the
-    /// resident set. `0` ⇒ the engine default ([`DEFAULT_MESH_CACHE_BYTES`]). (Was a reserved pad field; it
+    /// resident set. `0` ⇒ the engine default ([`DEFAULT_FLASH_CACHE_BYTES`]). (Was a reserved pad field; it
     /// occupies the same 4 bytes, so the ABI size is unchanged.)
-    pub mesh_cache_budget_mb: u32,
+    pub flash_cache_budget_mb: u32,
     /// Persistent on-disk tile-cache budget in bytes; `0` disables the cache. The cache directory is the
     /// separate `cache_dir` argument to `logi_globe_world_create`.
     pub cache_budget_bytes: u64,
+    /// Runtime tile-fetch backend knob (ABI v11): `0` = Auto (the [`CyperSource`] lane — HTTP/3 over QUIC via
+    /// Alt-Svc, h2 fallback — for Google P3DT when the `cyper-h2` feature is compiled, else `ureq`
+    /// `HttpSource`), `1` = force `ureq` `HttpSource` (HTTP/1.1), `2` = force the `CyperSource` lane (HTTP/3).
+    /// Maps via [`FetchBackend::from_ffi`]. A zero-initialised create-info gets `Auto` — i.e. the new default
+    /// (QUIC for Google tiles); forcing a value drives the live ureq-vs-h3 A/B. If `cyper-h2` was not compiled
+    /// in, a Cyper request degrades gracefully to `ureq` (logged).
+    pub fetch_backend: u32,
+    /// Reserved (alignment pad to the struct's 8-byte alignment; future knob). Must be `0`.
+    pub _reserved: u32,
 }
 
 /// [`LogiGlobeTile::flags`] bit 0: the tile's material is unlit (`KHR_materials_unlit`) — the renderer should
 /// shade it emissive (it bakes its own lighting; P3DT bakes real-world sun/shadow into the albedo) and not
 /// apply scene lighting on top. Mirrors `LOGI_GLOBE_TILE_FLAG_UNLIT` in `logi_geo_ffi.h`.
 pub const LOGI_GLOBE_TILE_FLAG_UNLIT: u32 = 1;
+
+/// `LogiGlobeTile.flags` bit 1: a "prepare" tile — geometry-resident but NOT yet textured. The renderer must
+/// BUILD it (so it can decode the atlas) yet keep it HIDDEN: the selector's texture gate is still drawing the
+/// coarse parent over its footprint, and showing the untextured tile would flash gray. Once the renderer
+/// textures it and reports it via [`logi_globe_world_set_textured_keys`], the gate promotes it (next frame this
+/// bit clears and it shows). Mirrors `LOGI_GLOBE_TILE_FLAG_HIDDEN` in `logi_geo_ffi.h`. ADVISORY for a renderer
+/// that — like ours — already derives the same state locally (a tile stays invisible until its own atlas-confirm
+/// lifecycle completes, `FadeT`/bloom); it is the authoritative mirror for a renderer without one.
+pub const LOGI_GLOBE_TILE_FLAG_HIDDEN: u32 = 2;
+
+/// One **hole-clip** oriented bounding box in Unreal render space (cm) — the geometric primitive the renderer
+/// tests each fragment of a coarse stand-in tile against, discarding fragments inside any of the tile's boxes
+/// so the coarse mesh never overlaps the finer tiles drawn over it (no z-fight, no Pixel Depth Offset). It is a
+/// center plus three half-extent axis vectors; a point `p` is inside iff `|(p − center)·âᵢ| ≤ |aᵢ|` along each
+/// axis `aᵢ`. Mirrors `LogiClipBox` in `logi_geo_ffi.h`. POD (`[f32;12]`), 48 bytes, align 4.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LogiClipBox {
+    pub center: [f32; 3],
+    pub half_axes: [[f32; 3]; 3],
+}
 
 /// One tile to draw this frame — zero-copy views into Rust-owned buffers (valid until the next `poll`).
 /// Geometry is in Unreal render space (cm, Z-up LH); the texture is raw encoded bytes (JPEG/PNG).
@@ -373,6 +438,15 @@ pub struct LogiGlobeTile {
     pub depth: u32,
     /// 3D Tiles geometric error at this tile (metres; lower = finer). Debug-viz / telemetry only.
     pub geometric_error: f32,
+    /// **Geometric hole-clip** (ABI v12): zero-copy view of this tile's clip OBBs (valid until the next `poll`,
+    /// like the geometry pointers). Non-null with `clip_box_count > 0` ONLY for a coarse REPLACE stand-in drawn
+    /// over finer tiles that have loaded+textured; the renderer then selects the masked clip material and discards
+    /// this tile's fragments inside any box. Null / 0 for the overwhelming majority of tiles — they render opaque
+    /// with no clip.
+    pub clip_boxes: *const LogiClipBox,
+    pub clip_box_count: u32,
+    /// Alignment pad to the struct's 8-byte alignment (the `clip_boxes` pointer). Always 0.
+    pub _pad_clip: u32,
 }
 
 /// The frame returned by [`logi_globe_world_poll`]: a pointer to the world's scratch tile array (valid until the
@@ -436,21 +510,29 @@ const _: () = {
     assert!(offset_of!(LogiBuildingData, bounds_radius) == 68);
     assert!(offset_of!(LogiBuildingData, ecef_origin) == 72);
 
-    // LogiGlobeCreateInfo — u64 + 4 × f64 + 2 × u32 + u64 (align 8), size 56. `mesh_cache_budget_mb`
-    // occupies the 4 bytes that used to be a reserved pad, so the ABI size is unchanged.
-    assert!(std::mem::size_of::<LogiGlobeCreateInfo>() == 56);
+    // LogiGlobeCreateInfo — u64 + 4 × f64 + 2 × u32 + u64 + 2 × u32 (align 8), size 64 (was 56 before v11:
+    // the `fetch_backend` runtime knob + a `_reserved` pad were appended; 64 is 8-aligned so no tail pad).
+    assert!(std::mem::size_of::<LogiGlobeCreateInfo>() == 64);
     assert!(offset_of!(LogiGlobeCreateInfo, ion_asset_id) == 0);
     assert!(offset_of!(LogiGlobeCreateInfo, origin_longitude_deg) == 8);
     assert!(offset_of!(LogiGlobeCreateInfo, origin_latitude_deg) == 16);
     assert!(offset_of!(LogiGlobeCreateInfo, origin_height_m) == 24);
     assert!(offset_of!(LogiGlobeCreateInfo, max_tile_distance_m) == 32);
     assert!(offset_of!(LogiGlobeCreateInfo, workers) == 40);
-    assert!(offset_of!(LogiGlobeCreateInfo, mesh_cache_budget_mb) == 44);
+    assert!(offset_of!(LogiGlobeCreateInfo, flash_cache_budget_mb) == 44);
     assert!(offset_of!(LogiGlobeCreateInfo, cache_budget_bytes) == 48);
+    assert!(offset_of!(LogiGlobeCreateInfo, fetch_backend) == 56);
+    assert!(offset_of!(LogiGlobeCreateInfo, _reserved) == 60);
 
-    // LogiGlobeTile — same shape as LogiBuildingData up to texture, then a depth (u32) + geometric_error
-    // (f32) tail for debug-viz/telemetry; no trailing ecef (align 8), size 88 (was 80 before v7).
-    assert!(std::mem::size_of::<LogiGlobeTile>() == 88);
+    // LogiClipBox — [f32;3] center + [[f32;3];3] half-axes = 12 × f32 (align 4), size 48.
+    assert!(std::mem::size_of::<LogiClipBox>() == 48);
+    assert!(offset_of!(LogiClipBox, center) == 0);
+    assert!(offset_of!(LogiClipBox, half_axes) == 12);
+
+    // LogiGlobeTile — same shape as LogiBuildingData up to texture, then a depth (u32) + geometric_error (f32)
+    // tail (v7), then the v12 hole-clip tail: a `clip_boxes` ptr (8) + `clip_box_count` (u32) + a `_pad_clip`
+    // (u32) to the struct's 8-byte alignment. size 104 (was 88 before v12, 80 before v7).
+    assert!(std::mem::size_of::<LogiGlobeTile>() == 104);
     assert!(offset_of!(LogiGlobeTile, tile_key) == 0);
     assert!(offset_of!(LogiGlobeTile, vertices) == 8);
     assert!(offset_of!(LogiGlobeTile, vertices_len) == 16);
@@ -465,6 +547,9 @@ const _: () = {
     assert!(offset_of!(LogiGlobeTile, bounds_radius) == 76);
     assert!(offset_of!(LogiGlobeTile, depth) == 80);
     assert!(offset_of!(LogiGlobeTile, geometric_error) == 84);
+    assert!(offset_of!(LogiGlobeTile, clip_boxes) == 88);
+    assert!(offset_of!(LogiGlobeTile, clip_box_count) == 96);
+    assert!(offset_of!(LogiGlobeTile, _pad_clip) == 100);
 
     // LogiGlobeFrame — 3 ptr + 6 × u32 + u64 + [f64;3] (align 8), size 80 (was 48 before v8 added the per-poll
     // delta lists `added_indices`/`removed_keys` + their counts + the `frame_id`).
@@ -496,6 +581,35 @@ const _: () = {
     assert!(offset_of!(LogiGlobeView, fov_y_radians) == 80);
     assert!(offset_of!(LogiGlobeView, viewport_height) == 88);
     assert!(offset_of!(LogiGlobeView, max_sse_pixels) == 96);
+
+    // LogiGlobeTelemetry (v17) — 26 × u64 (align 8), size 208; offsets are mechanical (index × 8).
+    assert!(std::mem::size_of::<LogiGlobeTelemetry>() == 208);
+    assert!(offset_of!(LogiGlobeTelemetry, resident_tiles) == 0);
+    assert!(offset_of!(LogiGlobeTelemetry, in_flight) == 8);
+    assert!(offset_of!(LogiGlobeTelemetry, produced_frames) == 16);
+    assert!(offset_of!(LogiGlobeTelemetry, step_panics) == 24);
+    assert!(offset_of!(LogiGlobeTelemetry, free_slots) == 32);
+    assert!(offset_of!(LogiGlobeTelemetry, max_resident) == 40);
+    assert!(offset_of!(LogiGlobeTelemetry, evicted_total) == 48);
+    assert!(offset_of!(LogiGlobeTelemetry, pool_exhausted_total) == 56);
+    assert!(offset_of!(LogiGlobeTelemetry, decode_failed_total) == 64);
+    assert!(offset_of!(LogiGlobeTelemetry, fetch_failed_total) == 72);
+    assert!(offset_of!(LogiGlobeTelemetry, graft_failed_total) == 80);
+    assert!(offset_of!(LogiGlobeTelemetry, url_resolve_failed_total) == 88);
+    assert!(offset_of!(LogiGlobeTelemetry, fetches_cancelled_total) == 96);
+    assert!(offset_of!(LogiGlobeTelemetry, session_refreshes_total) == 104);
+    assert!(offset_of!(LogiGlobeTelemetry, flash_hits) == 112);
+    assert!(offset_of!(LogiGlobeTelemetry, flash_misses) == 120);
+    assert!(offset_of!(LogiGlobeTelemetry, flash_bytes) == 128);
+    assert!(offset_of!(LogiGlobeTelemetry, disk_hits) == 136);
+    assert!(offset_of!(LogiGlobeTelemetry, disk_misses) == 144);
+    assert!(offset_of!(LogiGlobeTelemetry, disk_bytes) == 152);
+    assert!(offset_of!(LogiGlobeTelemetry, hold_kick) == 160);
+    assert!(offset_of!(LogiGlobeTelemetry, hold_dead) == 168);
+    assert!(offset_of!(LogiGlobeTelemetry, hold_loading) == 176);
+    assert!(offset_of!(LogiGlobeTelemetry, hold_leaf_under_sse) == 184);
+    assert!(offset_of!(LogiGlobeTelemetry, hold_pending_subtree) == 192);
+    assert!(offset_of!(LogiGlobeTelemetry, fetch_skip_grafted) == 200);
 };
 
 fn globe_create_impl(
@@ -508,6 +622,15 @@ fn globe_create_impl(
         return None;
     }
     let info = unsafe { info.read_unaligned() };
+    // `_reserved` is documented "must be 0" but was never checked: surface a mis-filled struct (stale C++
+    // header vs DLL within a matching ABI version) in dev builds at create time, where the per-field
+    // `offset_of!` locks can't see VALUES (re-eval 2026-06-09). Zero release cost; promote to a hard
+    // `set_last_error` + reject when `_reserved` is ever repurposed into a real knob.
+    debug_assert!(
+        info._reserved == 0,
+        "LogiGlobeCreateInfo._reserved must be 0 (got {}) — mis-filled create struct?",
+        info._reserved
+    );
     let token = match unsafe { CStr::from_ptr(ion_token) }.to_str() {
         Ok(t) => t,
         Err(_) => {
@@ -515,8 +638,15 @@ fn globe_create_impl(
             return None;
         }
     };
-    // Optional persistent disk cache; a cache-open failure degrades to no-cache (the globe still streams).
-    let cache = build_globe_cache(info.cache_budget_bytes, cache_dir);
+    // THE optional persistent disk cache — one cell, two tiers (bytes + decoded geometry), one budget
+    // (`cache_budget_bytes`, split inside the cell). A cache-open failure degrades to no-cache / bytes-only
+    // (the globe still streams). The tiers flow to their runtime owners below: bytes → the fetch source,
+    // geometry → the Geo World's restore path.
+    let disk = build_globe_disk_cache(info.cache_budget_bytes, cache_dir);
+    let (cache, geom_cache) = match &disk {
+        Some(cell) => (Some(std::sync::Arc::clone(&cell.bytes)), cell.geom.clone()),
+        None => (None, None),
+    };
     // The Geo World pre-spawns a fixed tile-entity pool; size it above the resident cap + in-flight slack so
     // it never exhausts in steady state. (Decode-failed tiles linger in the pool until a cleanup pass —
     // TODO; the headroom covers it for now.)
@@ -526,30 +656,49 @@ fn globe_create_impl(
         info.origin_longitude_deg,
         info.origin_latitude_deg,
         info.origin_height_m,
-        info.workers.clamp(1, 64) as usize, // clamp: a garbage count must not spawn unbounded threads
+        info.workers.clamp(MIN_FETCH_WORKERS, MAX_FETCH_WORKERS) as usize,
+        // Runtime fetch-backend knob (ABI v11): 0=Auto (Cyper/QUIC lane for Google P3DT), 1=ureq, 2=Cyper(h3).
+        FetchBackend::from_ffi(info.fetch_backend),
         info.max_tile_distance_m,
         cache,
-        24576, // pre-spawned tile-entity pool (> resident cap + in-flight + decode-failed slack). Raised from
-        // 10240: at the finer 6px Detail Target the in-view working set is ~1.8× the 8px set, which
-        // already sat at ~9.8k — 95% of the old pool, the hard wall that silently dropped tiles into
-        // coarse holes. FIRST tuning step; verify the live `resident` lands comfortably below this.
-        18432, // resident-tile cap — raised with the finer 6px Detail Target so the deeper LOD's larger working
-               // set fits without the LRU evicting still-wanted near tiles. In-view tiles are stamped every
-               // frame (never evictable), so this mainly bounds the off-view shell; the pool above is the ceiling.
+        DEFAULT_TILE_POOL_SIZE, // pre-spawned tile-entity pool (see the const for the sizing rationale)
+        DEFAULT_MAX_RESIDENT,   // resident-tile cap (mainly bounds the off-view shell; pool above is the ceiling)
     ) {
         Ok(mut world) => {
-            // Apply the actor's in-memory mesh-cache budget (MiB → bytes) before the world moves to its
+            // Apply the actor's in-memory flash-cache budget (MiB → bytes) before the world moves to its
             // stream thread; `0` keeps the engine default.
-            if info.mesh_cache_budget_mb > 0 {
-                world.set_mesh_cache_budget(info.mesh_cache_budget_mb as usize * 1024 * 1024);
+            if info.flash_cache_budget_mb > 0 {
+                world.set_flash_cache_budget(info.flash_cache_budget_mb as usize * 1024 * 1024);
             }
+            // Install the persisted decoded-geometry tier (audit M3), if enabled (a `geom` subdir of the cache dir).
+            world.set_geom_cache(geom_cache);
+            // Planet-true sky anchor (ABI v15): the WGS84 earth center in UE render space under this
+            // world's ENU origin + the origin's geocentric radius — same kernel geodesy as the rebase.
+            let ellipsoid = logi_geospatial::Ellipsoid::wgs84();
+            let enu = logi_geospatial::EnuFrame::from_cartographic(
+                &ellipsoid,
+                logi_geospatial::Cartographic::from_degrees(
+                    info.origin_longitude_deg,
+                    info.origin_latitude_deg,
+                    info.origin_height_m,
+                ),
+            );
+            let sky_anchor = {
+                let c = logi_geo_mesh::enu_pos_to_ue(enu.ecef_to_local(glam::DVec3::ZERO));
+                let (cx, cy, cz) = (f64::from(c[0]), f64::from(c[1]), f64::from(c[2]));
+                ([cx, cy, cz], (cx * cx + cy * cy + cz * cz).sqrt() / 100_000.0)
+            };
             Some(LogiGlobeWorld {
+                sky_anchor,
+                enu,
+                sky: logi_sky::SkyState::new(logi_sky::AtmosphereParams::earth()),
+                last_camera_ue_cm: None,
                 // Hand the world to its own stream thread (ADR-0012): it advances continuously OFF the game
-                // thread; the game thread only pushes views + polls. 8 ms idle park (~125 Hz when idle; a
-                // `set_view` unparks it so it advances promptly on camera motion).
-                streamer: GlobeStreamer::spawn(world, Duration::from_millis(8)),
+                // thread; the game thread only pushes views + polls. `GEO_IDLE_PARK` governs the idle cadence.
+                streamer: GlobeStreamer::spawn(world, GEO_IDLE_PARK),
                 current_frame: None,
                 frame_tiles: Vec::new(),
+                clip_arena: Vec::new(),
                 prev_keys: HashSet::new(),
                 key_to_index: HashMap::new(),
                 added_indices: Vec::new(),
@@ -565,9 +714,12 @@ fn globe_create_impl(
     }
 }
 
-/// Build the optional persistent disk cache from the FFI budget + dir. Returns `None` (no cache) when the
-/// budget is 0, the dir is null/empty, or the cache can't be opened — the last case logs but still streams.
-fn build_globe_cache(budget: u64, cache_dir: *const c_char) -> Option<std::sync::Arc<logi_3dtiles_io::DiskCache>> {
+/// Build THE persistent disk cache — ONE cell ([`logi_3dtiles_io::TileDiskCache`], ADR-0019): one root
+/// (`cache_dir`), one total budget (`info.cache_budget_bytes`, split evenly across the byte + geometry
+/// tiers inside the cell), aggregate telemetry at the membrane. Returns `None` (no disk caching at all)
+/// when the budget is 0, the dir is null/empty, or the BYTE tier can't open; a geometry-tier-only failure
+/// degrades inside the cell (bytes-only, re-decoding on miss) and is logged here.
+fn build_globe_disk_cache(budget: u64, cache_dir: *const c_char) -> Option<logi_3dtiles_io::TileDiskCache> {
     if budget == 0 || cache_dir.is_null() {
         return None;
     }
@@ -575,8 +727,15 @@ fn build_globe_cache(budget: u64, cache_dir: *const c_char) -> Option<std::sync:
     if dir.is_empty() {
         return None;
     }
-    match logi_3dtiles_io::DiskCache::open(dir, budget) {
-        Ok(c) => Some(std::sync::Arc::new(c)),
+    match logi_3dtiles_io::TileDiskCache::open(dir, budget) {
+        Ok((cell, geom_error)) => {
+            if let Some(e) = geom_error {
+                set_last_error(format!(
+                    "globe geom cache open '{dir}/geom': {e} (streaming without the geometry tier)"
+                ));
+            }
+            Some(cell)
+        }
         Err(e) => {
             set_last_error(format!(
                 "globe disk cache open '{dir}': {e} (streaming without a cache)"
@@ -643,6 +802,7 @@ fn build_globe_frame(gw: &mut LogiGlobeWorld) {
     let LogiGlobeWorld {
         current_frame,
         frame_tiles,
+        clip_arena,
         prev_keys,
         key_to_index,
         added_indices,
@@ -650,6 +810,7 @@ fn build_globe_frame(gw: &mut LogiGlobeWorld) {
         ..
     } = gw;
     frame_tiles.clear();
+    clip_arena.clear();
     added_indices.clear();
     removed_keys.clear();
     key_to_index.clear();
@@ -658,6 +819,10 @@ fn build_globe_frame(gw: &mut LogiGlobeWorld) {
         return;
     };
     frame_tiles.reserve(frame.tiles.len());
+    // Reserve the hole-clip arena to the EXACT total up front, so the per-tile `clip_boxes` pointers taken below
+    // index a Vec that never reallocates during the build loop — they stay valid until the next New poll, exactly
+    // like the `Arc` geometry pointers. (Almost always 0 — only coarse stand-ins carry boxes.)
+    clip_arena.reserve(frame.tiles.iter().map(|t| t.clip_boxes.len()).sum());
     for t in &frame.tiles {
         let g = &t.geom;
         // H5: count + stride come from the SAME buffers we emit pointers into → no OOB GPU upload.
@@ -665,6 +830,23 @@ fn build_globe_frame(gw: &mut LogiGlobeWorld) {
             g.vertices.len() % VERTEX_STRIDE == 0,
             "tile vertex buffer not a VERTEX_STRIDE multiple"
         );
+        // Append this tile's clip OBBs to the (pre-reserved → non-reallocating) arena, then hand out a pointer to
+        // its slice. `null`/0 for the common no-clip tile; the renderer reads `clip_box_count` boxes from the ptr.
+        let clip_start = clip_arena.len();
+        for b in &t.clip_boxes {
+            clip_arena.push(LogiClipBox {
+                center: b.center,
+                half_axes: b.half_axes,
+            });
+        }
+        let clip_box_count = t.clip_boxes.len() as u32;
+        let clip_boxes = if clip_box_count > 0 {
+            // SAFETY: `clip_start <= clip_arena.len()` and the reserve above guarantees no reallocation, so this
+            // points at a valid run of `clip_box_count` elements that lives until the next New poll.
+            unsafe { clip_arena.as_ptr().add(clip_start) }
+        } else {
+            core::ptr::null()
+        };
         frame_tiles.push(LogiGlobeTile {
             tile_key: t.tile_key,
             vertices: g.vertices.as_ptr(),
@@ -673,13 +855,19 @@ fn build_globe_frame(gw: &mut LogiGlobeWorld) {
             vertex_stride: VERTEX_STRIDE as u32,
             indices: g.indices.as_ptr() as *const u8,
             index_count: g.indices.len() as u32,
-            flags: if g.unlit { LOGI_GLOBE_TILE_FLAG_UNLIT } else { 0 },
+            // bit 0 UNLIT (material), bit 1 HIDDEN ("prepare" tile — built but not shown until textured; the
+            // texture gate is still drawing its coarse parent). `visible` is the Rust-side render-vs-prepare bit.
+            flags: (if g.unlit { LOGI_GLOBE_TILE_FLAG_UNLIT } else { 0 })
+                | (if t.visible { 0 } else { LOGI_GLOBE_TILE_FLAG_HIDDEN }),
             texture_jpeg: g.texture.as_ptr(),
             texture_jpeg_len: g.texture.len() as u64,
             bounds_center: g.bounds_center,
             bounds_radius: g.bounds_radius,
             depth: t.depth,
             geometric_error: t.geometric_error,
+            clip_boxes,
+            clip_box_count,
+            _pad_clip: 0,
         });
     }
     // Diff vs the previously emitted frame. `key_to_index.insert(..).is_none()` is true only for the FIRST
@@ -748,6 +936,39 @@ pub unsafe extern "C" fn logi_globe_world_set_view(
         // reference deref (`as_ref`) would be UB on a misaligned `LogiGlobeView`. Matches the discipline every
         // other inbound boundary struct uses (LogiGlobeCreateInfo / LogiPlacement / the baked infos).
         let v = unsafe { view.read_unaligned() };
+        // Boundary sanitation (FFI-edge probe, 2026-06-09): a non-finite field or a degenerate target must
+        // not reach the selector. The failure shapes differ and neither is a crash, but the bad ones are
+        // expensive: a NaN camera zeroes every distance via `f64::max` (NaN.max(0) == 0) → SSE explodes →
+        // over-refine storm; `max_sse <= 0` fails the SSE test everywhere → descend-to-depth-cap fetch storm
+        // (bounded by the caps, but pure waste). `viewport_height <= 0` is meaningless. A bad view is
+        // DROPPED — newest-wins means the last good view simply stays current (frozen-but-stable) — and
+        // asserted in dev builds so the caller bug is loud (the guard maps the panic to `LogiStatus::Panic`).
+        let finite = [
+            v.camera_x_cm,
+            v.camera_y_cm,
+            v.camera_z_cm,
+            v.dir_x,
+            v.dir_y,
+            v.dir_z,
+            v.up_x,
+            v.up_y,
+            v.up_z,
+            v.aspect,
+            v.fov_y_radians,
+            v.viewport_height,
+            v.max_sse_pixels,
+        ]
+        .iter()
+        .all(|f| f.is_finite());
+        if !finite || v.max_sse_pixels <= 0.0 || v.viewport_height <= 0.0 {
+            debug_assert!(
+                false,
+                "logi_globe_world_set_view: non-finite view field, max_sse <= 0, or viewport_height <= 0 — view dropped"
+            );
+            return LogiStatus::Ok; // release: keep the last good view rather than poison selection
+        }
+        // The sky lane derives from the same camera the selector streams against (one observer, one truth).
+        gw.last_camera_ue_cm = Some([v.camera_x_cm, v.camera_y_cm, v.camera_z_cm]);
         gw.streamer.set_view(ViewParams {
             camera_ue_cm: [v.camera_x_cm, v.camera_y_cm, v.camera_z_cm],
             camera_dir_ue: [v.dir_x, v.dir_y, v.dir_z],
@@ -757,6 +978,40 @@ pub unsafe extern "C" fn logi_globe_world_set_view(
             viewport_height: v.viewport_height,
             max_sse: v.max_sse_pixels,
         });
+        LogiStatus::Ok
+    })
+}
+
+/// Report the COMPLETE set of tile keys the renderer has fully TEXTURED (geometry was already resident; this
+/// adds the texture-ready bit). The stream thread's selector treats a tile as renderable — eligible to replace
+/// its coarse parent — only when it is BOTH geometry-resident AND in this set, so the coarse parent stays drawn
+/// (real imagery) until the fine tile is textured: LOD loading never shows a gray placeholder. Newest-wins —
+/// pass the WHOLE current set whenever it changes (a dropped update just costs one extra frame of coarse cover,
+/// never gray). Producer half of the texture gate; single-consumer (game thread), like `set_view`/`poll`.
+///
+/// # Safety
+/// `world` must be a valid handle from [`logi_globe_world_create`] (or null → `InvalidHandle`); `keys` must be
+/// null (→ treated as the empty set) or point to `count` readable `u64`s.
+#[no_mangle]
+pub unsafe extern "C" fn logi_globe_world_set_textured_keys(
+    world: *mut LogiGlobeWorld,
+    keys: *const u64,
+    count: u32,
+) -> LogiStatus {
+    guard(|| {
+        let gw = match unsafe { world.as_mut() } {
+            Some(w) => w,
+            None => return LogiStatus::InvalidHandle,
+        };
+        gw.assert_single_consumer(); // debug-only: poll/set_view/set_textured_keys must stay on one thread
+        let keys: &[u64] = if keys.is_null() || count == 0 {
+            &[]
+        } else {
+            // Read as a slice; the keys are plain u64 with no alignment concern beyond `u64` (the caller's
+            // TArray<uint64> is 8-aligned). Empty when null/zero so the set simply clears.
+            unsafe { std::slice::from_raw_parts(keys, count as usize) }
+        };
+        gw.streamer.set_textured_keys(keys);
         LogiStatus::Ok
     })
 }
@@ -812,6 +1067,9 @@ pub unsafe extern "C" fn logi_globe_world_poll(
         // Monotonic frame id (0 = empty). The renderer compares it to its last-applied id: equal ⇒ identical
         // scene ⇒ skip the reconcile entirely (the dominant camera-still case).
         let frame_id = gw.current_frame.as_ref().map(|f| f.frame).unwrap_or(0);
+        // The per-poll header counters ride the v16 telemetry block (one brief lock; the full block is
+        // available via `logi_globe_world_telemetry`).
+        let t = gw.streamer.telemetry();
         let out = LogiGlobeFrame {
             tiles: gw.frame_tiles.as_ptr(),
             added_indices: gw.added_indices.as_ptr(),
@@ -819,8 +1077,8 @@ pub unsafe extern "C" fn logi_globe_world_poll(
             tile_count: gw.frame_tiles.len() as u32,
             added_count: gw.added_indices.len() as u32,
             removed_count: gw.removed_keys.len() as u32,
-            resident_tiles: gw.streamer.resident_tiles() as u32,
-            in_flight: gw.streamer.in_flight() as u32,
+            resident_tiles: t.resident_tiles as u32,
+            in_flight: t.in_flight as u32,
             _pad: 0,
             frame_id,
             origin_ecef,
@@ -871,60 +1129,304 @@ pub unsafe extern "C" fn logi_globe_world_tile_by_key(
     })
 }
 
-/// Bytes currently resident in the world's persistent disk cache (0 if none configured). Telemetry only.
-///
-/// # Safety
-/// `world` must be null or a valid handle from [`logi_globe_world_create`].
-#[no_mangle]
-pub unsafe extern "C" fn logi_globe_world_cached_bytes(world: *const LogiGlobeWorld) -> u64 {
-    // no-panic: a null check + one atomic load — cannot panic, so no `catch_unwind`. A future edit that
-    // adds fallible work here must add a guard (an unwind across the C ABI is UB).
-    match unsafe { world.as_ref() } {
-        Some(gw) => gw.streamer.cached_bytes(),
-        None => 0,
-    }
+/// The Geo streaming lane's TELEMETRY BLOCK (v16, reshaped at v17 to the TWO-cache model) — every
+/// streaming counter crossing the C ABI as ONE `#[repr(C)]` struct, replacing the v10–v15 accessor sprawl
+/// (`_cached_bytes`, `_failed_counts`, `_refine_failures`, `_flash/_disk/_geom_cache_stats`,
+/// `_pool_stats`, `_evict_stats`, `_hold_stats`, `_warm_cache_bytes` — all DELETED, ADR-0004 no-compat).
+/// Field-for-field mirror of the scene's `GeoTelemetry` (same names, same order); every field is u64, so
+/// the layout is mechanical (offset = index × 8, size = 26 × 8 = 208). Filled by
+/// [`logi_globe_world_telemetry`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LogiGlobeTelemetry {
+    /// Resident decoded tiles after the last step.
+    pub resident_tiles: u64,
+    /// Outstanding/undrained tile fetches.
+    pub in_flight: u64,
+    /// Frames published into the stream mailbox (`produced - polled` ≈ intentional latest-wins skips).
+    pub produced_frames: u64,
+    /// Stream-thread steps that panicked and were caught (the lane keeps running). A rapid climb = a
+    /// deterministically-bad tile/input. First mirrored at v16 (previously waited for "the next bump").
+    pub step_panics: u64,
+    /// Pool pressure: free slots now / the LRU cap / cumulative Resident→Free reclaims / cumulative
+    /// admissions dropped for want of a slot. `pool_exhausted_total` climbing while `evicted_total` stays
+    /// flat at a full pool = the 2026-06-11 starvation-stall signature (eviction dead, streamer starved).
+    pub free_slots: u64,
+    pub max_resident: u64,
+    pub evicted_total: u64,
+    pub pool_exhausted_total: u64,
+    /// Give-ups — why a region stays blurry: bytes didn't parse (terminal) / bytes never arrived after
+    /// retries (dead URL, network, expired session) / a child manifest fetched but never grafted (its
+    /// subtree never appears) / a content URI never resolved against its base (never even fetched).
+    pub decode_failed_total: u64,
+    pub fetch_failed_total: u64,
+    pub graft_failed_total: u64,
+    pub url_resolve_failed_total: u64,
+    /// In-flight fetches pre-emptively cancelled because their tile left the selection (fast camera
+    /// motion) — bandwidth saved from already-stale tiles. First crossed the ABI at v16.
+    pub fetches_cancelled_total: u64,
+    /// Google P3DT session refreshes (root re-fetched for a fresh `?session=…` after a 401/403). Climbing
+    /// on a long session is NORMAL; climbing alongside `fetch_failed_total` means the refresh isn't
+    /// recovering (bad key / network). First crossed the ABI at v16.
+    pub session_refreshes_total: u64,
+    /// The TWO caches (v17, owner directive + ADR-0019): hit-rate = hits/(hits+misses); `*_bytes` =
+    /// occupancy. `flash` = the in-memory cell (decoded-geometry LRU). `disk` = the disk cell's MEMBRANE
+    /// aggregate over its two internal tiers (raw bytes + persisted decoded geometry): a hit is ANY tier
+    /// serving (a geometry restore that skipped fetch+decode, or cached bytes that skipped the network);
+    /// a miss is a request that ultimately needed the network.
+    pub flash_hits: u64,
+    pub flash_misses: u64,
+    pub flash_bytes: u64,
+    pub disk_hits: u64,
+    pub disk_misses: u64,
+    pub disk_bytes: u64,
+    /// The selection X-RAY: why is each coarser-than-SSE region held there? SNAPSHOT of the last full
+    /// selection step (see `logi_3dtiles_select::HoldCounts`). A stuck-coarse SCAR = `hold_leaf_under_sse`
+    /// or `fetch_skip_grafted` sustained while the pipeline is quiescent; `hold_kick`/`hold_loading` are
+    /// normal during convergence and fall to zero at settle.
+    pub hold_kick: u64,
+    pub hold_dead: u64,
+    pub hold_loading: u64,
+    pub hold_leaf_under_sse: u64,
+    pub hold_pending_subtree: u64,
+    pub fetch_skip_grafted: u64,
 }
 
-/// Cumulative tiles that GAVE UP loading, packed `(decode_failed << 32) | fetch_failed`. Telemetry to
-/// distinguish the two reasons a tile stays stuck at its coarse (blurry) ancestor: **fetch_failed** = the
-/// bytes never arrived (dead URL / network error / expired P3DT session, after bounded retries);
-/// **decode_failed** = bytes arrived but didn't parse (an unsupported format such as Draco/KTX2, or corrupt
-/// content). A steady zero on both means stuck tiles are still in flight, not given up. `0` for a null handle.
+/// Fill `out` with the streaming lane's WHOLE telemetry block (v17) — one call per HUD/bench sample in
+/// place of the ten deleted per-counter accessors. Returns `size_of::<LogiGlobeTelemetry>()` (208) on
+/// success, `0` for a null world/out; the caller should check the return against its own `sizeof` as a
+/// layout handshake.
 ///
 /// # Safety
-/// `world` must be null or a valid handle from [`logi_globe_world_create`].
+/// `world` must be null or a valid handle from [`logi_globe_world_create`]; `out` must be null or point to
+/// writable [`LogiGlobeTelemetry`] storage (written unaligned).
 #[no_mangle]
-pub unsafe extern "C" fn logi_globe_world_failed_counts(world: *const LogiGlobeWorld) -> u64 {
-    // no-panic: a null check + two atomic loads + mask/shift — cannot panic, so no `catch_unwind`. A
-    // future edit that adds fallible work here must add a guard (an unwind across the C ABI is UB).
-    match unsafe { world.as_ref() } {
-        // Mask BOTH lanes: an unmasked high counter that ever exceeds 32 bits would spill into the low
-        // lane and corrupt it. C++ unpacks as `decode_failed = v >> 32`, `fetch_failed = v & 0xFFFFFFFF`.
-        Some(gw) => ((gw.streamer.decode_failed() & 0xFFFF_FFFF) << 32) | (gw.streamer.fetch_failed() & 0xFFFF_FFFF),
-        None => 0,
-    }
+pub unsafe extern "C" fn logi_globe_world_telemetry(
+    world: *const LogiGlobeWorld,
+    out: *mut LogiGlobeTelemetry,
+) -> usize {
+    // no-panic: a brief mutex lock + flat field copies — cannot panic, so no `catch_unwind` (the same
+    // documented convention as the other no-panic telemetry entry points). A future edit that adds
+    // fallible work must add a guard (an unwind across the C ABI is UB).
+    let (Some(gw), false) = (unsafe { world.as_ref() }, out.is_null()) else {
+        return 0;
+    };
+    let t = gw.streamer.telemetry();
+    let mirrored = LogiGlobeTelemetry {
+        resident_tiles: t.resident_tiles,
+        in_flight: t.in_flight,
+        produced_frames: t.produced_frames,
+        step_panics: t.step_panics,
+        free_slots: t.free_slots,
+        max_resident: t.max_resident,
+        evicted_total: t.evicted_total,
+        pool_exhausted_total: t.pool_exhausted_total,
+        decode_failed_total: t.decode_failed_total,
+        fetch_failed_total: t.fetch_failed_total,
+        graft_failed_total: t.graft_failed_total,
+        url_resolve_failed_total: t.url_resolve_failed_total,
+        fetches_cancelled_total: t.fetches_cancelled_total,
+        session_refreshes_total: t.session_refreshes_total,
+        flash_hits: t.flash_hits,
+        flash_misses: t.flash_misses,
+        flash_bytes: t.flash_bytes,
+        disk_hits: t.disk_hits,
+        disk_misses: t.disk_misses,
+        disk_bytes: t.disk_bytes,
+        hold_kick: t.hold_kick,
+        hold_dead: t.hold_dead,
+        hold_loading: t.hold_loading,
+        hold_leaf_under_sse: t.hold_leaf_under_sse,
+        hold_pending_subtree: t.hold_pending_subtree,
+        fetch_skip_grafted: t.fetch_skip_grafted,
+    };
+    unsafe { out.write_unaligned(mirrored) };
+    std::mem::size_of::<LogiGlobeTelemetry>()
 }
 
-/// Cumulative tiles stuck coarse because **refinement couldn't descend** into them, packed
-/// `(graft_failed << 32) | url_resolve_failed`. Unlike [`logi_globe_world_failed_counts`] (a fetch/decode
-/// failure of a tile we DID try to load), these are tiles never even fetched: **graft_failed** = a child
-/// `tileset.json` manifest fetched but didn't parse/graft (its subtree never appears); **url_resolve_failed**
-/// = a content URI couldn't be resolved against its base. Both were SILENT before — a climbing count is the
-/// cause of a region that stays blurry at any SSE target. `0` for a null handle.
+/// Planet-true SKY ANCHOR (ABI v15): fills `out` with up to `len` of
+/// `[earth_center_x_cm, earth_center_y_cm, earth_center_z_cm, geocentric_radius_km]` — the WGS84 earth
+/// center in UE render space under this world's ENU origin, and the origin's geocentric surface radius.
+/// The renderer anchors the SkyAtmosphere planet model with these (`PlanetCenterAtComponentTransform` at
+/// the center, `BottomRadius` = the radius; the VolumetricCloud layer follows the atmosphere's planet), so
+/// the sky/cloud shells track the streamed WGS84 globe instead of a 6,360 km sphere pinned at the UE world
+/// origin — the 2026-06-11 "settled-shot collapse" (clouds engulfing station cameras, detached limb bands,
+/// ±15 km latitude-varying misplacement). Constant per world (computed at create). Returns the count
+/// written (4, or 0 for a null handle/out).
 ///
 /// # Safety
-/// `world` must be null or a valid handle from [`logi_globe_world_create`].
+/// `world` must be null or a valid handle from [`logi_globe_world_create`]; `out` must be null or valid for
+/// `len` writes.
 #[no_mangle]
-pub unsafe extern "C" fn logi_globe_world_refine_failures(world: *const LogiGlobeWorld) -> u64 {
-    // no-panic: a null check + two atomic loads + mask/shift — cannot panic, so no `catch_unwind`. A
-    // future edit that adds fallible work here must add a guard (an unwind across the C ABI is UB).
-    match unsafe { world.as_ref() } {
-        // Mask BOTH lanes (see logi_globe_world_failed_counts): a >32-bit high counter must not spill into
-        // the low lane. C++ unpacks as `graft_failed = v >> 32`, `url_resolve_failed = v & 0xFFFFFFFF`.
-        Some(gw) => {
-            ((gw.streamer.graft_failed() & 0xFFFF_FFFF) << 32) | (gw.streamer.url_resolve_failed() & 0xFFFF_FFFF)
+pub unsafe extern "C" fn logi_globe_world_sky_anchor(world: *const LogiGlobeWorld, out: *mut f64, len: usize) -> usize {
+    // no-panic: field reads + bounded writes — cannot panic, so no `catch_unwind` (the same documented
+    // convention as `logi_globe_world_telemetry`). A future fallible edit must add a guard (FFI unwind = UB).
+    let (Some(gw), false) = (unsafe { world.as_ref() }, out.is_null()) else {
+        return 0;
+    };
+    let ([cx, cy, cz], r_km) = gw.sky_anchor;
+    let vals = [cx, cy, cz, r_km];
+    let n = vals.len().min(len);
+    for (i, v) in vals.iter().take(n).enumerate() {
+        unsafe { out.add(i).write(*v) };
+    }
+    n
+}
+
+/// The LogiSky per-frame block (ABI v18 — ADR-0022 S2): everything camera/sun-dependent the renderer
+/// needs, derived in Rust from the SAME camera `set_view` last pushed (one observer, one truth) plus the
+/// atmosphere parameters the shader evaluates with. Per ADR-0023 §7 the block carries the UN-COLLAPSED
+/// family — NO quality/tier field crosses here; the observing pass picks its formula per view. Positions/
+/// directions are UE render space (the same ENU→UE map every streamed vertex used); the sun is the S2
+/// zenith-follow policy (computed in Rust — sun truth gains a real model in S3).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LogiSkyFrame {
+    /// The WGS84 earth center in UE render space (cm) — the AP pass's ray∩ellipsoid anchor (= the v15 anchor).
+    pub earth_center_ue_cm: [f64; 3],
+    /// Geodetic (ellipsoid) camera altitude in metres — the LUT altitude coordinate (ADR-0022 law 3).
+    pub camera_altitude_m: f64,
+    /// Sun direction (unit, UE render space, pointing AT the sun).
+    pub sun_dir_ue: [f64; 3],
+    /// Geodetic zenith at the camera (unit, UE render space).
+    pub up_ue: [f64; 3],
+    pub cos_sun_zenith: f64,
+    /// cos of zenith→horizon at this altitude (negative below horizontal) — the sky-view horizon split.
+    pub horizon_cos: f64,
+    pub bottom_radius_m: f64,
+    pub top_radius_m: f64,
+    /// LUT generation this frame was derived against — re-fetch + re-upload the LUTs iff it changed.
+    pub lut_generation: u64,
+    // --- Atmosphere parameters the shader's in-scatter evaluation needs (f32 — shader-bound) ---------
+    pub rayleigh_scattering_per_m: [f32; 3],
+    pub rayleigh_scale_height_m: f32,
+    pub mie_scattering_per_m: f32,
+    pub mie_absorption_per_m: f32,
+    pub mie_g: f32,
+    pub mie_scale_height_m: f32,
+    pub ozone_absorption_per_m: [f32; 3],
+    pub ozone_center_m: f32,
+    pub ozone_half_width_m: f32,
+    pub _pad: f32,
+}
+
+/// Zero-copy views of the LogiSky LUTs (ABI v18): flat RGBA `f32` rows, baked LAZILY on first call
+/// (ADR-0019 §8 — the un-evaluated state collapses on observation) and STABLE until the world is
+/// destroyed (no parameter-set entry exists in S2, so the generation can only change with one). The
+/// renderer uploads each buffer as one flat texture copy and re-uploads only when `generation` moves.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LogiSkyLuts {
+    pub transmittance: *const f32,
+    /// Float count (= width × height × 4 RGBA).
+    pub transmittance_len: u64,
+    pub transmittance_width: u32,
+    pub transmittance_height: u32,
+    pub multi_scattering: *const f32,
+    pub multi_scattering_len: u64,
+    pub multi_scattering_width: u32,
+    pub multi_scattering_height: u32,
+    pub generation: u64,
+}
+
+/// Fill `out` with the LogiSky per-frame block, derived (event-gated in Rust — a parked camera costs two
+/// compares) from the last `set_view` camera under the S2 zenith-sun policy. Returns
+/// `size_of::<LogiSkyFrame>()` (176) on success, `0` for a null world/out OR before the first `set_view`
+/// (no camera ⇒ no sky frame yet). Single-consumer (game thread), like `poll`/`set_view`.
+///
+/// # Safety
+/// `world` must be null or a valid handle from [`logi_globe_world_create`]; `out` must be null or point
+/// to writable [`LogiSkyFrame`] storage (written unaligned).
+#[no_mangle]
+pub unsafe extern "C" fn logi_globe_world_sky_frame(world: *mut LogiGlobeWorld, out: *mut LogiSkyFrame) -> usize {
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let (Some(gw), false) = (unsafe { world.as_mut() }, out.is_null()) else {
+            return 0;
+        };
+        gw.assert_single_consumer();
+        let Some(cam_ue) = gw.last_camera_ue_cm else {
+            return 0; // no view pushed yet — the renderer keeps whatever sky it has
+        };
+        let cam_ecef = gw.enu.local_to_ecef(logi_geo_mesh::ue_cm_to_enu(cam_ue));
+        // S2 sun policy: zenith-follow — `derive` maps a zero sun to the geodetic up (local solar noon,
+        // matching the imagery's baked ~noon lighting). S3 replaces this with a real sun model.
+        let f = gw.sky.derive(cam_ecef, glam::DVec3::ZERO);
+        // ECEF direction → UE render space: rotate into ENU, then negate North (the same convention as
+        // `enu_dir_to_ue`, kept in f64 here).
+        let to_ue = |d: glam::DVec3| {
+            let v = gw.enu.ecef_to_enu * d;
+            [v.x, -v.y, v.z]
+        };
+        let p = *gw.sky.params();
+        let frame = LogiSkyFrame {
+            earth_center_ue_cm: gw.sky_anchor.0,
+            camera_altitude_m: f.camera_altitude_m,
+            sun_dir_ue: to_ue(f.sun_dir_ecef),
+            up_ue: to_ue(f.up_ecef),
+            cos_sun_zenith: f.cos_sun_zenith,
+            horizon_cos: f.horizon_cos,
+            bottom_radius_m: f.bottom_radius_m,
+            top_radius_m: f.top_radius_m,
+            lut_generation: f.lut_generation,
+            rayleigh_scattering_per_m: p.rayleigh_scattering_per_m.map(|v| v as f32),
+            rayleigh_scale_height_m: p.rayleigh_scale_height_m as f32,
+            mie_scattering_per_m: p.mie_scattering_per_m as f32,
+            mie_absorption_per_m: p.mie_absorption_per_m as f32,
+            mie_g: p.mie_g as f32,
+            mie_scale_height_m: p.mie_scale_height_m as f32,
+            ozone_absorption_per_m: p.ozone_absorption_per_m.map(|v| v as f32),
+            ozone_center_m: p.ozone_center_m as f32,
+            ozone_half_width_m: p.ozone_half_width_m as f32,
+            _pad: 0.0,
+        };
+        unsafe { out.write_unaligned(frame) };
+        std::mem::size_of::<LogiSkyFrame>()
+    }));
+    match result {
+        Ok(n) => n,
+        Err(_) => {
+            set_last_error("panic caught in logi_globe_world_sky_frame");
+            0
         }
-        None => 0,
+    }
+}
+
+/// Fill `out` with zero-copy views of the LogiSky LUTs, baking them on first call (a one-off CPU cost on
+/// parameter generations, never per frame). Returns `size_of::<LogiSkyLuts>()` (56) on success, `0` for a
+/// null world/out. The pointed-to buffers stay valid until `logi_globe_world_destroy`. Single-consumer.
+///
+/// # Safety
+/// `world` must be null or a valid handle from [`logi_globe_world_create`]; `out` must be null or point
+/// to writable [`LogiSkyLuts`] storage (written unaligned). The written pointers borrow Rust-owned
+/// buffers valid until the world is destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn logi_globe_world_sky_luts(world: *mut LogiGlobeWorld, out: *mut LogiSkyLuts) -> usize {
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let (Some(gw), false) = (unsafe { world.as_mut() }, out.is_null()) else {
+            return 0;
+        };
+        gw.assert_single_consumer();
+        let luts = gw.sky.luts(); // lazy bake (ADR-0019 §8): first observation collapses the derivation
+        let view = LogiSkyLuts {
+            transmittance: luts.transmittance.as_ptr(),
+            transmittance_len: luts.transmittance.len() as u64,
+            transmittance_width: logi_sky::TRANSMITTANCE_W as u32,
+            transmittance_height: logi_sky::TRANSMITTANCE_H as u32,
+            multi_scattering: luts.multi_scattering.as_ptr(),
+            multi_scattering_len: luts.multi_scattering.len() as u64,
+            multi_scattering_width: logi_sky::MULTI_SCATTERING_W as u32,
+            multi_scattering_height: logi_sky::MULTI_SCATTERING_H as u32,
+            generation: luts.generation,
+        };
+        unsafe { out.write_unaligned(view) };
+        std::mem::size_of::<LogiSkyLuts>()
+    }));
+    match result {
+        Ok(n) => n,
+        Err(_) => {
+            set_last_error("panic caught in logi_globe_world_sky_luts");
+            0
+        }
     }
 }
 

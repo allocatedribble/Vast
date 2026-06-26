@@ -18,9 +18,9 @@
 #include "CanvasItem.h"                                  // FCanvasTextItem / FCanvasTileItem (overlay draw)
 #include "Engine/Texture2D.h"
 #include "TextureResource.h"
-#include "RenderingThread.h"                   // ENQUEUE_RENDER_COMMAND — defer the BC1 mip upload to the render thread (audit T4)
+#include "RenderingThread.h"                   // ENQUEUE_RENDER_COMMAND — defer the BC7 mip upload to the render thread (audit T4)
 #include "RHICommandList.h"                    // FRHICommandListImmediate / LockTexture2D / UnlockTexture2D (render-thread mip upload)
-#include "RenderUtils.h"                       // CopyTextureData2D + GPixelFormats/FPixelFormatInfo — block-aware (BC1) mip copy
+#include "RenderUtils.h"                       // CopyTextureData2D + GPixelFormats/FPixelFormatInfo — block-aware (BC7) mip copy
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
 #include "Modules/ModuleManager.h"
@@ -28,21 +28,32 @@
 #include "Misc/FileHelper.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h" // TRACE_CPUPROFILER_EVENT_SCOPE (zero cost when not tracing)
 #include "HAL/PlatformTime.h"                  // FPlatformTime — geo-step game-thread cost probe
+#include "RHIStats.h"                          // GNumDrawCallsRHI / GNumPrimitivesDrawnRHI (bench metrics)
+#include "DynamicRHI.h"                        // RHIGetGPUFrameCycles (bench metrics)
+#include "RenderTimer.h"                       // GGameThreadTime / GRenderThreadTime (bench metrics, cycles)
 #include "Async/Async.h"                       // Async(EAsyncExecution::ThreadPool, …) — off-thread atlas decode
 #include "ispc_texcomp.h"                      // Intel ISPC CompressBlocksBC7 — runtime BC7 encode of the tile atlases
 
 #if LOGI_GEO_NANITE_LANE
 #include "Engine/StaticMesh.h"
+#include "Components/SkyAtmosphereComponent.h" // ASkyAtmosphere / USkyAtmosphereComponent — planet-true sky anchoring
+#include "Engine/DirectionalLight.h"           // ADirectionalLight — sun-at-camera-zenith (planet-true sun)
+#include "Engine/ExponentialHeightFog.h"       // AExponentialHeightFog — flat-world fog slab, disabled with the anchor
+#include "Components/ExponentialHeightFogComponent.h"
+#include "EngineUtils.h"                       // TActorIterator (find the level's SkyAtmosphere / sun / fog)
 #endif
 
 #if WITH_EDITOR
-#include "MaterialEditingLibrary.h"                     // UMaterialEditingLibrary — wire DepthBiasCm -> Pixel Depth Offset
+#include "MaterialEditingLibrary.h"                     // UMaterialEditingLibrary — wire the FadeAlpha focus-pull
 #include "Materials/Material.h"                          // UMaterial
-#include "Materials/MaterialExpressionScalarParameter.h" // the DepthBiasCm + FadeAlpha parameter nodes
-#include "Materials/MaterialExpressionTextureSampleParameter2D.h" // find the authored BaseColorTex sampler
+#include "Materials/MaterialExpressionScalarParameter.h" // the FadeAlpha + ClipBoxCount parameter nodes
+#include "Materials/MaterialExpressionVectorParameter.h" // the per-box clip OBB parameter nodes
+#include "Materials/MaterialExpressionTextureSampleParameter2D.h" // find/author the BaseColorTex sampler
 #include "Materials/MaterialExpressionLinearInterpolate.h"        // placeholder→atlas emissive develop
 #include "Materials/MaterialExpressionConstant3Vector.h"          // the neutral placeholder colour
-#include "SceneTypes.h"                                  // EMaterialProperty::MP_PixelDepthOffset / MP_OpacityMask
+#include "Materials/MaterialExpressionCustom.h"          // the hole-clip OpacityMask HLSL node
+#include "Materials/MaterialExpressionWorldPosition.h"   // absolute world position fed to the clip test
+#include "SceneTypes.h"                                  // EMaterialProperty::MP_EmissiveColor (focus-pull target)
 #endif
 
 #if LOGI_BEVY_HAVE_GEO
@@ -53,6 +64,13 @@ bool LogiBevy_IsTerrainAbiOk();
 // Defined in LogiBevyFfi.cpp: true iff ispc_texcomp.dll (the BC7 encoder) loaded at module startup. The tile
 // decode consults it to SKIP BC7 (→ a placeholder tile) instead of crashing if that delay-loaded DLL is absent.
 bool LogiBevy_IsIspcTexCompOk();
+
+// Hole-clip: max clip OBBs the masked clip material's unrolled per-pixel loop handles — MUST equal
+// MAX_CLIP_BOXES_PER_TILE in the Rust selector (logi_3dtiles_select). A REPLACE stand-in has >=1 hole, so it
+// clips <=3 of its 4 quadtree children in the common case; 4 covers that with margin.
+// Must match the Rust selector's MAX_CLIP_BOXES_PER_TILE (8, raised from 4 after the PIE skip-level
+// overflow artifact): per-pixel cost rides ONLY stand-in tiles (ClipBoxCount bounds the unrolled loop).
+static constexpr uint32 LOGI_CLIP_MAX = 8;
 
 namespace
 {
@@ -71,13 +89,14 @@ namespace
 		return FString();
 	}
 
-	// Box-downsample a tightly packed BGRA8 image (SrcW x SrcH) into Dst (DstW x DstH = half each, min 1 px),
-	// averaging each 2x2 source block with round-to-nearest. Odd source dims clamp the trailing sample to the
-	// last row/column so the edge texel isn't dropped (no out-of-bounds read at SrcW/SrcH == 1). Averaging is
+	// Box-downsample a tightly packed RGBA8 image (SrcW x SrcH) into Dst (DstW x DstH = half each, min 1 px),
+	// averaging each 2x2 source block with round-to-nearest. Channel-agnostic: it does a per-channel box average
+	// over all 4 bytes, so it works equally for RGBA8 or BGRA8 input. Odd source dims clamp the trailing sample to
+	// the last row/column so the edge texel isn't dropped (no out-of-bounds read at SrcW/SrcH == 1). Averaging is
 	// in sRGB byte space (not gamma-decoded): the cheap, standard runtime path — it slightly darkens mips at
 	// high-contrast edges versus a gamma-correct filter, acceptable for photoreal aerial atlases. A 256-entry
 	// sRGB->linear / linear->sRGB LUT pair is the upgrade if darkening ever shows on a flamegraph-justified path.
-	void DownsampleBoxBGRA8(const uint8* Src, int32 SrcW, int32 SrcH, uint8* Dst, int32 DstW, int32 DstH)
+	void DownsampleBox(const uint8* Src, int32 SrcW, int32 SrcH, uint8* Dst, int32 DstW, int32 DstH)
 	{
 		for (int32 y = 0; y < DstH; ++y)
 		{
@@ -91,7 +110,7 @@ namespace
 				const int32 sx0 = (x * 2) * 4;                              // byte offset of source column 2x
 				const int32 sx1 = FMath::Min(x * 2 + 1, SrcW - 1) * 4;      // ...and 2x+1, clamped at the edge
 				uint8* D = DstRow + static_cast<int64>(x) * 4;
-				for (int32 c = 0; c < 4; ++c) // B, G, R, A (A is opaque-255 for these atlases, averages to 255)
+				for (int32 c = 0; c < 4; ++c) // per-channel box average (channel-agnostic; A is opaque-255 here, averages to 255)
 				{
 					D[c] = static_cast<uint8>(
 						(static_cast<uint32>(Row0[sx0 + c]) + Row0[sx1 + c] + Row1[sx0 + c] + Row1[sx1 + c] + 2) >> 2);
@@ -150,7 +169,7 @@ namespace
 		CompressBlocksBC7(&Surf, Out.GetData(), &Settings);
 	}
 
-	// Worker-side decode: a tile atlas (JPEG/PNG) -> BC1 + full box-filtered mip chain, as plain CPU byte
+	// Worker-side decode: a tile atlas (JPEG/PNG) -> BC7 + full box-filtered mip chain, as plain CPU byte
 	// buffers (NO UObject, NO RHI). Runs OFF the game thread (audit #3); the game thread only turns the result
 	// into a UTexture2D (AcquireTexture). Returns false on an unrecognised/invalid image. `Module` is resolved
 	// on the game thread (module load isn't thread-safe) and lives for the session; CreateImageWrapper makes a
@@ -184,8 +203,9 @@ namespace
 		OutMips.Reset();
 		OutMips.SetNum(NumMips);
 
-		// mip 0: the tightly packed W*H*4 BGRA8. Clamp to that size — a decoder returning padded rows could make
-		// Raw.Num() exceed it, and an unclamped copy would overrun the destination.
+		// mip 0: the tightly packed W*H*4 RGBA8 (decoded RGBA above — ISPC's BC7 reads byte 0 as red; audit
+		// 2026-06-10 §4.8 — the "BGRA" here was stale wording from the BC1 era). Clamp to that size — a decoder
+		// returning padded rows could make Raw.Num() exceed it, and an unclamped copy would overrun the destination.
 		const int64 Mip0Bytes = static_cast<int64>(W) * H * 4;
 		OutMips[0].SetNumUninitialized(Mip0Bytes);
 		FMemory::Memcpy(OutMips[0].GetData(), Raw.GetData(), FMath::Min<int64>(Raw.Num(), Mip0Bytes));
@@ -199,7 +219,7 @@ namespace
 			const int32 DstW = FMath::Max(1, SrcW >> 1);
 			const int32 DstH = FMath::Max(1, SrcH >> 1);
 			OutMips[i].SetNumUninitialized(static_cast<int64>(DstW) * DstH * 4);
-			DownsampleBoxBGRA8(OutMips[i - 1].GetData(), SrcW, SrcH, OutMips[i].GetData(), DstW, DstH);
+			DownsampleBox(OutMips[i - 1].GetData(), SrcW, SrcH, OutMips[i].GetData(), DstW, DstH);
 			SrcW = DstW;
 			SrcH = DstH;
 		}
@@ -290,11 +310,14 @@ bool ALogiBakedGeoTerrain::EnsureWorld()
 		Info.origin_latitude_deg = OriginLatitude;
 		Info.origin_height_m = OriginHeight;
 		Info.max_tile_distance_m = GlobeMaxTileDistanceM;
-		Info.workers = static_cast<uint32>(FMath::Clamp(GlobeFetchWorkers, 1, 32));
-		Info.mesh_cache_budget_mb = static_cast<uint32>(FMath::Max(0, GlobeMeshCacheBudgetMB));
+		Info.workers = static_cast<uint32>(FMath::Clamp(GlobeFetchWorkers, 1, 64)); // unified with the Rust FFI clamp(1, 64)
+		Info.flash_cache_budget_mb = static_cast<uint32>(FMath::Max(0, GlobeFlashCacheBudgetMB));
 		Info.cache_budget_bytes = bGlobeDiskCache
 			? static_cast<uint64>(FMath::Max(1, GlobeCacheBudgetGB)) * 1024ull * 1024ull * 1024ull
 			: 0ull;
+		// Runtime fetch-backend knob (ABI v11). The enum is laid out to match LOGI_GLOBE_FETCH_BACKEND_* (0=Auto,
+		// 1=ureq, 2=Cyper), so a straight cast selects the lane; Auto picks the CyperSource HTTP/3/QUIC lane for Google P3DT.
+		Info.fetch_backend = static_cast<uint32>(GlobeFetchBackend);
 		const FString CacheDir = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("P3DTCache"));
 		// Keep the UTF-8 converters alive across the call.
 		const FTCHARToUTF8 TokenUtf8(*Token);
@@ -309,6 +332,7 @@ bool ALogiBakedGeoTerrain::EnsureWorld()
 		UE_LOG(LogLogiBevy, Log,
 			TEXT("Streamed Tiles Terrain: GOOGLE TILES (ion asset %lld, origin %.4f,%.4f,%.0f m; disk cache %s)."),
 			GlobeIonAssetId, OriginLatitude, OriginLongitude, OriginHeight, bGlobeDiskCache ? TEXT("ON") : TEXT("off"));
+		AnchorSkyToPlanet();
 		return true;
 	}
 
@@ -393,7 +417,7 @@ void ALogiBakedGeoTerrain::EnsureRenderComponents()
 		{
 			GlobeBaseMaterial.Reset(Mat);
 #if WITH_EDITOR
-			EnsureGlobeMaterialPdo(Cast<UMaterial>(Mat)); // wire depth-priority (once, in-memory) — see definition
+			EnsureGlobeMaterialFocusPull(Cast<UMaterial>(Mat)); // wire the LOD-reveal focus-pull (once, in-memory)
 #endif
 		}
 		else if (!bWarnedNoGlobeMaterial)
@@ -409,6 +433,20 @@ void ALogiBakedGeoTerrain::EnsureRenderComponents()
 		{
 			GlobeLitMaterial.Reset(Lit);
 		}
+		// Hole-clip MASKED variant: prefer an authored asset (shipping-grade, saved), else build it at runtime
+		// (editor/PIE only). Without either, a coarse stand-in over loaded finer tiles renders un-clipped (the
+		// overlap returns for it) — GlobeMaterialForTile falls back to the opaque base.
+		if (UMaterialInterface* Clip = LoadObject<UMaterialInterface>(
+				nullptr, TEXT("/Game/Globe/M_LogiGlobeTileClip.M_LogiGlobeTileClip"), nullptr, LOAD_NoWarn | LOAD_Quiet))
+		{
+			GlobeClipMaterial.Reset(Clip);
+		}
+#if WITH_EDITOR
+		else if (UMaterialInterface* RuntimeClip = GetOrCreateGlobeClipMaterial())
+		{
+			GlobeClipMaterial.Reset(RuntimeClip);
+		}
+#endif
 		return;
 	}
 
@@ -449,7 +487,7 @@ ULogiTileMeshComponent* ALogiBakedGeoTerrain::AcquireProcComp()
 		TStrongObjectPtr<ULogiTileMeshComponent> Pooled = ProcCompPool.Pop(EAllowShrinking::No);
 		if (ULogiTileMeshComponent* Comp = Pooled.Get())
 		{
-			Comp->SetVisibility(true, /*bPropagateToChildren=*/false); // already attached + registered; just show it
+			Comp->SetTileVisible(true); // already attached + registered; in-place show (C4c — no proxy recreate)
 			return Comp;
 		}
 	}
@@ -469,42 +507,32 @@ ULogiTileMeshComponent* ALogiBakedGeoTerrain::AcquireProcComp()
 }
 
 #if WITH_EDITOR
-void ALogiBakedGeoTerrain::EnsureGlobeMaterialPdo(UMaterial* M)
+void ALogiBakedGeoTerrain::EnsureGlobeMaterialFocusPull(UMaterial* M)
 {
-	// Depth-priority refinement (companion to the per-tile `DepthBiasCm` set in the globe build loop): wire a
-	// `DepthBiasCm` scalar parameter into this material's PIXEL DEPTH OFFSET, so a COARSER tile (large geometric
-	// error → large DepthBiasCm) is pushed BACK in depth and a FINER tile (small error) wins the depth test
-	// wherever they overlap. The coarse ancestor that fills not-yet-loaded gaps then shows ONLY in genuine holes,
-	// never laid OVER loaded fine tiles — the reported coarse-over-sharp overlap. Done in C++ because the editor
-	// Python material API does NOT expose Pixel Depth Offset (its `MaterialProperty` enum lacks it). Applied
-	// IN-MEMORY (not saved) + recompiled: re-wired each editor session, idempotent within one via the static
-	// latch. Editor-only — `RecompileMaterial` needs the shader compiler (mirrors the runtime debug-viz material).
+	// Wire the globe tile material's LOD-reveal FOCUS-PULL once per session (in-memory + recompiled — the editor
+	// Python material API can't reach these properties). NOTE: this used to ALSO wire a `DepthBiasCm` → Pixel
+	// Depth Offset to push a coarse tile behind a finer one wherever they overlapped. That PDO is REMOVED: the
+	// geometric hole-clip discards a coarse stand-in's fragments inside the tight decoded-mesh bounds of the
+	// finer tiles drawn over it (ApplyTileClip below), so there is no coplanar coarse-over-fine geometry to
+	// depth-separate — and a PDO large enough to separate real terrain (a coarse mesh sits metres above a fine
+	// one on convex ground) would shift the scene depth SkyAtmosphere reads (the blue tile-quilt). Overlap is
+	// removed GEOMETRICALLY and off-screen tiles are dropped by frustum culling — neither is papered over with a
+	// depth hack. Idempotent within a session via the static latch. Editor-only — `RecompileMaterial` needs the
+	// shader compiler.
 	static bool bWired = false;
 	if (bWired || M == nullptr)
 	{
 		return;
 	}
 	bWired = true;
-	UMaterialExpression* Ex = UMaterialEditingLibrary::CreateMaterialExpression(
-		M, UMaterialExpressionScalarParameter::StaticClass(), -700, 500);
-	UMaterialExpressionScalarParameter* P = Cast<UMaterialExpressionScalarParameter>(Ex);
-	if (P == nullptr)
-	{
-		return;
-	}
-	P->ParameterName = FName(TEXT("DepthBiasCm"));
-	P->DefaultValue = 0.0f;
-	UMaterialEditingLibrary::ConnectMaterialProperty(P, TEXT(""), MP_PixelDepthOffset);
 
-	// LOD fade via TEXTURE-DEVELOP (robust for our DECOUPLED geometry/texture pipeline). The opacity-dither approach
-	// made a tile INVISIBLE until its atlas confirmed; since Rust streams geometry before C++ decodes the texture,
-	// and the coarse cover is only briefly held, the invisible terrain revealed the white sky — the "white globe".
-	// Instead, keep the material OPAQUE and lerp the EMISSIVE from a neutral placeholder → the atlas as FadeAlpha
-	// 0→1: a loading tile shows the placeholder (opaque, like before the fade) and the gray→atlas SNAP becomes a
-	// smooth develop. A tile is NEVER transparent, so it can never reveal the sky — structurally white-proof. Force
-	// Opaque first (in case a prior session's Masked/dither wiring was saved into the asset). If the authored
-	// BaseColorTex sampler can't be found, we skip the develop and leave the emissive untouched (tiles snap, but
-	// still render their atlas — never white).
+	// LOD reveal via a FOCUS-PULL (rack-focus). The material stays OPAQUE and ALWAYS samples the real atlas — only the
+	// sampled MIP changes, soft → sharp as FadeAlpha 0→1. A refined-in tile is shown only once it is fully TEXTURED
+	// (the Rust texture gate, ABI v9, holds its coarse parent drawn over it until then — invisible LOD loading), so the
+	// reveal never shows gray and never reveals sky: a tile starts at ~its coarse parent's apparent resolution and
+	// crisps up, hiding the LOD jump. Force Opaque first (a prior session may have saved Masked/dither wiring). If the
+	// authored BaseColorTex sampler isn't found, leave the emissive as authored (tiles snap to sharp, still their
+	// atlas — never white/gray).
 	M->BlendMode = BLEND_Opaque;
 	UMaterialExpressionTextureSampleParameter2D* BaseTex = nullptr;
 	for (UMaterialExpression* MatEx : M->GetExpressions())
@@ -516,53 +544,77 @@ void ALogiBakedGeoTerrain::EnsureGlobeMaterialPdo(UMaterial* M)
 	}
 	UMaterialExpressionScalarParameter* Fade = Cast<UMaterialExpressionScalarParameter>(
 		UMaterialEditingLibrary::CreateMaterialExpression(M, UMaterialExpressionScalarParameter::StaticClass(), -760, 660));
-	UMaterialExpressionConstant3Vector* Gray = Cast<UMaterialExpressionConstant3Vector>(
-		UMaterialEditingLibrary::CreateMaterialExpression(M, UMaterialExpressionConstant3Vector::StaticClass(), -760, 760));
-	UMaterialExpressionLinearInterpolate* Lerp = Cast<UMaterialExpressionLinearInterpolate>(
-		UMaterialEditingLibrary::CreateMaterialExpression(M, UMaterialExpressionLinearInterpolate::StaticClass(), -470, 700));
-	if (BaseTex != nullptr && Fade != nullptr && Gray != nullptr && Lerp != nullptr)
+	UMaterialExpressionLinearInterpolate* MipLerp = Cast<UMaterialExpressionLinearInterpolate>(
+		UMaterialEditingLibrary::CreateMaterialExpression(M, UMaterialExpressionLinearInterpolate::StaticClass(), -470, 760));
+	if (BaseTex != nullptr && Fade != nullptr && MipLerp != nullptr)
 	{
 		Fade->ParameterName = FName(TEXT("FadeAlpha"));
-		Fade->DefaultValue = 1.0f; // a tile with no per-tile override renders its atlas fully (rest state)
-		Gray->Constant = FLinearColor(0.5f, 0.5f, 0.5f); // neutral placeholder (matches the engine default texture)
-		UMaterialEditingLibrary::ConnectMaterialExpressions(Gray, FString(), Lerp, TEXT("A"));
-		UMaterialEditingLibrary::ConnectMaterialExpressions(BaseTex, TEXT("RGB"), Lerp, TEXT("B"));
-		UMaterialEditingLibrary::ConnectMaterialExpressions(Fade, FString(), Lerp, TEXT("Alpha"));
-		UMaterialEditingLibrary::ConnectMaterialProperty(Lerp, FString(), MP_EmissiveColor); // replaces BaseColorTex→Emissive
-		UE_LOG(LogLogiBevy, Log, TEXT("Globe tile material: wired FadeAlpha emissive develop (placeholder→atlas) for the LOD fade."));
+		Fade->DefaultValue = 1.0f; // rest state: no per-tile override ⇒ sample mip 0 (fully sharp)
+		// MipValue = lerp(SoftBias, 0, FadeAlpha): FadeAlpha 0 ⇒ SoftBias (soft), 1 ⇒ 0 (sharp). ConstA/ConstB carry
+		// the endpoints, so only FadeAlpha needs wiring (no extra Constant nodes).
+		MipLerp->ConstA = GlobeFadeSoftBias; // soft start (a few mips coarse ≈ the coarse parent's detail)
+		MipLerp->ConstB = 0.0f;              // sharp end
+		UMaterialEditingLibrary::ConnectMaterialExpressions(Fade, FString(), MipLerp, TEXT("Alpha"));
+		// Sample the atlas at that mip bias (wire the MipValue input struct directly — its pin name varies by mode)
+		// and emit it as emissive (P3DT bakes its own lighting ⇒ unlit). A failed wire just leaves mip 0 → instant
+		// sharp, never gray/white.
+		BaseTex->MipValueMode = TMVM_MipBias;
+		BaseTex->MipValue.Expression = MipLerp;
+		UMaterialEditingLibrary::ConnectMaterialProperty(BaseTex, TEXT("RGB"), MP_EmissiveColor);
+		UE_LOG(LogLogiBevy, Log, TEXT("Globe tile material: wired FadeAlpha focus-pull (soft->sharp mip bias) for the LOD reveal."));
 	}
 	else
 	{
-		UE_LOG(LogLogiBevy, Warning, TEXT("Globe tile material: develop wiring skipped (BaseColorTex sampler not found); tiles snap, no fade."));
+		UE_LOG(LogLogiBevy, Warning, TEXT("Globe tile material: focus-pull wiring skipped (BaseColorTex sampler not found); tiles snap, no reveal."));
 	}
 
 	UMaterialEditingLibrary::RecompileMaterial(M);
-	UE_LOG(LogLogiBevy, Log, TEXT("Globe tile material: wired DepthBiasCm -> Pixel Depth Offset (depth-priority refinement)."));
 }
 #endif // WITH_EDITOR
 
 UMaterialInstanceDynamic* ALogiBakedGeoTerrain::AcquireMid(UMaterialInterface* Base)
 {
-	while (MidPool.Num() > 0)
+	// Per-parent bucket (audit 2026-06-10 C3): a MID can't be re-parented, and the hole-clip lane recycles
+	// BOTH the opaque and the masked base into the pool — the old flat pool popped-and-DROPPED every
+	// non-matching MID while hunting a match, destroying pooled MIDs of the other base exactly during LOD
+	// convergence (when both kinds churn). Bucketed, acquire is O(1) and never destroys a usable MID.
+	if (Base == nullptr) { return nullptr; }
+	if (TArray<TStrongObjectPtr<UMaterialInstanceDynamic>>* Bucket = MidPool.Find(TObjectKey<UMaterialInterface>(Base)))
 	{
-		TStrongObjectPtr<UMaterialInstanceDynamic> Pooled = MidPool.Pop(EAllowShrinking::No);
-		if (UMaterialInstanceDynamic* Mid = Pooled.Get())
+		while (Bucket->Num() > 0)
 		{
-			// Reuse only a MID over the SAME parent: with the unlit/lit split a pooled MID may carry the other
-			// base, and a MID can't be re-parented. A mismatch is dropped (GC reclaims) and we try the next /
-			// create fresh. P3DT is uniform (all unlit), so in practice the pool holds one base and never churns.
-			if (Mid->Parent == Base)
+			TStrongObjectPtr<UMaterialInstanceDynamic> Pooled = Bucket->Pop(EAllowShrinking::No);
+			if (UMaterialInstanceDynamic* Mid = Pooled.Get())
 			{
 				return Mid; // caller re-points BaseColorTex
 			}
 		}
 	}
-	return (Base != nullptr) ? UMaterialInstanceDynamic::Create(Base, this) : nullptr;
+	return UMaterialInstanceDynamic::Create(Base, this);
 }
 
-UMaterialInterface* ALogiBakedGeoTerrain::GlobeMaterialForTile(uint32 TileFlags)
+void ALogiBakedGeoTerrain::RecycleMid(TStrongObjectPtr<UMaterialInstanceDynamic>&& Mid)
+{
+	if (UMaterialInstanceDynamic* M = Mid.Get())
+	{
+		MidPool.FindOrAdd(TObjectKey<UMaterialInterface>(M->Parent)).Add(MoveTemp(Mid));
+	}
+}
+
+UMaterialInterface* ALogiBakedGeoTerrain::GlobeMaterialForTile(uint32 TileFlags, bool bWantClip)
 {
 #if LOGI_BEVY_HAVE_GEO
+	// Hole-clip: a coarse stand-in drawn over loaded finer tiles uses the MASKED clip variant (unlit — P3DT is all
+	// unlit) so the renderer can discard its fragments inside the child footprints. Only when one is available; if
+	// neither authored nor runtime-built, fall through to the opaque base (the tile renders un-clipped — the
+	// coplanar overlap returns for it, but no crash).
+	if (bWantClip)
+	{
+		if (UMaterialInterface* Clip = GlobeClipMaterial.Get())
+		{
+			return Clip;
+		}
+	}
 	bool bWantUnlit;
 	switch (GoogleTileLighting)
 	{
@@ -589,6 +641,7 @@ UMaterialInterface* ALogiBakedGeoTerrain::GlobeMaterialForTile(uint32 TileFlags)
 	return GlobeBaseMaterial.Get();
 #else
 	(void)TileFlags;
+	(void)bWantClip;
 	return nullptr;
 #endif
 }
@@ -598,12 +651,12 @@ void ALogiBakedGeoTerrain::RecycleTile(FTileEntry& Entry)
 	if (ULogiTileMeshComponent* Comp = Entry.ProcComp.Get())
 	{
 		Comp->ClearTileGeometry();                                  // free the geometry (O(1): drops this tile's proxy)
-		Comp->SetVisibility(false, /*bPropagateToChildren=*/false);
+		Comp->SetTileVisible(false); // in-place flag flip (C4c) — the proxy is already gone
 		ProcCompPool.Add(MoveTemp(Entry.ProcComp));                 // keep it registered + GC-rooted for reuse
 	}
 	if (Entry.Material.IsValid())
 	{
-		MidPool.Add(MoveTemp(Entry.Material));
+		RecycleMid(MoveTemp(Entry.Material)); // bucketed by parent (C3)
 	}
 	if (Entry.DebugMid.IsValid())
 	{
@@ -646,6 +699,8 @@ void ALogiBakedGeoTerrain::DestroyAllTiles()
 	}
 	Tiles.Reset(); // drops all per-tile MID/texture strong refs
 	PendingTexture.Reset();
+	TexturedKeys.Reset();      // un-report everything to the Rust gate (the world is being torn down)
+	bTexturedKeysDirty = true;
 	// Reset the delta-reconcile baseline (ADR-0012): the next poll must be treated as a CHANGED frame so the lane
 	// does a full reconcile against whatever the (possibly recreated) world publishes, rebuilding `Tiles` cleanly.
 	LastFrameId = 0;
@@ -667,13 +722,11 @@ void ALogiBakedGeoTerrain::ClearPools()
 	PendingBinds.Reset();           // drop uploads awaiting confirmation — the world is being rebuilt
 	AwaitingTextureConfirm.Reset();
 	DecodingKeys.Reset();
-	// LOD cross-fade: tear down any held / fading tiles too (the world is being rebuilt).
-	for (TPair<uint64, FTileEntry>& Pair : FadingOut)
-	{
-		if (ULogiTileMeshComponent* C = Pair.Value.ProcComp.Get()) { C->DestroyComponent(); }
-	}
-	FadingOut.Reset();
+	DepartedGrace.Reset();          // retained departed tiles die with the world (their components recycle above)
+	// LOD cross-fade: drop the fading set too (the world is being rebuilt).
 	FadingKeys.Reset();
+	TexturedKeys.Reset();          // the renderer's report to the Rust gate — empty for the rebuilt world
+	bTexturedKeysDirty = true;     // push the empty set next step (prime the gate fresh)
 	// Hand any in-flight workers a fresh inbox: a decode still running holds the OLD shared queue and delivers
 	// into it (freed when the last worker drops it), so stale results can't reach the rebuilt state.
 	DecodeQueue = MakeShared<TQueue<FLogiTileDecode, EQueueMode::Mpsc>, ESPMode::ThreadSafe>();
@@ -686,7 +739,7 @@ void ALogiBakedGeoTerrain::ClearPools()
 // mip 0; this appends mips 1..N-1 and (re)sizes each BulkData so the subsequent UpdateResource() builds a correctly-
 // laid-out RHI texture + full mip chain. The bytes are left uninitialised: UpdateResource's render-thread CreateTexture
 // seed-uploads this garbage once (a single tile's worth, ON THE RENDER THREAD), and EnqueueTileMipUploadRT immediately
-// overwrites every mip with the real BC1 data. Lock-THEN-Realloc matches CreateTransient: a freshly-added mip has no
+// overwrites every mip with the real BC7 data. Lock-THEN-Realloc matches CreateTransient: a freshly-added mip has no
 // allocation, so Lock alone returns null; Realloc allocates (or no-ops at the same size) and — crucially — does NOT
 // memset, so this stays O(allocations), not O(bytes), on the game thread. `NumMips` is the full chain length.
 void ALogiBakedGeoTerrain::AllocateMipDescriptors(UTexture2D* Tex, int32 W, int32 H, int32 NumMips)
@@ -715,12 +768,12 @@ void ALogiBakedGeoTerrain::AllocateMipDescriptors(UTexture2D* Tex, int32 W, int3
 	}
 }
 
-// Enqueue the BC1 mip-byte upload onto the RENDER THREAD (audit T4). The game thread has already created/acquired the
+// Enqueue the BC7 mip-byte upload onto the RENDER THREAD (audit T4). The game thread has already created/acquired the
 // UTexture2D and made its RHI resource live (CreateTransient + UpdateResource for a fresh texture, or a pooled texture
 // whose RHI is already resident); here it only hands off a pointer to the texture's render resource + a SHARED ref to
-// the BC1 bytes, then returns — the per-mip Memcpy now happens on the render thread.
+// the BC7 bytes, then returns — the per-mip Memcpy now happens on the render thread.
 //
-// LIFETIME (the load-bearing part): the BC1 bytes live in `Mips`, a thread-safe shared pointer captured BY VALUE in the
+// LIFETIME (the load-bearing part): the BC7 bytes live in `Mips`, a thread-safe shared pointer captured BY VALUE in the
 // render lambda. So the bytes are guaranteed to outlive the asynchronous upload no matter when it runs (it may execute
 // after the next game tick has already polled/drained again) — the chain is freed only when the render thread drops this
 // last reference at the end of the command. This mirrors the T1 mesh proxy's FLogiTilePayload and the JPEG-copy in
@@ -729,13 +782,19 @@ void ALogiBakedGeoTerrain::AllocateMipDescriptors(UTexture2D* Tex, int32 W, int3
 // TStrongObjectPtr (FTileEntry::Texture or the pool), and a UObject teardown enqueues the resource's ReleaseResource
 // AFTER this command (render commands are FIFO), so the resource is valid for the duration of this command (re-validated
 // defensively below).
-void ALogiBakedGeoTerrain::EnqueueTileMipUploadRT(UTexture2D* Tex, const TSharedRef<FLogiTileMipChain, ESPMode::ThreadSafe>& Mips)
+void ALogiBakedGeoTerrain::EnqueueTileMipUploadRT(UTexture2D* Tex, const TSharedRef<FLogiTileMipChain, ESPMode::ThreadSafe>& Mips,
+	const TSharedRef<FLogiTexPipeStats, ESPMode::ThreadSafe>& Stats)
 {
 	FTextureResource* Resource = (Tex != nullptr) ? Tex->GetResource() : nullptr;
-	if (Resource == nullptr) { Mips->UploadState.store(-1, std::memory_order_release); return; }
+	if (Resource == nullptr)
+	{
+		Stats->UploadNoRhi.fetch_add(1, std::memory_order_relaxed);
+		Mips->UploadState.store(-1, std::memory_order_release);
+		return;
+	}
 
 	ENQUEUE_RENDER_COMMAND(LogiGeoTileMipUpload)(
-		[Resource, Mips](FRHICommandListImmediate& RHICmdList)
+		[Resource, Mips, Stats](FRHICommandListImmediate& RHICmdList)
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE(LogiGeoTileTexUploadRT);
 
@@ -744,7 +803,12 @@ void ALogiBakedGeoTerrain::EnqueueTileMipUploadRT(UTexture2D* Tex, const TShared
 			// on this same thread — so by the time this runs it is valid. Re-fetch + null-check anyway (defence in
 			// depth): if the resource was torn down before this ran, GetTexture2DRHI() returns null and we drop the upload.
 			FRHITexture* TexRHI = Resource->GetTexture2DRHI();
-			if (TexRHI == nullptr) { Mips->UploadState.store(-1, std::memory_order_release); return; }
+			if (TexRHI == nullptr)
+			{
+				Stats->UploadNoRhi.fetch_add(1, std::memory_order_relaxed);
+				Mips->UploadState.store(-1, std::memory_order_release);
+				return;
+			}
 
 			const EPixelFormat Format = TexRHI->GetFormat();      // PF_BC7 (block-compressed)
 			const FPixelFormatInfo& FmtInfo = GPixelFormats[Format];
@@ -756,11 +820,17 @@ void ALogiBakedGeoTerrain::EnqueueTileMipUploadRT(UTexture2D* Tex, const TShared
 			// than we have source for), the texture is NOT fully resident and must not be shown — a fresh texture
 			// would show its uninitialised seed (black), a pooled one the previous tile's atlas (wrong-atlas).
 			bool bAllMipsUploaded = (Num == RHIMips);
+			if (!bAllMipsUploaded) { Stats->UploadMipMismatch.fetch_add(1, std::memory_order_relaxed); }
 
 			for (int32 i = 0; i < Num; ++i)
 			{
 				const TArray64<uint8>& Src = Mips->Mips[i];
-				if (Src.Num() == 0) { bAllMipsUploaded = false; continue; }
+				if (Src.Num() == 0)
+				{
+					Stats->UploadShortMip.fetch_add(1, std::memory_order_relaxed);
+					bAllMipsUploaded = false;
+					continue;
+				}
 				const int32 MipW = FMath::Max(1, W >> i);
 				const int32 MipH = FMath::Max(1, H >> i);
 
@@ -773,9 +843,14 @@ void ALogiBakedGeoTerrain::EnqueueTileMipUploadRT(UTexture2D* Tex, const TShared
 				const uint32 BlocksY = FMath::DivideAndRoundUp<uint32>(MipH, FmtInfo.BlockSizeY);
 				const uint32 SrcPitch = BlocksX * static_cast<uint32>(FmtInfo.BlockBytes);
 				const int64 TightSize = static_cast<int64>(SrcPitch) * BlocksY;
-				if (TightSize > Src.Num()) { bAllMipsUploaded = false; continue; } // short/truncated source — never read past the decode output
+				if (TightSize > Src.Num())
+				{
+					Stats->UploadShortMip.fetch_add(1, std::memory_order_relaxed);
+					bAllMipsUploaded = false;
+					continue; // short/truncated source — never read past the decode output
+				}
 
-				// Lock the live RHI mip for write. DestStride is the GPU row pitch (for BC1 a "row" is one row of 4x4
+				// Lock the live RHI mip for write. DestStride is the GPU row pitch (for BC7 a "row" is one row of 4x4
 				// blocks); it may be PADDED above the tight source pitch (e.g. D3D12 aligns row pitch), so we copy
 				// block-row by block-row with CopyTextureData2D — the same block-aware primitive the engine uses to
 				// upload compressed mips (FTexture2DResource::CreateTexture). A flat Memcpy would corrupt rows whenever
@@ -783,7 +858,12 @@ void ALogiBakedGeoTerrain::EnqueueTileMipUploadRT(UTexture2D* Tex, const TShared
 				uint32 DestStride = 0;
 				void* Dest = RHICmdList.LockTexture2D(TexRHI, static_cast<uint32>(i), RLM_WriteOnly, DestStride,
 					/*bLockWithinMiptail=*/false);
-				if (Dest == nullptr) { bAllMipsUploaded = false; continue; } // LockTexture2D failed (upload-heap pressure) — mip left unwritten
+				if (Dest == nullptr)
+				{
+					Stats->UploadLockFailed.fetch_add(1, std::memory_order_relaxed);
+					bAllMipsUploaded = false;
+					continue; // LockTexture2D failed (upload-heap pressure) — mip left unwritten
+				}
 				CopyTextureData2D(Src.GetData(), Dest, MipH, Format, SrcPitch, DestStride);
 				RHICmdList.UnlockTexture2D(TexRHI, static_cast<uint32>(i), /*bLockWithinMiptail=*/false);
 			}
@@ -810,11 +890,11 @@ UTexture2D* ALogiBakedGeoTerrain::AcquireTexture(const TSharedRef<FLogiTileMipCh
 			UTexture2D* Tex = Pooled.Get();
 			// Same dims => same mip count + a still-live RHI texture: overwrite the existing RHI mips IN PLACE on the
 			// render thread (no UObject churn, no UpdateResource, and no seed upload — the resource is already
-			// resident). The game thread does zero pixel work; the BC1 Memcpy runs in the enqueued render command.
+			// resident). The game thread does zero pixel work; the BC7 Memcpy runs in the enqueued render command.
 			if (Tex != nullptr && Tex->GetPlatformData() != nullptr
 				&& Tex->GetPlatformData()->Mips.Num() == Mips->Mips.Num() && Tex->GetResource() != nullptr)
 			{
-				EnqueueTileMipUploadRT(Tex, Mips);
+				EnqueueTileMipUploadRT(Tex, Mips, TexStats);
 				return Tex;
 			}
 		}
@@ -838,12 +918,20 @@ UTexture2D* ALogiBakedGeoTerrain::AcquireTexture(const TSharedRef<FLogiTileMipCh
 	// regardless of CreateTransient's defaults. Set BEFORE UpdateResource so it's baked into the RHI sampler.
 	Tex->Filter = TF_Default;
 	Tex->LODGroup = TEXTUREGROUP_World;
+	// CLAMP addressing (the 2026-06-12 ocean grid-seam fix). CreateTransient leaves AddressX/Y at TA_Wrap, so a
+	// border sample at UV≈0/1 bilinear-blends the tile's OPPOSITE edge texels — a thin wrong-color line along
+	// every tile boundary, faint over uniform ocean and wider at the deep mips a grazing orbital view samples
+	// (half a texel at mip k covers 2^k source texels). Each tile's atlas is self-contained (UVs span [0,1],
+	// no tiling repeat), so clamp is unconditionally correct. Set BEFORE UpdateResource (baked into the RHI
+	// sampler); the material samples with SSM_FromTextureAsset, so the texture's address mode is what binds.
+	Tex->AddressX = TA_Clamp;
+	Tex->AddressY = TA_Clamp;
 #if WITH_EDITORONLY_DATA
 	Tex->MipGenSettings = TMGS_NoMipmaps; // "no GENERATION" — we supply the chain; pins LOD bias to 0
 #endif
 	AllocateMipDescriptors(Tex, W, H, Mips->Mips.Num());
 	Tex->UpdateResource();
-	EnqueueTileMipUploadRT(Tex, Mips);
+	EnqueueTileMipUploadRT(Tex, Mips, TexStats);
 	return Tex;
 }
 
@@ -857,17 +945,20 @@ void ALogiBakedGeoTerrain::DispatchTileDecode(uint64 Key, const uint8* Jpeg, int
 		ImageWrapperModule = &FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
 	}
 	DecodingKeys.Add(Key);
+	TexStats->DecodeDispatched.fetch_add(1, std::memory_order_relaxed);
 	// Copy the JPEG out of the frame-transient FFI buffer (the next poll may overwrite it), then decode on a
 	// worker. The task captures only POD + the copied bytes + the shared queue + the module pointer — never
 	// `this` — so it is safe regardless of the actor's lifetime.
 	TArray<uint8> Bytes(Jpeg, static_cast<int32>(Len));
 	TSharedPtr<TQueue<FLogiTileDecode, EQueueMode::Mpsc>, ESPMode::ThreadSafe> Queue = DecodeQueue;
 	IImageWrapperModule* Module = ImageWrapperModule;
-	Async(EAsyncExecution::ThreadPool, [Key, Bytes = MoveTemp(Bytes), Queue, Module]()
+	TSharedRef<FLogiTexPipeStats, ESPMode::ThreadSafe> Stats = TexStats;
+	Async(EAsyncExecution::ThreadPool, [Key, Bytes = MoveTemp(Bytes), Queue, Module, Stats]()
 	{
 		FLogiTileDecode Out;
 		Out.Key = Key;
 		DecodeJpegToBgraMips(Module, Bytes.GetData(), Bytes.Num(), Out.W, Out.H, Out.Mips); // Mips empty on failure
+		(Out.Mips.Num() > 0 ? Stats->DecodeJobOk : Stats->DecodeJobEmpty).fetch_add(1, std::memory_order_relaxed);
 		Queue->Enqueue(MoveTemp(Out)); // always enqueue so the game thread clears the in-flight key
 	});
 }
@@ -888,9 +979,23 @@ void ALogiBakedGeoTerrain::DrainDecodedTextures(double DeadlineSec)
 		DecodingKeys.Remove(Done.Key);
 		if (Done.Mips.Num() == 0) { continue; }                          // decode failed — tile stays untextured (re-driven)
 		FTileEntry* Entry = Tiles.Find(Done.Key);
-		if (Entry == nullptr || !Entry->ProcComp.IsValid()) { continue; } // evicted before the decode finished
-		if (Entry->Texture.IsValid() || AwaitingTextureConfirm.Contains(Done.Key)) { continue; } // already textured / a bind is pending
-		// Move the worker-produced BC1 chain into a thread-safe shared payload (no copy) so AcquireTexture can hand
+		if (Entry == nullptr || !Entry->ProcComp.IsValid())
+		{
+			TexStats->DrainDropEvicted.fetch_add(1, std::memory_order_relaxed);
+			continue; // evicted before the decode finished
+		}
+		if (Entry->Texture.IsValid() || AwaitingTextureConfirm.Contains(Done.Key))
+		{
+			TexStats->DrainDropDup.fetch_add(1, std::memory_order_relaxed);
+			continue; // already textured / a bind is pending
+		}
+		// Decode SUCCEEDED (non-empty mips). Clear the retry counter: GMaxTextureAttempts is there to retire a
+		// genuinely-undecodable atlas (decode keeps returning EMPTY, caught at the `Mips.Num()==0` continue above) —
+		// it must NOT accrue on upload-pressure cycles (decode-OK, then a dropped GPU upload under a LockTexture2D
+		// burst). Without this reset, a perfectly decodable tile in a sustained upload flood burns the cap one
+		// re-decode at a time and strands on the placeholder. Resetting here means only true decode failures count.
+		Entry->TextureAttempts = 0;
+		// Move the worker-produced BC7 chain into a thread-safe shared payload (no copy) so AcquireTexture can hand
 		// it to the render thread, which owns the upload + frees the bytes when done (audit T4 lifetime discipline).
 		TSharedRef<FLogiTileMipChain, ESPMode::ThreadSafe> Chain = MakeShared<FLogiTileMipChain, ESPMode::ThreadSafe>();
 		Chain->W = Done.W;
@@ -951,6 +1056,7 @@ void ALogiBakedGeoTerrain::ProcessPendingTextureBinds()
 		if (State == 1)
 		{
 			// CONFIRMED resident — now it is safe to show. Claim the texture + point the tile's MID at the atlas.
+			TexStats->UploadConfirmed.fetch_add(1, std::memory_order_relaxed);
 			UTexture2D* Tex = B.Texture.Get();
 			Entry->Texture = MoveTemp(B.Texture);
 			PendingTexture.Remove(Key); // atlas is up — stop the bounded re-drive tracking it
@@ -964,14 +1070,14 @@ void ALogiBakedGeoTerrain::ProcessPendingTextureBinds()
 					if (Mid != nullptr)
 					{
 						Entry->Material.Reset(Mid);
-						if (!IsDebugViewActive()) { Entry->ProcComp->SetMaterial(0, Mid); }
+						if (!IsDebugViewActive()) { Entry->ProcComp->SetTileMaterial(Mid); } // recreate-on-swap (see SetTileMaterial)
 					}
 				}
 			}
 			if (Mid != nullptr) { Mid->SetTextureParameterValue(TEXT("BaseColorTex"), Tex); }
-			// Atlas is resident — START the LOD bloom: the tile dithers in from invisible to opaque (sharpening into
-			// view) instead of popping. If fade is off, FadeMode is None and the tile was already opaque (instant).
-			if (Entry->FadeMode == EGlobeFade::WaitTexture) { Entry->FadeMode = EGlobeFade::FadingIn; FadingKeys.Add(Key); }
+			// Atlas resident + bound ⇒ the tile is texture-READY: show it (it was built HIDDEN as a "prepare" tile),
+			// start the focus-pull reveal, and report it to the Rust texture gate so its held coarse parent can drop.
+			MarkTileTextured(Key, *Entry);
 			AwaitingTextureConfirm.Remove(Key);
 			PendingBinds.RemoveAtSwap(i, EAllowShrinking::No);
 			continue;
@@ -982,12 +1088,20 @@ void ALogiBakedGeoTerrain::ProcessPendingTextureBinds()
 		if (B.UploadRetries < MaxUploadRetries && B.Texture.IsValid() && B.Chain.IsValid())
 		{
 			++B.UploadRetries;
+			TexStats->UploadRetried.fetch_add(1, std::memory_order_relaxed);
 			B.Chain->UploadState.store(0, std::memory_order_release);
-			EnqueueTileMipUploadRT(B.Texture.Get(), B.Chain.ToSharedRef());
+			EnqueueTileMipUploadRT(B.Texture.Get(), B.Chain.ToSharedRef(), TexStats);
 			continue; // still pending; re-checked next step
 		}
-		// Gave up after the retry cap: return the texture to the pool and leave the tile on its gray placeholder. It
-		// stays in PendingTexture, so the steady-state re-drive eventually re-decodes + re-uploads it.
+		// Gave up on THIS upload after the retry cap: return the texture to the pool but leave the tile HIDDEN — do
+		// NOT surrender it onto the placeholder. A dropped upload is heap PRESSURE (a LockTexture2D burst during a
+		// region-entry flood), which is TRANSIENT, and the decode itself succeeded. Reporting it textured here would
+		// un-hide it on the null-texture placeholder (a flat patch beside sharp neighbours) AND drop its real-textured
+		// coarse parent — the worse of both. Instead keep it hidden under that coarse parent and keep its key in
+		// PendingTexture: DriveTileTextures re-drives it (a successful decode resets TextureAttempts, so upload
+		// pressure never burns the cap) until the upload lands for real. Only a genuinely-undecodable atlas — decode
+		// keeps failing — reaches the cap and surrenders, and that happens in DriveTileTextures, not here.
+		TexStats->UploadSurrendered.fetch_add(1, std::memory_order_relaxed);
 		if (UTexture2D* Tex = B.Texture.Get())
 		{
 			const FTexturePlatformData* PD = Tex->GetPlatformData();
@@ -1070,6 +1184,103 @@ UMaterialInterface* ALogiBakedGeoTerrain::GetOrCreateDebugMaterial()
 	return nullptr; // runtime material compilation needs the editor; debug viz is editor / PIE only
 #endif
 }
+
+#if WITH_EDITOR
+UMaterialInterface* ALogiBakedGeoTerrain::GetOrCreateGlobeClipMaterial()
+{
+	if (UMaterialInterface* Existing = GlobeClipMaterial.Get())
+	{
+		return Existing;
+	}
+	UMaterial* Mat = NewObject<UMaterial>(this, NAME_None, RF_Transient);
+	if (Mat == nullptr)
+	{
+		return nullptr;
+	}
+	// Unlit + MASKED: emissive = the atlas (P3DT bakes its own lighting), OpacityMask = the hole-clip test. A
+	// masked surface writes scene depth ONLY where the mask passes — so a clipped fragment leaves depth untouched
+	// (the finer tile behind shows through) and SkyAtmosphere reads a clean depth, exactly what the PDO could not
+	// give. NOTE: the clip OBBs are in render-space world cm (the actor sits at the world origin, the ENU origin),
+	// so the test uses Absolute World Position — the same space the tile mesh vertices live in.
+	Mat->MaterialDomain = MD_Surface;
+	Mat->SetShadingModel(MSM_Unlit);
+	Mat->BlendMode = BLEND_Masked;
+	Mat->TwoSided = true;
+	UMaterialEditorOnlyData* Ed = Mat->GetEditorOnlyData();
+
+	// Emissive = BaseColorTex.RGB — the per-tile MID binds the atlas, exactly as the opaque unlit base displays it.
+	UMaterialExpressionTextureSampleParameter2D* Tex = NewObject<UMaterialExpressionTextureSampleParameter2D>(Mat);
+	Tex->ParameterName = TEXT("BaseColorTex");
+	Mat->GetExpressionCollection().AddExpression(Tex);
+	Ed->EmissiveColor.Connect(0, Tex);
+
+	UMaterialExpressionWorldPosition* WorldPos = NewObject<UMaterialExpressionWorldPosition>(Mat);
+	Mat->GetExpressionCollection().AddExpression(WorldPos);
+
+	UMaterialExpressionScalarParameter* Count = NewObject<UMaterialExpressionScalarParameter>(Mat);
+	Count->ParameterName = TEXT("ClipBoxCount");
+	Count->DefaultValue = 0.0f;
+	Mat->GetExpressionCollection().AddExpression(Count);
+
+	// OpacityMask = 0 (discard) when the world position is inside ANY clip OBB, else 1. Each box is center + 3
+	// half-extent axis vectors; inside iff |dot(p-center, axisK)| <= dot(axisK, axisK) for all three axes K. The
+	// loop is bounded by ClipBoxCount (0 ⇒ always 1 ⇒ fully opaque), so a tile with no clip set renders normally.
+	UMaterialExpressionCustom* Clip = NewObject<UMaterialExpressionCustom>(Mat);
+	Clip->OutputType = CMOT_Float1;
+	Clip->Description = TEXT("HoleClipMask");
+	Clip->Code = TEXT(
+		"float3 C[8]  = { C0.xyz,  C1.xyz,  C2.xyz,  C3.xyz,  C4.xyz,  C5.xyz,  C6.xyz,  C7.xyz  };\n"
+		"float3 AX[8] = { AX0.xyz, AX1.xyz, AX2.xyz, AX3.xyz, AX4.xyz, AX5.xyz, AX6.xyz, AX7.xyz };\n"
+		"float3 AY[8] = { AY0.xyz, AY1.xyz, AY2.xyz, AY3.xyz, AY4.xyz, AY5.xyz, AY6.xyz, AY7.xyz };\n"
+		"float3 AZ[8] = { AZ0.xyz, AZ1.xyz, AZ2.xyz, AZ3.xyz, AZ4.xyz, AZ5.xyz, AZ6.xyz, AZ7.xyz };\n"
+		"float m = 1.0;\n"
+		"int n = (int)round(Count);\n"
+		"[unroll] for (int i = 0; i < 8; ++i)\n"
+		"{\n"
+		"    if (i >= n) break;\n"
+		"    float3 d = WorldPos - C[i];\n"
+		"    bool inside = abs(dot(d, AX[i])) <= dot(AX[i], AX[i])\n"
+		"               && abs(dot(d, AY[i])) <= dot(AY[i], AY[i])\n"
+		"               && abs(dot(d, AZ[i])) <= dot(AZ[i], AZ[i]);\n"
+		"    if (inside) m = 0.0;\n"
+		"}\n"
+		"return m;");
+
+	// Wire the Custom node inputs: WorldPos + ClipBoxCount + the LOGI_CLIP_MAX×4 box-data vector parameters the
+	// per-tile MID sets (ClipBox{i}_{Center,AxisX,AxisY,AxisZ}); HLSL names are WorldPos / Count / C{i} / A{X,Y,Z}{i}.
+	Clip->Inputs.Empty();
+	auto AddExprInput = [&](const TCHAR* VarName, UMaterialExpression* Expr)
+	{
+		FCustomInput In;
+		In.InputName = FName(VarName);
+		In.Input.Connect(0, Expr);
+		Clip->Inputs.Add(In);
+	};
+	auto AddVecInput = [&](const FString& VarName, const FString& ParamName)
+	{
+		UMaterialExpressionVectorParameter* V = NewObject<UMaterialExpressionVectorParameter>(Mat);
+		V->ParameterName = FName(*ParamName);
+		V->DefaultValue = FLinearColor(0.f, 0.f, 0.f, 0.f);
+		Mat->GetExpressionCollection().AddExpression(V);
+		AddExprInput(*VarName, V);
+	};
+	AddExprInput(TEXT("WorldPos"), WorldPos);
+	AddExprInput(TEXT("Count"), Count);
+	for (uint32 i = 0; i < LOGI_CLIP_MAX; ++i)
+	{
+		AddVecInput(FString::Printf(TEXT("C%u"), i), FString::Printf(TEXT("ClipBox%u_Center"), i));
+		AddVecInput(FString::Printf(TEXT("AX%u"), i), FString::Printf(TEXT("ClipBox%u_AxisX"), i));
+		AddVecInput(FString::Printf(TEXT("AY%u"), i), FString::Printf(TEXT("ClipBox%u_AxisY"), i));
+		AddVecInput(FString::Printf(TEXT("AZ%u"), i), FString::Printf(TEXT("ClipBox%u_AxisZ"), i));
+	}
+	Mat->GetExpressionCollection().AddExpression(Clip);
+	Ed->OpacityMask.Connect(0, Clip);
+
+	Mat->PostEditChange(); // compile (async in-editor; tiles briefly render unclipped until it finishes)
+	GlobeClipMaterial.Reset(Mat);
+	return Mat;
+}
+#endif
 
 UMaterialInstanceDynamic* ALogiBakedGeoTerrain::AcquireDebugMid()
 {
@@ -1190,7 +1401,16 @@ void ALogiBakedGeoTerrain::UpdateTileDebugDisplay(const FLogiStreamView& View)
 		}
 		if (Comp->GetMaterial(0) != Mid)
 		{
-			Comp->SetMaterial(0, Mid);
+			// In-place swap for tile components (C4c — a debug-view toggle re-bound EVERY tile, each a full
+			// proxy recreate + re-upload); the Nanite static-mesh lane keeps the engine path.
+			if (ULogiTileMeshComponent* TileComp = Cast<ULogiTileMeshComponent>(Comp))
+			{
+				TileComp->SetTileMaterial(Mid);
+			}
+			else
+			{
+				Comp->SetMaterial(0, Mid);
+			}
 		}
 		Mid->SetVectorParameterValue(TEXT("DebugColor"), DebugColorForTile(E, View));
 	}
@@ -1204,7 +1424,14 @@ void ALogiBakedGeoTerrain::RestoreTileMaterial(FTileEntry& Entry)
 		UMaterialInterface* Real = RealMaterialForTile(Entry);
 		if (Comp->GetMaterial(0) != Real)
 		{
-			Comp->SetMaterial(0, Real);
+			if (ULogiTileMeshComponent* TileComp = Cast<ULogiTileMeshComponent>(Comp))
+			{
+				TileComp->SetTileMaterial(Real); // recreate-on-swap (see SetTileMaterial)
+			}
+			else
+			{
+				Comp->SetMaterial(0, Real);
+			}
 		}
 	}
 	if (Entry.DebugMid.IsValid())
@@ -1216,6 +1443,13 @@ void ALogiBakedGeoTerrain::RestoreTileMaterial(FTileEntry& Entry)
 void ALogiBakedGeoTerrain::UpdateDebugTelemetry(const TCHAR* SourceLabel, int32 Rendered, int32 Resident,
 	int32 InFlight, const FString& Failures, int32 CachedMB)
 {
+	// Gate the O(built) sweep (audit 2026-06-10 §2): with neither the overlay nor a debug view active, this
+	// ran every step purely to refresh Details-panel fields — refresh those on a slow cadence instead (every
+	// 30th step keeps the panel readable when the actor is selected), and every step only when consumed.
+	if (!bShowDebugPanel && DebugView == EGeoDebugView::None && (HeartbeatCounter % 30u) != 0u)
+	{
+		return;
+	}
 	// One O(resident) pass: textured count + the depth & geometric-error spread the heatmaps normalize over.
 	int32 Textured = 0;
 	uint16 DepthLo = TNumericLimits<uint16>::Max();
@@ -1248,6 +1482,11 @@ void ALogiBakedGeoTerrain::UpdateDebugTelemetry(const TCHAR* SourceLabel, int32 
 	{
 		PoolTex += Bucket.Value.Num();
 	}
+	int32 PoolMids = 0;
+	for (const TPair<TObjectKey<UMaterialInterface>, TArray<TStrongObjectPtr<UMaterialInstanceDynamic>>>& Bucket : MidPool)
+	{
+		PoolMids += Bucket.Value.Num();
+	}
 
 	DbgStatus = FString::Printf(TEXT("%s  |  View: %s"), SourceLabel, GeoDebugViewName(DebugView));
 	DbgTilesRendered = Rendered;
@@ -1256,12 +1495,48 @@ void ALogiBakedGeoTerrain::UpdateDebugTelemetry(const TCHAR* SourceLabel, int32 
 	DbgTilesInFlight = InFlight;
 	DbgTilesDecoding = DecodingKeys.Num();
 	DbgTilesTextured = Textured;
-	DbgPools = FString::Printf(TEXT("%d / %d / %d"), ProcCompPool.Num(), MidPool.Num(), PoolTex);
+	DbgPools = FString::Printf(TEXT("%d / %d / %d"), ProcCompPool.Num(), PoolMids, PoolTex);
 	DbgGeoStepMs = FString::Printf(TEXT("%.2f / %.2f"), DbgGeoStepAvgMs, DbgGeoStepPeakMs);
 	DbgDepthRange = (Built > 0) ? FString::Printf(TEXT("%u - %u"), DebugDepthMin, DebugDepthMax) : TEXT("-");
 	DbgGeoErrorRange = (GeoHi > 0.0f) ? FString::Printf(TEXT("%.2f - %.1f m"), DebugGeoErrMin, DebugGeoErrMax) : TEXT("-");
 	DbgFailures = Failures;
 	DbgCachedMB = CachedMB;
+
+	// --- Cache / pool / texture-pipeline subtrees (the diagnosis panel, 2026-06-11) ----------------------
+	// One v16 telemetry-block read + a handful of Printfs — same cost class as the rows above.
+	auto HitMiss = [](uint64 Hits, uint64 Misses) {
+		const uint64 Total = Hits + Misses;
+		return Total == 0
+			? FString(TEXT("0 / 0"))
+			: FString::Printf(TEXT("%llu / %llu (%.1f%%)"), (unsigned long long)Hits, (unsigned long long)Misses,
+				100.0 * static_cast<double>(Hits) / static_cast<double>(Total));
+	};
+#if LOGI_BEVY_HAVE_GEO
+	LogiGlobeTelemetry T = {};
+	if (GlobeWorld != nullptr && logi_globe_world_telemetry(GlobeWorld, &T) == sizeof(T))
+	{
+		DbgFlashCache = FString::Printf(TEXT("%s | %llu MB"), *HitMiss(T.flash_hits, T.flash_misses),
+			(unsigned long long)(T.flash_bytes / (1024 * 1024)));
+		DbgDiskCache = FString::Printf(TEXT("%s | %llu MB"), *HitMiss(T.disk_hits, T.disk_misses),
+			(unsigned long long)(T.disk_bytes / (1024 * 1024)));
+		DbgPoolSlots = FString::Printf(TEXT("%llu / %d / %llu"), (unsigned long long)T.free_slots, Resident,
+			(unsigned long long)T.max_resident);
+		DbgPoolEvict = FString::Printf(TEXT("%llu / %llu"), (unsigned long long)T.evicted_total,
+			(unsigned long long)T.pool_exhausted_total);
+		DbgHolds = FString::Printf(TEXT("%llu / %llu / %llu / %llu / %llu / %llu"),
+			(unsigned long long)T.hold_kick, (unsigned long long)T.hold_dead, (unsigned long long)T.hold_loading,
+			(unsigned long long)T.hold_leaf_under_sse, (unsigned long long)T.hold_pending_subtree,
+			(unsigned long long)T.fetch_skip_grafted);
+	}
+#endif
+	DbgRetained = DepartedGrace.Num();
+	DbgTexPipeline = FString::Printf(TEXT("%u / %u / %u"),
+		TexStats->DecodeDispatched.load(std::memory_order_relaxed),
+		TexStats->DecodeJobOk.load(std::memory_order_relaxed),
+		TexStats->UploadConfirmed.load(std::memory_order_relaxed));
+	DbgTexDrops = FString::Printf(TEXT("%u / %u"),
+		TexStats->DrainDropEvicted.load(std::memory_order_relaxed),
+		TexStats->DrainDropDup.load(std::memory_order_relaxed));
 }
 
 void ALogiBakedGeoTerrain::RecordGeoStepMs(double Ms)
@@ -1462,7 +1737,7 @@ void ALogiBakedGeoTerrain::StepAndBuildBaked(const FLogiStreamView& View)
 				FVector3f(T.bounds_center[0], T.bounds_center[1], T.bounds_center[2]), T.bounds_radius);
 			if (UMaterialInterface* Mat = TerrainMaterial.Get())
 			{
-				Comp->SetMaterial(0, Mat);
+				Comp->SetTileMaterial(Mat); // override-only — SetTileGeometry's pending recreate reads it (C4c)
 			}
 			Entry.ProcComp.Reset(Comp);
 		}
@@ -1487,18 +1762,28 @@ void ALogiBakedGeoTerrain::StepAndBuildGlobe(const FLogiStreamView& View)
 {
 #if LOGI_BEVY_HAVE_GEO
 	const double StepT0 = FPlatformTime::Seconds(); // whole-step geo game-thread cost; also the per-frame budget origin
-	const double GeoDeadline = StepT0 + static_cast<double>(GeoBuildBudgetMs) * 0.001; // drain + build share this slice
+	const double GeoDeadline = StepT0 + static_cast<double>(GeoBuildBudgetMs) * 0.001; // the whole geo slice
+	// Guaranteed BUILD floor (audit D): cap the texture DRAIN at half the slice so a burst of finished atlas
+	// decodes can't consume the whole budget and starve mesh builds to ZERO this frame — the tile BUILD is the
+	// binding throughput constraint behind "fine tiles arrive but never reach the screen". The build phase
+	// below still passes the FULL GeoDeadline, so when the drain finishes early the builds claim the remainder;
+	// the floor only bites when the drain would otherwise overrun the whole slice.
+	const double DrainDeadline = StepT0 + static_cast<double>(GeoBuildBudgetMs) * 0.001 * 0.5;
 
 	// Apply any tile atlases finished by worker decodes since the last step. This only creates the UTexture2D +
 	// assigns the tile's MID (O(1) each) — the JPEG decode + mip build already happened off the game thread.
 	// Runs FIRST so already-decoded textures land promptly; it yields the moment it crosses the shared deadline.
-	DrainDecodedTextures(GeoDeadline);
+	DrainDecodedTextures(DrainDeadline);
 
 	// Advance the LOD cross-fade (bloom-in + held-tile recycle) EVERY step — including the camera-still frame-id skip
 	// below — so in-flight fades always complete. dt from the real-time clock, clamped so a hitch can't snap a fade.
-	const float FadeDt = (LastFadeStepSeconds > 0.0) ? static_cast<float>(FMath::Min(StepT0 - LastFadeStepSeconds, 0.1)) : 0.0f;
+	const float FadeDt = (LastFadeStepSeconds > 0.0) ? static_cast<float>(FMath::Min(StepT0 - LastFadeStepSeconds, 0.05)) : 0.0f;
 	LastFadeStepSeconds = StepT0;
-	if (FadingKeys.Num() > 0 || FadingOut.Num() > 0) { TickTileFades(FadeDt); }
+	if (FadingKeys.Num() > 0) { TickTileFades(FadeDt); }
+
+	// Drain the departed-grace cache EVERY step too (both reconcile paths + the frame-id skip): expired retained
+	// tiles recycle here, bounded — the grace cache is self-draining, never a reconcile backlog.
+	SweepRetainedTiles(StepT0);
 
 	// Planetary scale: the globe step takes the f64 world-cm camera directly (no f32 cast). The C++ side clamps
 	// the actor's Detail Target to 1–64 px here; Rust then uses this max_sse as-is (it passes it through untouched).
@@ -1517,11 +1802,29 @@ void ALogiBakedGeoTerrain::StepAndBuildGlobe(const FLogiStreamView& View)
 		View.Up.X, View.Up.Y, View.Up.Z,
 		Aspect, static_cast<double>(View.FovY), static_cast<double>(View.ViewportHeight), MaxSsePixels};
 	logi_globe_world_set_view(GlobeWorld, &GlobeView);
+	// Planet-true sun: keep the DirectionalLight at the camera's zenith (no-op while parked / unanchored).
+	UpdateSunZenith(View.Loc);
+	// Report the tiles we've fully TEXTURED to the Rust texture gate (only when the set changed). The selector keeps a
+	// tile's coarse parent rendered until the tile is in this set, so a refining tile never shows before it's textured
+	// (invisible LOD loading). Pushed BEFORE poll so this step's selection sees the latest textures.
+	if (bTexturedKeysDirty)
+	{
+		TexturedKeysScratch.Reset();
+		TexturedKeysScratch.Reserve(TexturedKeys.Num());
+		for (uint64 K : TexturedKeys) { TexturedKeysScratch.Add(K); }
+		logi_globe_world_set_textured_keys(GlobeWorld, TexturedKeysScratch.GetData(), static_cast<uint32>(TexturedKeysScratch.Num()));
+		bTexturedKeysDirty = false;
+	}
 	LogiGlobeFrame Frame{};
 	if (logi_globe_world_poll(GlobeWorld, &Frame) != LOGI_GEO_OK || (Frame.tile_count > 0 && Frame.tiles == nullptr))
 	{
 		return; // nothing published yet — leave resident tiles in place (no eviction)
 	}
+
+	// One v16 telemetry-block read serves the failure log, the heartbeat, and the debug panel below (the
+	// old per-counter accessors were deleted with ABI v16; the size return is the layout handshake).
+	LogiGlobeTelemetry Telemetry = {};
+	const bool bHaveTelemetry = logi_globe_world_telemetry(GlobeWorld, &Telemetry) == sizeof(Telemetry);
 
 	// Diagnostic: surface WHY a tile stays stuck at a coarse (blurry) ancestor. Two distinct classes:
 	//  - refinement couldn't DESCEND (graft_failed: a child tileset.json manifest didn't graft → its subtree
@@ -1529,22 +1832,23 @@ void ALogiBakedGeoTerrain::StepAndBuildGlobe(const FLogiStreamView& View)
 	//    no SSE target can sharpen it. These were SILENT before.
 	//  - a tile we DID try to load gave up (fetch_failed: bytes never arrived; decode_failed: didn't parse).
 	// Logged only when a count CHANGES, so it pinpoints the moment + kind without spamming the per-frame step.
+	if (bHaveTelemetry)
 	{
-		const uint64 Failed = logi_globe_world_failed_counts(GlobeWorld);
-		const uint64 Refine = logi_globe_world_refine_failures(GlobeWorld);
-		static uint64 LastFailed = 0;
-		static uint64 LastRefine = 0;
-		if (Failed != LastFailed || Refine != LastRefine)
+		// Packed into the v13-era change-detection members (two u64s) — only the comparison encoding, the
+		// values themselves now come from the telemetry block.
+		const uint64 Failed = ((Telemetry.decode_failed_total & 0xFFFFFFFFu) << 32) | (Telemetry.fetch_failed_total & 0xFFFFFFFFu);
+		const uint64 Refine = ((Telemetry.graft_failed_total & 0xFFFFFFFFu) << 32) | (Telemetry.url_resolve_failed_total & 0xFFFFFFFFu);
+		// Per-INSTANCE change detection (audit 2026-06-10 C8): function statics were shared across actor
+		// instances and persisted across PIE sessions (cross-talk + spurious first-change logs).
+		if (Failed != LastFailedCounts || Refine != LastRefineCounts)
 		{
-			const uint32 DecodeFailed = static_cast<uint32>(Failed >> 32);
-			const uint32 FetchFailed = static_cast<uint32>(Failed & 0xFFFFFFFFu);
-			const uint32 GraftFailed = static_cast<uint32>(Refine >> 32);
-			const uint32 ResolveFailed = static_cast<uint32>(Refine & 0xFFFFFFFFu);
 			UE_LOG(LogLogiBevy, Warning,
-				TEXT("Geo refine/load failures: graft_failed=%u (manifest didn't graft) url_resolve_failed=%u | fetch_failed=%u decode_failed=%u | resident=%u in_flight=%u"),
-				GraftFailed, ResolveFailed, FetchFailed, DecodeFailed, Frame.resident_tiles, Frame.in_flight);
-			LastFailed = Failed;
-			LastRefine = Refine;
+				TEXT("Geo refine/load failures: graft_failed=%llu (manifest didn't graft) url_resolve_failed=%llu | fetch_failed=%llu decode_failed=%llu | resident=%u in_flight=%u"),
+				(unsigned long long)Telemetry.graft_failed_total, (unsigned long long)Telemetry.url_resolve_failed_total,
+				(unsigned long long)Telemetry.fetch_failed_total, (unsigned long long)Telemetry.decode_failed_total,
+				Frame.resident_tiles, Frame.in_flight);
+			LastFailedCounts = Failed;
+			LastRefineCounts = Refine;
 		}
 	}
 
@@ -1554,12 +1858,31 @@ void ALogiBakedGeoTerrain::StepAndBuildGlobe(const FLogiStreamView& View)
 	// (raise fetch workers / in-flight cap); `in_flight` ~0 with a coarse scene ⇒ the selection settled
 	// (under-refining — SSE/frustum, not loading). Also exposes the TRUE render count vs "textures built".
 	{
-		static uint32 HeartbeatN = 0;
-		if (++HeartbeatN % 30u == 0u)
+		if (++HeartbeatCounter % 30u == 0u && bHaveTelemetry)
 		{
-			UE_LOG(LogLogiBevy, Log, TEXT("Geo stream: render=%u resident=%u in_flight=%u cached_mb=%llu"),
+			// Cache effectiveness rides the heartbeat (audit L1 — the counters existed with no consumer,
+			// leaving "are we even using the cache?" unanswerable from a session log). Each is hits/misses.
+			UE_LOG(LogLogiBevy, Log,
+				TEXT("Geo stream: render=%u resident=%u in_flight=%u | mem hit/miss/mb=%llu/%llu/%llu disk hit/miss/mb=%llu/%llu/%llu")
+				TEXT(" | pool free=%llu cap=%llu evicted=%llu starved=%llu | holds k/d/l/leaf/sub/graft=%llu/%llu/%llu/%llu/%llu/%llu | panics=%llu")
+				TEXT(" | tex disp=%u ok=%u empty=%u conf=%u drop(evict/dup)=%u/%u fail(rhi/mip/short/lock)=%u/%u/%u/%u retry=%u recyc=%u"),
 				Frame.tile_count, Frame.resident_tiles, Frame.in_flight,
-				static_cast<unsigned long long>(logi_globe_world_cached_bytes(GlobeWorld) / (1024 * 1024)));
+				(unsigned long long)Telemetry.flash_hits, (unsigned long long)Telemetry.flash_misses,
+				(unsigned long long)(Telemetry.flash_bytes / (1024 * 1024)),
+				(unsigned long long)Telemetry.disk_hits, (unsigned long long)Telemetry.disk_misses,
+				(unsigned long long)(Telemetry.disk_bytes / (1024 * 1024)),
+				(unsigned long long)Telemetry.free_slots, (unsigned long long)Telemetry.max_resident,
+				(unsigned long long)Telemetry.evicted_total, (unsigned long long)Telemetry.pool_exhausted_total,
+				(unsigned long long)Telemetry.hold_kick, (unsigned long long)Telemetry.hold_dead,
+				(unsigned long long)Telemetry.hold_loading, (unsigned long long)Telemetry.hold_leaf_under_sse,
+				(unsigned long long)Telemetry.hold_pending_subtree, (unsigned long long)Telemetry.fetch_skip_grafted,
+				(unsigned long long)Telemetry.step_panics,
+				TexStats->DecodeDispatched.load(std::memory_order_relaxed), TexStats->DecodeJobOk.load(std::memory_order_relaxed),
+				TexStats->DecodeJobEmpty.load(std::memory_order_relaxed), TexStats->UploadConfirmed.load(std::memory_order_relaxed),
+				TexStats->DrainDropEvicted.load(std::memory_order_relaxed), TexStats->DrainDropDup.load(std::memory_order_relaxed),
+				TexStats->UploadNoRhi.load(std::memory_order_relaxed), TexStats->UploadMipMismatch.load(std::memory_order_relaxed),
+				TexStats->UploadShortMip.load(std::memory_order_relaxed), TexStats->UploadLockFailed.load(std::memory_order_relaxed),
+				TexStats->UploadRetried.load(std::memory_order_relaxed), TexStats->UploadSurrendered.load(std::memory_order_relaxed));
 		}
 	}
 
@@ -1570,6 +1893,10 @@ void ALogiBakedGeoTerrain::StepAndBuildGlobe(const FLogiStreamView& View)
 	//    removed[], build added[]). Deltas are never repeated, so we take this path ONLY when we can apply it FULLY.
 	//  - otherwise (first frame / large burst / backlog) ⇒ re-scan the full visible list, which defers safely.
 	const bool bChanged = (Frame.frame_id != LastFrameId);
+	// Pure O(1) steady state = an unchanged frame that is already in sync; ANY other path reconciles, which also
+	// means a coarse stand-in's clip set may have changed and needs a refresh (captured before the block mutates
+	// bDeltaInSync).
+	const bool bSteadyStateSkip = !bChanged && bDeltaInSync;
 	if (!bChanged)
 	{
 		if (!bDeltaInSync)
@@ -1595,24 +1922,30 @@ void ALogiBakedGeoTerrain::StepAndBuildGlobe(const FLogiStreamView& View)
 		LastFrameId = Frame.frame_id;
 	}
 
+	// Hole-clip: a coarse stand-in's clip set grows as its children texture in (RETAINED tiles the delta path never
+	// revisits), so refresh every visible tile's clip params from the frame whenever the scene changed — skipped
+	// entirely in the O(1) unchanged-frame steady state.
+	if (!bSteadyStateSkip)
+	{
+		RefreshTileClips(Frame);
+	}
+
 	// Bounded atlas re-drive for built-but-untextured tiles (decode failures / not-yet-arrived). PendingTexture is
 	// tiny in steady state; it reaches a tile by key via logi_globe_world_tile_by_key (the delta path never visits
 	// already-resident tiles), so this never re-scans the frame.
 	DriveTileTextures(BuildBudget);
 
-	// Live telemetry + debug heatmaps. Pull the streaming give-up counters once more (cheap atomics) and pack
-	// them for the panel; the geo-step game-thread cost is now timed in Tick (RecordGeoStepMs), so this lane no
-	// longer keeps its own static avg/max timer. The depth + geometric-error ranges are computed over the
+	// Live telemetry + debug heatmaps. Pack the streaming give-up counters (already read into the v16 block
+	// above) for the panel; the geo-step game-thread cost is now timed in Tick (RecordGeoStepMs), so this lane
+	// no longer keeps its own static avg/max timer. The depth + geometric-error ranges are computed over the
 	// resident tiles inside UpdateDebugTelemetry; UpdateTileDebugDisplay then (re)colours them if a view is on.
 	{
-		const uint64 Failed = logi_globe_world_failed_counts(GlobeWorld);
-		const uint64 Refine = logi_globe_world_refine_failures(GlobeWorld);
-		const FString Failures = FString::Printf(TEXT("%u / %u / %u / %u"),
-			static_cast<uint32>(Failed & 0xFFFFFFFFu),  // fetch_failed
-			static_cast<uint32>(Failed >> 32),          // decode_failed
-			static_cast<uint32>(Refine >> 32),          // graft_failed
-			static_cast<uint32>(Refine & 0xFFFFFFFFu)); // url_resolve_failed
-		const int32 CachedMB = static_cast<int32>(logi_globe_world_cached_bytes(GlobeWorld) / (1024 * 1024));
+		const FString Failures = FString::Printf(TEXT("%llu / %llu / %llu / %llu"),
+			(unsigned long long)Telemetry.fetch_failed_total,
+			(unsigned long long)Telemetry.decode_failed_total,
+			(unsigned long long)Telemetry.graft_failed_total,
+			(unsigned long long)Telemetry.url_resolve_failed_total);
+		const int32 CachedMB = static_cast<int32>(Telemetry.disk_bytes / (1024 * 1024));
 		UpdateDebugTelemetry(TEXT("Google Tiles"), static_cast<int32>(Frame.tile_count),
 			static_cast<int32>(Frame.resident_tiles), static_cast<int32>(Frame.in_flight), Failures, CachedMB);
 	}
@@ -1623,11 +1956,81 @@ void ALogiBakedGeoTerrain::StepAndBuildGlobe(const FLogiStreamView& View)
 }
 
 #if LOGI_BEVY_HAVE_GEO
+// Per-tile atlas-decode retry cap, shared by ReconcileGlobeFull (full-pass re-drive) and DriveTileTextures
+// (steady-state re-drive) — both gate Entry->TextureAttempts against it, so it lives in one place to keep them
+// in lock-step. Past this many dispatches a tile is shown soft / by surrender (a permanently-undecodable atlas).
+static constexpr uint8 GMaxTextureAttempts = 4;
+
+// A tile's atlas is bound (or it has none / its decode surrendered) ⇒ it is texture-READY. Show it (it was built
+// HIDDEN as a "prepare" tile) and report it to the Rust texture gate via logi_globe_world_set_textured_keys so the
+// selector lets it replace its coarse parent. The reveal is a focus-pull: FadeAlpha ramps 0→1 (soft→sharp mip bias)
+// over GlobeFadeInSec, starting at ~the coarse parent's apparent detail so the LOD swap is imperceptible. Idempotent:
+// re-marking a shown tile just re-confirms its key (no second reveal).
+void ALogiBakedGeoTerrain::MarkTileTextured(uint64 Key, FTileEntry& Entry)
+{
+	// Visibility is NOT flipped here (atomic-reveal follow-up, 2026-06-10). This used to show the tile the
+	// moment its atlas bound — a LOCAL lifecycle that matched the old partial-reveal selection (Rust dropped
+	// or clipped the coarse parent as each child textured). Under the ATOMIC reveal, Rust keeps rendering the
+	// kicked parent until the WHOLE sibling set is textured, so a locally-shown child sat UNDER the parent —
+	// sustained coarse-over-fine z-fighting. Visibility now mirrors the published HIDDEN flag exclusively
+	// (`ApplyTileVisibility`, driven by the Rust gate — ADR-0005: Rust owns the cut; this side only reports
+	// readiness): this method just reports the texture so the gate can promote, and arms the reveal fade
+	// (started when the tile actually SHOWS).
+	(void)Entry;
+	if (!TexturedKeys.Contains(Key))
+	{
+		TexturedKeys.Add(Key);
+		bTexturedKeysDirty = true; // a poll-time push tells the gate this tile is ready (its coarse parent can drop)
+	}
+}
+
+// Mirror one published tile's HIDDEN flag onto its component, arming the focus-pull reveal on the
+// hidden->shown edge. The single home of globe-tile visibility: BuildGlobeTile (initial state),
+// RefreshTileClips (retained tiles each changed frame — the delta path never revisits them), and
+// ReconcileGlobeFull (full passes) all route here, so C++ can never show a tile the Rust gate hasn't
+// promoted (and the parent->children swap lands make-before-break within one poll).
+void ALogiBakedGeoTerrain::ApplyTileVisibility(uint64 Key, FTileEntry& Entry, uint32 TileFlags)
+{
+	const bool bShow = (TileFlags & LOGI_GLOBE_TILE_FLAG_HIDDEN) == 0;
+	if (bShow && Entry.FadeMode == EGlobeFade::WaitTexture)
+	{
+		// First reveal of this build: start the focus-pull (soft -> sharp) AT THE SHOW, not at texture-bind —
+		// under the atomic reveal a tile can sit textured-but-hidden while its siblings finish.
+		if (bGlobeTileFade)
+		{
+			Entry.FadeMode = EGlobeFade::FadingIn;
+			Entry.FadeT = 0.0f;
+			FadingKeys.Add(Key);
+			if (UMaterialInstanceDynamic* Mid = Entry.Material.Get())
+			{
+				Mid->SetScalarParameterValue(TEXT("FadeAlpha"), 0.0f);
+			}
+		}
+		else
+		{
+			Entry.FadeMode = EGlobeFade::None;
+		}
+	}
+	if (ULogiTileMeshComponent* Comp = Entry.ProcComp.Get())
+	{
+		Comp->SetTileVisible(bShow); // in-place (C4c); no-op when unchanged
+	}
+}
+
 // Build ONE globe tile into a fresh pooled component + placeholder MID, and kick off its atlas decode. Shared by
 // the delta (added[]) and full-reconcile paths; the caller guarantees Key is not already in `Tiles`. The geometry
 // hand-off is a flat byte copy + an O(1) proxy hand-off — the de-interleave + RHI upload run on the RENDER THREAD.
 void ALogiBakedGeoTerrain::BuildGlobeTile(const LogiGlobeTile& T)
 {
+	if (FTileEntry* Existing = Tiles.Find(T.tile_key))
+	{
+		// A retained (departed-grace) tile re-entering via the delta added[] path: still fully built — and, if it
+		// kept its texture, still textured. Cancel its grace and re-show per the published flag; no rebuild, no
+		// re-decode. (The full-reconcile path dedups before calling, so this guard is the delta path's.)
+		DepartedGrace.Remove(T.tile_key);
+		ApplyTileVisibility(T.tile_key, *Existing, T.flags);
+		return;
+	}
 	if (T.vertex_count == 0 || T.vertices == nullptr)
 	{
 		return; // a contentless selected node — nothing to build; the streamer refines past it
@@ -1647,61 +2050,192 @@ void ALogiBakedGeoTerrain::BuildGlobeTile(const LogiGlobeTile& T)
 	// draws that material's own flat colour rather than the engine's gray CHECKER default a material-less proxy
 	// falls back to. BaseColorTex is cleared because a pooled MID may still carry a previous tile's atlas.
 	// DrainDecodedTextures reuses THIS SAME MID. Base chosen by GlobeMaterialForTile (unlit vs lit).
-	if (UMaterialInterface* Base = GlobeMaterialForTile(T.flags))
+	if (UMaterialInterface* Base = GlobeMaterialForTile(T.flags, /*bWantClip=*/false))
 	{
 		if (UMaterialInstanceDynamic* Mid = AcquireMid(Base))
 		{
 			Mid->SetTextureParameterValue(TEXT("BaseColorTex"), nullptr);
-			// Depth-priority refinement via Pixel Depth Offset (DepthBiasCm = geometric error in cm): a coarser
-			// tile is pushed back more, so a finer tile wins the depth test where they overlap. No-op until
-			// M_LogiGlobeTile exposes DepthBiasCm → Pixel Depth Offset.
-			Mid->SetScalarParameterValue(TEXT("DepthBiasCm"), T.geometric_error * 100.0f);
-			Comp->SetMaterial(0, Mid);
+			// Geometric hole-clip (replaces the removed Pixel Depth Offset): the tile is built on the OPAQUE base
+			// here; ApplyTileClip (below) swaps it to the MASKED clip variant and sets the per-box OBB params IF
+			// this tile is a coarse stand-in over loaded finer tiles, so the renderer discards the coplanar overlap
+			// instead of depth-fighting it (a PDO large enough to separate real terrain shifts SkyAtmosphere depth).
+			Comp->SetTileMaterial(Mid); // override-only — SetTileGeometry's pending recreate reads it (C4c)
 			Entry.Material.Reset(Mid);
 		}
 	}
-	// LOD cross-fade init: a fading tile starts INVISIBLE (FadeAlpha 0) and blooms in once its atlas confirms (a
-	// held coarse tile covers it meanwhile, so there's no gray flash); a textureless tile has nothing to wait for,
-	// so it blooms from build. Fade off ⇒ FadeMode stays None and FadeAlpha keeps its material default (1, opaque).
-	if (bGlobeTileFade)
+	// Invisible LOD loading: a NEW tile is a "prepare" tile — the Rust texture gate is holding its coarse parent drawn
+	// OVER this tile's footprint until we report it textured, so the swap never flashes gray or sky. Build it HIDDEN
+	// and start FadeAlpha at 0 (soft); MarkTileTextured shows it + starts the focus-pull reveal once its atlas binds.
+	// Fade off ⇒ FadeAlpha stays at the material default (1, sharp), and the tile still only shows once ready.
+	Entry.FadeT = 0.0f;
+	Entry.FadeMode = EGlobeFade::WaitTexture; // hidden until textured (or marked ready just below for a textureless tile)
+	if (UMaterialInstanceDynamic* Mid = Entry.Material.Get())
 	{
-		Entry.FadeT = 0.0f;
-		Entry.FadeMode = (T.texture_jpeg_len > 0) ? EGlobeFade::WaitTexture : EGlobeFade::FadingIn;
-		// FadeAlpha 0 ⇒ the emissive shows the neutral placeholder; the tile is OPAQUE (never invisible) and develops
-		// to its atlas once textured (WaitTexture → FadingIn on confirm). A textureless tile develops from build.
-		// Only FadingIn tiles are ticked; a WaitTexture tile just shows the placeholder until its atlas arrives.
-		if (Entry.FadeMode == EGlobeFade::FadingIn) { FadingKeys.Add(T.tile_key); }
-		if (UMaterialInstanceDynamic* Mid = Entry.Material.Get())
-		{
-			Mid->SetScalarParameterValue(TEXT("FadeAlpha"), 0.0f);
-		}
+		Mid->SetScalarParameterValue(TEXT("FadeAlpha"), bGlobeTileFade ? 0.0f : 1.0f);
 	}
 	if (T.texture_jpeg_len > 0)
 	{
 		Entry.TextureAttempts = 1; // counts the dispatch below toward the per-tile retry cap
 	}
-	Tiles.Add(T.tile_key, MoveTemp(Entry));
+	FTileEntry& Stored = Tiles.Add(T.tile_key, MoveTemp(Entry));
+	// Initial visibility mirrors the published HIDDEN flag (usually hidden — a "prepare" tile the gate is
+	// still covering with its coarse parent; visible on a resync re-add of an already-promoted tile).
+	ApplyTileVisibility(T.tile_key, Stored, T.flags);
+	ApplyTileClip(Stored, T); // swap to the masked clip variant + set OBB params if this tile is a coarse stand-in
 
 	// Photoreal atlas: decode the JPEG + build the mip chain on a WORKER (off the game thread). Track the tile in
-	// PendingTexture so DriveTileTextures can bound-retry it if that decode fails or is slow.
+	// PendingTexture so DriveTileTextures can bound-retry it if that decode fails or is slow. A textureless tile has
+	// nothing to decode ⇒ it is texture-ready NOW: show it + report it to the gate so its coarse parent can drop.
 	if (T.texture_jpeg_len > 0)
 	{
 		DispatchTileDecode(T.tile_key, T.texture_jpeg, static_cast<int64>(T.texture_jpeg_len));
 		PendingTexture.Add(T.tile_key);
 	}
+	else
+	{
+		MarkTileTextured(T.tile_key, Stored);
+	}
 }
 
-// Recycle ONE tile by key (the delta removed[] path): a full teardown to the pool, O(1). Unlike the full path's
-// EvictDeparted, a delta removal is never repeated, so it is always a FULL recycle — never a hide-defer.
+// Geometric hole-clip: set this tile's clip OBB params on its MID, swapping the Opaque base <-> the MASKED clip
+// base on the 0<->nonzero transition (preserving the bound atlas + fade). A cheap param-only update otherwise.
+void ALogiBakedGeoTerrain::ApplyTileClip(FTileEntry& Entry, const LogiGlobeTile& T)
+{
+	const uint32 NewCount = FMath::Min<uint32>(T.clip_box_count, LOGI_CLIP_MAX);
+	// Clip only tiles with a BOUND atlas: the masked clip MID samples BaseColorTex for its emissive, so
+	// swapping an atlas-less tile (surrendered after the retry cap, or a rare textureless content) onto it
+	// renders the material's flat default colour with wedge cutouts — the "flat light-blue clipped tiles"
+	// in the 2026-06-10 ground screenshots. An unclipped stand-in (mild overdraw) beats a flat blue one.
+	const bool bWantClip = NewCount > 0 && GlobeClipMaterial.IsValid() && Entry.Texture.IsValid();
+	const bool bWasClip = Entry.ClipBoxCount > 0;
+
+	// Opaque <-> Masked is a BASE-MATERIAL change (BlendMode is per-material, not a MID param), so it needs a fresh
+	// MID over the other base — only on the 0<->nonzero edge, not when the clip set merely changes size. Preserve
+	// the tile's bound atlas + current fade so the swap is invisible.
+	if (bWantClip != bWasClip)
+	{
+		UMaterialInterface* Base = bWantClip ? GlobeClipMaterial.Get() : GlobeMaterialForTile(T.flags, /*bWantClip=*/false);
+		if (UMaterialInstanceDynamic* NewMid = AcquireMid(Base))
+		{
+			NewMid->SetTextureParameterValue(TEXT("BaseColorTex"), Entry.Texture.Get());
+			NewMid->SetScalarParameterValue(TEXT("FadeAlpha"), bGlobeTileFade ? Entry.FadeT : 1.0f);
+			if (ULogiTileMeshComponent* Comp = Entry.ProcComp.Get())
+			{
+				// Base swap = proxy recreate (SetTileMaterial): a material POINTER change cannot apply in
+				// place — the scene's cached static batch bakes the old material's render proxy in, and the
+				// re-cache path never re-runs DrawStaticElements (engine-verified 5.8). Clip-edge transitions
+				// are rare per tile; visibility flips (the common churn) stay in-place via SetTileVisible.
+				Comp->SetTileMaterial(NewMid);
+			}
+			if (UMaterialInstanceDynamic* OldMid = Entry.Material.Get())
+			{
+				RecycleMid(TStrongObjectPtr<UMaterialInstanceDynamic>(OldMid)); // bucketed by parent (C3)
+			}
+			Entry.Material.Reset(NewMid);
+		}
+	}
+
+	// Push the clip OBBs (no proxy churn) whenever clipping: center + 3 half-extent axes per box, in render
+	// space. The masked material discards fragments inside any box; ClipBoxCount bounds its per-pixel loop.
+	// Skipped when the applied set is BIT-IDENTICAL (the usual RefreshTileClips re-walk while a stand-in waits
+	// for more children): 17 render-thread param updates per clipping tile per poll for nothing was the only
+	// real cost left in this pass. CRC over the raw OBB bytes — tiny (≤192 B), and only for clipping tiles.
+	const uint32 NewHash =
+		bWantClip ? FCrc::MemCrc32(T.clip_boxes, NewCount * sizeof(LogiClipBox), NewCount) : 0;
+	if (bWantClip && (bWantClip != bWasClip || NewHash != Entry.ClipHash))
+	{
+		if (UMaterialInstanceDynamic* Mid = Entry.Material.Get())
+		{
+			// Param names are stable per slot — build the FName table ONCE instead of a Printf + FName-registry
+			// round trip per param per call (16 of them) on every clip update.
+			struct FClipParamNames
+			{
+				FName Count;
+				FName Center[LOGI_CLIP_MAX];
+				FName AxisX[LOGI_CLIP_MAX];
+				FName AxisY[LOGI_CLIP_MAX];
+				FName AxisZ[LOGI_CLIP_MAX];
+				FClipParamNames()
+				{
+					Count = FName(TEXT("ClipBoxCount"));
+					for (uint32 i = 0; i < LOGI_CLIP_MAX; ++i)
+					{
+						Center[i] = FName(*FString::Printf(TEXT("ClipBox%u_Center"), i));
+						AxisX[i] = FName(*FString::Printf(TEXT("ClipBox%u_AxisX"), i));
+						AxisY[i] = FName(*FString::Printf(TEXT("ClipBox%u_AxisY"), i));
+						AxisZ[i] = FName(*FString::Printf(TEXT("ClipBox%u_AxisZ"), i));
+					}
+				}
+			};
+			static const FClipParamNames Names;
+			Mid->SetScalarParameterValue(Names.Count, static_cast<float>(NewCount));
+			for (uint32 i = 0; i < NewCount; ++i)
+			{
+				const LogiClipBox& B = T.clip_boxes[i];
+				Mid->SetVectorParameterValue(Names.Center[i], FLinearColor(B.center[0], B.center[1], B.center[2]));
+				Mid->SetVectorParameterValue(Names.AxisX[i],
+					FLinearColor(B.half_axes[0][0], B.half_axes[0][1], B.half_axes[0][2]));
+				Mid->SetVectorParameterValue(Names.AxisY[i],
+					FLinearColor(B.half_axes[1][0], B.half_axes[1][1], B.half_axes[1][2]));
+				Mid->SetVectorParameterValue(Names.AxisZ[i],
+					FLinearColor(B.half_axes[2][0], B.half_axes[2][1], B.half_axes[2][2]));
+			}
+		}
+	}
+	// Record what was APPLIED, not what was requested: with the clip material unset, recording the requested
+	// count would leave bWasClip stuck true and re-run the base-swap branch (a fresh MID acquire) EVERY poll
+	// for every would-clip tile.
+	Entry.ClipBoxCount = bWantClip ? static_cast<uint8>(NewCount) : 0;
+	Entry.ClipHash = NewHash;
+}
+
+// Refresh every visible tile's clip params from the frame: the delta path never revisits a RETAINED coarse
+// stand-in whose clip set grows as its children texture in, so a per-poll pass keeps them current. Skipped in the
+// O(1) unchanged-frame steady state (clip sets are identical there); a not-yet-built backlog tile is set when it
+// builds; an already-recycled one is simply absent.
+void ALogiBakedGeoTerrain::RefreshTileClips(const LogiGlobeFrame& Frame)
+{
+	for (uint32 i = 0; i < Frame.tile_count; ++i)
+	{
+		const LogiGlobeTile& T = Frame.tiles[i];
+		if (FTileEntry* Entry = Tiles.Find(T.tile_key))
+		{
+			// Mirror the published HIDDEN flag (the Rust gate's promote/demote — the delta path never revisits
+			// retained tiles, and a visibility flip always comes with a changed frame id, so this pass is the
+			// flip's delivery). SetTileVisible no-ops when unchanged — steady state pays a flag compare.
+			ApplyTileVisibility(T.tile_key, *Entry, T.flags);
+			// Touch the MID only when this tile clips now or did last poll — the fully-refined common case is a
+			// pure skip (0 ⇒ 0), so steady state pays nothing even on the rare frame this pass runs.
+			if (T.clip_box_count > 0 || Entry->ClipBoxCount > 0)
+			{
+				ApplyTileClip(*Entry, T);
+			}
+		}
+	}
+}
+
+// Retire ONE tile by key (the delta removed[] path): same departed-grace semantics as EvictDeparted — hide in
+// place, retain component/texture/TexturedKeys until SweepRetainedTiles expires it (2026-06-10 oscillation fix;
+// the delta removal not being repeated is fine — the sweep runs every step regardless of reconcile path).
 void ALogiBakedGeoTerrain::RecycleByKey(uint64 Key)
 {
-	FTileEntry Entry;
-	if (Tiles.RemoveAndCopyValue(Key, Entry))
+	if (FTileEntry* Entry = Tiles.Find(Key))
 	{
-		RecycleTile(Entry); // texture-develop keeps tiles opaque, so no held cover is needed — recycle immediately
+		if (!DepartedGrace.Contains(Key))
+		{
+			DepartedGrace.Add(Key, FPlatformTime::Seconds());
+			if (ULogiTileMeshComponent* Comp = Entry->ProcComp.Get())
+			{
+				Comp->SetTileVisible(false); // in-place hide; stale coarse surface gone now, teardown later
+			}
+		}
+		FadingKeys.Remove(Key);
+		return;
 	}
+	// No entry (already swept, or never built): just clear the bookkeeping.
 	FadingKeys.Remove(Key);
 	PendingTexture.Remove(Key);
+	if (TexturedKeys.Remove(Key) > 0) { bTexturedKeysDirty = true; }
 }
 
 // O(Δ) delta apply: recycle the departed tiles, then build the newly-selected ones. The caller gated the counts
@@ -1729,9 +2263,12 @@ void ALogiBakedGeoTerrain::ApplyGlobeDelta(const LogiGlobeFrame& Frame)
 // next frame; any deferral keeps the lane on this path until the backlog drains.
 void ALogiBakedGeoTerrain::ReconcileGlobeFull(const LogiGlobeFrame& Frame, int32 BuildBudget, double GeoDeadline)
 {
-	constexpr uint8 MaxTextureAttempts = 4;
 	int32 TextureRedriveBudget = FMath::Max(1, TileBuildsPerStep);
 	bool bBuildDeferred = false;
+	// Collect the new tiles to BUILD, then build them priority-sorted below (audit D build-priority) instead of
+	// in arbitrary frame order — so a budget-limited backlog spends its slots on the most-valuable tiles first.
+	TArray<uint32> ToBuild;
+	ToBuild.Reserve(Frame.tile_count);
 
 	ResidentScratch.Empty(Frame.tile_count);
 	for (uint32 i = 0; i < Frame.tile_count; ++i)
@@ -1742,16 +2279,17 @@ void ALogiBakedGeoTerrain::ReconcileGlobeFull(const LogiGlobeFrame& Frame, int32
 
 		if (FTileEntry* Existing = Tiles.Find(Key))
 		{
-			// Re-show if an over-budget eviction frame hid it, then it re-entered before its full recycle.
-			if (ULogiTileMeshComponent* Comp = Existing->ProcComp.Get())
-			{
-				Comp->SetVisibility(true, /*bPropagateToChildren=*/false);
-			}
+			// Re-show ONLY a tile that's actually texture-READY. Re-showing unconditionally would un-hide a
+			// still-loading "prepare" tile (built HIDDEN by the invisible-loading gate) before its atlas binds →
+			// it draws untextured (flat), which the atmosphere then washes out. TexturedKeys.Contains is true
+			// exactly when MarkTileTextured has run (atlas bound, or textureless/surrendered), so prepare tiles
+			// stay hidden while genuinely-evicted-then-re-entered textured tiles still re-show.
+			ApplyTileVisibility(Key, *Existing, T.flags); // mirror the published HIDDEN flag (the Rust gate)
 			// RE-DRIVE a missing atlas (decode failed / starved / not yet arrived — or an external texture that
 			// only became available now). Bounded per frame + per tile; PendingTexture also tracks it for the
 			// steady-state retry.
 			if (!Existing->Texture.IsValid() && T.texture_jpeg_len > 0
-				&& Existing->TextureAttempts < MaxTextureAttempts
+				&& Existing->TextureAttempts < GMaxTextureAttempts
 				&& !DecodingKeys.Contains(Key) && !AwaitingTextureConfirm.Contains(Key)
 				&& TextureRedriveBudget > 0)
 			{
@@ -1766,13 +2304,24 @@ void ALogiBakedGeoTerrain::ReconcileGlobeFull(const LogiGlobeFrame& Frame, int32
 		{
 			continue;
 		}
+		ToBuild.Add(i); // defer the build to the priority-sorted pass below
+	}
+	// Build COARSEST-first (highest geometric_error): with a limited budget the region's COVERAGE lands before
+	// its fine detail (no holes while fine tiles trickle in), matching the top-down graft order. The E fetch
+	// concentration already makes the resident set the focal tiles; this just orders the build WITHIN it, so a
+	// backlogged frame spends its slots on coverage rather than an arbitrary frame-order slice.
+	ToBuild.Sort([&Frame](const uint32& A, const uint32& B) {
+		return Frame.tiles[A].geometric_error > Frame.tiles[B].geometric_error;
+	});
+	for (const uint32 BuildIdx : ToBuild)
+	{
 		if (BuildBudget <= 0 || FPlatformTime::Seconds() >= GeoDeadline)
 		{
-			bBuildDeferred = true; // a selected tile is NOT built this frame → backlog; stay on the full path
-			continue;
+			bBuildDeferred = true; // budget/deadline hit → the remaining (finer) tiles defer to next frame's backlog
+			break;
 		}
 		--BuildBudget;
-		BuildGlobeTile(T);
+		BuildGlobeTile(Frame.tiles[BuildIdx]);
 	}
 
 	const bool bEvictDeferred = EvictDeparted(ResidentScratch);
@@ -1791,7 +2340,6 @@ void ALogiBakedGeoTerrain::DriveTileTextures(int32 Budget)
 	{
 		return;
 	}
-	constexpr uint8 MaxTextureAttempts = 4;
 	TArray<uint64, TInlineAllocator<32>> Done; // keys to drop (textured / evicted / gave up) — removed after the loop
 	int32 Dispatched = 0;
 	for (uint64 Key : PendingTexture)
@@ -1806,9 +2354,12 @@ void ALogiBakedGeoTerrain::DriveTileTextures(int32 Budget)
 		{
 			continue; // a decode is in flight, or its upload is awaiting GPU-resident confirmation — wait for it
 		}
-		if (Entry->TextureAttempts >= MaxTextureAttempts)
+		if (Entry->TextureAttempts >= GMaxTextureAttempts)
 		{
-			Done.Add(Key); // gave up after the retry cap — leave it on its placeholder
+			// Gave up after the retry cap. Show + report it anyway (texture-ready by surrender) so the Rust gate stops
+			// holding its coarse parent — one soft tile beats a region pinned coarse forever.
+			MarkTileTextured(Key, *Entry);
+			Done.Add(Key);
 			continue;
 		}
 		if (Dispatched >= Budget)
@@ -1846,7 +2397,7 @@ void ALogiBakedGeoTerrain::TickTileFades(float DeltaSeconds)
 		for (uint64 Key : FadingKeys)
 		{
 			FTileEntry* E = Tiles.Find(Key);
-			if (E == nullptr) { DoneFading.Add(Key); continue; } // evicted / held while fading — drop it from the set
+			if (E == nullptr) { DoneFading.Add(Key); continue; } // evicted while fading — drop it from the set
 			if (E->FadeMode == EGlobeFade::WaitTexture)
 			{
 				// The atlas will never arrive (decode gave up) ⇒ bloom in on the placeholder rather than stay
@@ -1865,94 +2416,303 @@ void ALogiBakedGeoTerrain::TickTileFades(float DeltaSeconds)
 		}
 		for (uint64 Key : DoneFading) { FadingKeys.Remove(Key); }
 	}
-
-	// Hold OUT: count down each parked coarse tile; recycle it once its finer replacements have bloomed in over it
-	// (by which point it is fully occluded, so its removal is invisible).
-	if (FadingOut.Num() > 0)
-	{
-		TArray<uint64, TInlineAllocator<32>> Expired;
-		for (TPair<uint64, FTileEntry>& Pair : FadingOut)
-		{
-			Pair.Value.HoldRemaining -= DeltaSeconds;
-			if (Pair.Value.HoldRemaining <= 0.0f) { Expired.Add(Pair.Key); }
-		}
-		for (uint64 Key : Expired)
-		{
-			FTileEntry Entry;
-			if (FadingOut.RemoveAndCopyValue(Key, Entry)) { RecycleTile(Entry); }
-		}
-	}
 }
 #endif // LOGI_BEVY_HAVE_GEO
 
 bool ALogiBakedGeoTerrain::EvictDeparted(const TSet<uint64>& Resident)
 {
+	const double Now = FPlatformTime::Seconds();
+	// Tiles back in the cut leave grace untouched-by-recycle: still built, still textured, nothing to redo.
+	// (ReconcileGlobeFull's Existing branch re-shows them via the published flag in the same pass.)
+	for (TMap<uint64, double>::TIterator It(DepartedGrace); It; ++It)
+	{
+		if (Resident.Contains(It->Key))
+		{
+			It.RemoveCurrent();
+		}
+	}
 	DepartedScratch.Reset();
 	for (const TPair<uint64, FTileEntry>& Pair : Tiles)
 	{
-		if (!Resident.Contains(Pair.Key))
+		if (!Resident.Contains(Pair.Key) && !DepartedGrace.Contains(Pair.Key))
 		{
 			DepartedScratch.Add(Pair.Key);
 		}
 	}
-	// Spread teardown across steps: a camera move can depart hundreds of tiles at once, and unregistering them
-	// all in one frame is its own spike. Each eviction is O(1) (recycle to the pool), so the cap is generous;
-	// any leftover departed tiles keep rendering harmlessly and evict on the following steps. Returns whether any
-	// teardown was DEFERRED (hidden, not recycled) — the globe delta path treats that as a backlog.
-	int32 EvictBudget = FMath::Max(1, TileEvictionsPerStep);
-	bool bDeferred = false;
+	// RETIRE, don't recycle (2026-06-10 oscillation fix — see TileRetainSeconds): hide the departed tile in
+	// place and start its grace. Crucially its TexturedKeys report is KEPT — the instant recycle's un-texturing
+	// is what re-held ancestors in the Rust gate and flipped the cut back, re-decoding the flap edge forever.
+	// Hiding now (not at recycle) still removes a de-selected coarse ancestor's stale surface immediately, so
+	// the old hide-defer's z-fight protection is preserved. The actual teardown happens in SweepRetainedTiles.
 	for (uint64 Key : DepartedScratch)
 	{
-		if (EvictBudget > 0)
+		DepartedGrace.Add(Key, Now);
+		if (FTileEntry* Entry = Tiles.Find(Key))
 		{
-			FTileEntry Entry;
-			if (!Tiles.RemoveAndCopyValue(Key, Entry))
-			{
-				continue;
-			}
-			--EvictBudget;
-			RecycleTile(Entry); // texture-develop keeps tiles opaque — no held cover needed
-			FadingKeys.Remove(Key);
-			PendingTexture.Remove(Key);
-		}
-		else if (FTileEntry* Entry = Tiles.Find(Key))
-		{
-			// Over the per-frame teardown budget: HIDE the departed tile NOW (full recycle happens on a later
-			// frame). A de-selected coarse ancestor would otherwise keep drawing OVER its fine children for the
-			// few frames until its recycle (coarse-over-fine overlap / z-fight during a fast descent); hiding it
-			// immediately removes the stale low-detail surface without the cost of a full teardown this frame.
-			bDeferred = true;
 			if (ULogiTileMeshComponent* Comp = Entry->ProcComp.Get())
 			{
-				Comp->SetVisibility(false, /*bPropagateToChildren=*/false);
+				Comp->SetTileVisible(false); // in-place hide (C4c — the engine path re-uploaded per flip)
 			}
 		}
 	}
-	return bDeferred;
+	// Retiring is complete handling for this frame (the sweep self-drains every step) — no reconcile backlog.
+	return false;
 }
 
-void ALogiBakedGeoTerrain::HoldFadingOut(uint64 Key, FTileEntry&& Entry)
+void ALogiBakedGeoTerrain::SweepRetainedTiles(double Now)
 {
-	// ONLY a TEXTURED tile can cover its replacements' bloom with real imagery. An UNtextured tile forced opaque
-	// would render as a flat white/gray placeholder — and during a fast zoom-in, tiles get refined away before they
-	// finish texturing, so holding those opaque paints the whole globe white. Recycle untextured tiles immediately
-	// (their replacements simply bloom over whatever textured ancestor is still resident). Also bound the held set:
-	// a fast pan departs hundreds of tiles/sec and holding them all would balloon VRAM — past the cap, recycle now.
-	constexpr int32 MaxHeld = 512;
-	if (!Entry.Texture.IsValid() || (FadingOut.Num() >= MaxHeld && !FadingOut.Contains(Key)))
+	if (DepartedGrace.Num() == 0)
 	{
-		RecycleTile(Entry);
 		return;
 	}
-	// If this key is somehow already held (rapid remove→re-add→remove), recycle the older one first so its
-	// component isn't leaked when the map entry is overwritten below.
-	if (FTileEntry* Old = FadingOut.Find(Key)) { RecycleTile(*Old); }
-	// Force it fully opaque so it actually COVERS the bloom (a textured tile refined away mid-bloom would otherwise
-	// still be partly transparent → a hole); it no longer fades.
-	if (UMaterialInstanceDynamic* Mid = Entry.Material.Get()) { Mid->SetScalarParameterValue(TEXT("FadeAlpha"), 1.0f); }
-	Entry.FadeMode = EGlobeFade::None;
-	Entry.HoldRemaining = FMath::Max(0.05f, GlobeParentHoldSec);
-	FadingOut.Add(Key, MoveTemp(Entry));
+	// Collect due keys: grace expired, or — over budget — oldest first regardless of age. O(retained) scan per
+	// step (retained is budget-capped); the sort only runs in the over-budget case, on the small scratch.
+	DepartedScratch.Reset();
+	const double Cutoff = Now - static_cast<double>(FMath::Max(0.0f, TileRetainSeconds));
+	for (const TPair<uint64, double>& Pair : DepartedGrace)
+	{
+		if (Pair.Value <= Cutoff)
+		{
+			DepartedScratch.Add(Pair.Key);
+		}
+	}
+	const int32 OverBudget = DepartedGrace.Num() - FMath::Max(0, TileRetainBudget);
+	if (OverBudget > DepartedScratch.Num())
+	{
+		// Need more than the age-expired set: take the oldest OverBudget entries outright.
+		TArray<TPair<uint64, double>> ByAge;
+		ByAge.Reserve(DepartedGrace.Num());
+		for (const TPair<uint64, double>& Pair : DepartedGrace) { ByAge.Add(Pair); }
+		ByAge.Sort([](const TPair<uint64, double>& A, const TPair<uint64, double>& B) { return A.Value < B.Value; });
+		DepartedScratch.Reset();
+		for (int32 i = 0; i < OverBudget; ++i) { DepartedScratch.Add(ByAge[i].Key); }
+	}
+	// Spread teardown across steps: each recycle is O(1) but unregistering hundreds in one frame is a spike.
+	// Leftovers stay hidden in grace and go on following steps. This is the ONE place a departed tile's
+	// TexturedKeys report is withdrawn — long after the cut moved on, so the gate sees a quiet, batched change.
+	int32 EvictBudget = FMath::Max(1, TileEvictionsPerStep);
+	for (uint64 Key : DepartedScratch)
+	{
+		if (EvictBudget-- <= 0)
+		{
+			break;
+		}
+		DepartedGrace.Remove(Key);
+		FTileEntry Entry;
+		if (Tiles.RemoveAndCopyValue(Key, Entry))
+		{
+			RecycleTile(Entry);
+		}
+		FadingKeys.Remove(Key);
+		PendingTexture.Remove(Key);
+		if (TexturedKeys.Remove(Key) > 0) { bTexturedKeysDirty = true; } // un-report it (a return re-textures)
+	}
+}
+
+// (The HoldFadingOut "park the refined-away parent" lane was deleted here: it had no remaining caller — the
+// Rust texture gate + the geometric hole-clip keep the coarse stand-in rendered and clipped until its
+// replacements are textured, so departed tiles recycle immediately in RecycleByKey / EvictDeparted.)
+
+bool ALogiBakedGeoTerrain::GetBenchMetrics(FLogiGeoBenchMetrics& Out)
+{
+	Out = FLogiGeoBenchMetrics{};
+	// Engine-frame costs first (always available). Thread times are cycle counters; GPU time arrives via the
+	// RHI's end-of-frame query. Draw calls/primitives are the RHI's last-completed-frame counters for GPU 0.
+	Out.DrawCalls = GNumDrawCallsRHI[0];
+	Out.PrimitivesDrawn = GNumPrimitivesDrawnRHI[0];
+	Out.GameThreadMs = FPlatformTime::ToMilliseconds(GGameThreadTime);
+	Out.RenderThreadMs = FPlatformTime::ToMilliseconds(GRenderThreadTime);
+	Out.GpuMs = FPlatformTime::ToMilliseconds(RHIGetGPUFrameCycles());
+	Out.GeoStepAvgMs = DbgGeoStepAvgMs;
+	Out.GeoStepPeakMs = DbgGeoStepPeakMs;
+
+	// Per-tile aggregates over the built set: O(built) payload-size reads, no render-thread traffic.
+	for (const TPair<uint64, FTileEntry>& Pair : Tiles)
+	{
+		if (const ULogiTileMeshComponent* Comp = Pair.Value.ProcComp.Get())
+		{
+			uint64 Verts = 0, Tris = 0;
+			Comp->GetTileGeometryStats(Verts, Tris);
+			Out.BuiltVerts += Verts;
+			Out.BuiltTris += Tris;
+			if (Comp->IsVisible())
+			{
+				++Out.VisibleComps;
+				Out.VisibleVerts += Verts;
+				Out.VisibleTris += Tris;
+			}
+		}
+	}
+	Out.Built = Tiles.Num();
+	Out.Retained = DepartedGrace.Num();
+	Out.Decoding = DecodingKeys.Num();
+	Out.PendingTexture = PendingTexture.Num();
+	Out.PendingBinds = PendingBinds.Num();
+	Out.AwaitingConfirm = AwaitingTextureConfirm.Num();
+	Out.Fading = FadingKeys.Num();
+	Out.Textured = TexturedKeys.Num();
+	Out.FrameId = LastFrameId;
+	// Texture-pipeline outcome counters (lock-free; relaxed is fine — these are statistics, not a handshake).
+	Out.DecodeDispatched = TexStats->DecodeDispatched.load(std::memory_order_relaxed);
+	Out.DecodeJobOk = TexStats->DecodeJobOk.load(std::memory_order_relaxed);
+	Out.DecodeJobEmpty = TexStats->DecodeJobEmpty.load(std::memory_order_relaxed);
+	Out.DrainDropEvicted = TexStats->DrainDropEvicted.load(std::memory_order_relaxed);
+	Out.DrainDropDup = TexStats->DrainDropDup.load(std::memory_order_relaxed);
+	Out.UploadConfirmed = TexStats->UploadConfirmed.load(std::memory_order_relaxed);
+	Out.UploadNoRhi = TexStats->UploadNoRhi.load(std::memory_order_relaxed);
+	Out.UploadMipMismatch = TexStats->UploadMipMismatch.load(std::memory_order_relaxed);
+	Out.UploadShortMip = TexStats->UploadShortMip.load(std::memory_order_relaxed);
+	Out.UploadLockFailed = TexStats->UploadLockFailed.load(std::memory_order_relaxed);
+	Out.UploadRetried = TexStats->UploadRetried.load(std::memory_order_relaxed);
+	Out.UploadSurrendered = TexStats->UploadSurrendered.load(std::memory_order_relaxed);
+
+#if LOGI_BEVY_HAVE_GEO
+	if (GlobeWorld != nullptr)
+	{
+		// NEVER poll here: logi_globe_world_poll is the single-consumer frame intake with valid-until-next-poll
+		// semantics — an extra poll would consume a New frame and advance the FFI's delta baseline behind
+		// StepAndBuildGlobe's back (its next poll would read `Same` with EMPTY deltas and mark the frame applied
+		// without applying it — silent reconcile corruption). The per-frame numbers come from the step's own
+		// cached telemetry; only the v16 telemetry block is read here (a brief lock, no frame intake).
+		Out.Rendered = DbgTilesRendered;
+		Out.Resident = DbgTilesResident;
+		Out.InFlight = DbgTilesInFlight;
+		LogiGlobeTelemetry T = {};
+		if (logi_globe_world_telemetry(GlobeWorld, &T) != sizeof(T))
+		{
+			return false; // layout handshake failed — DLL/header mismatch; the bench must not record garbage
+		}
+		Out.DecodeFailed = static_cast<uint32>(T.decode_failed_total);
+		Out.FetchFailed = static_cast<uint32>(T.fetch_failed_total);
+		Out.GraftFailed = static_cast<uint32>(T.graft_failed_total);
+		Out.UrlResolveFailed = static_cast<uint32>(T.url_resolve_failed_total);
+		Out.HoldKick = static_cast<uint32>(T.hold_kick);
+		Out.HoldDead = static_cast<uint32>(T.hold_dead);
+		Out.HoldLoading = static_cast<uint32>(T.hold_loading);
+		Out.HoldLeafUnderSse = static_cast<uint32>(T.hold_leaf_under_sse);
+		Out.HoldPendingSubtree = static_cast<uint32>(T.hold_pending_subtree);
+		Out.FetchSkipGrafted = static_cast<uint32>(T.fetch_skip_grafted);
+		Out.FlashMB = static_cast<uint32>(T.flash_bytes / (1024 * 1024));
+		Out.FreeSlots = static_cast<uint32>(T.free_slots);
+		Out.ResidentCap = static_cast<uint32>(T.max_resident);
+		Out.EvictedTotal = static_cast<uint32>(T.evicted_total);
+		Out.PoolStarved = static_cast<uint32>(T.pool_exhausted_total);
+		Out.FlashHits = T.flash_hits;
+		Out.FlashMisses = T.flash_misses;
+		Out.DiskHits = T.disk_hits;
+		Out.DiskMisses = T.disk_misses;
+		Out.DiskCachedMB = T.disk_bytes / (1024 * 1024);
+		return true;
+	}
+#endif
+	return false;
+}
+
+void ALogiBakedGeoTerrain::AnchorSkyToPlanet()
+{
+#if LOGI_BEVY_HAVE_GEO
+	if (!bAnchorSkyToPlanet || GlobeWorld == nullptr)
+	{
+		return;
+	}
+	// [earth_center_x_cm, earth_center_y_cm, earth_center_z_cm, geocentric_radius_km] — Rust kernel
+	// geodesy (ABI v15), the same ENU/UE mapping every streamed vertex was rebased with.
+	double Anchor[4] = {0.0, 0.0, 0.0, 0.0};
+	if (logi_globe_world_sky_anchor(GlobeWorld, Anchor, 4) != 4)
+	{
+		return;
+	}
+	const FVector EarthCenter(Anchor[0], Anchor[1], Anchor[2]);
+	const float RadiusKm = static_cast<float>(Anchor[3]);
+	SkyEarthCenterUE = EarthCenter;
+	bSkyAnchored = true; // the sun-zenith update keys off the same planet model
+	for (TActorIterator<ASkyAtmosphere> It(GetWorld()); It; ++It)
+	{
+		ASkyAtmosphere* Sky = *It;
+		USkyAtmosphereComponent* Comp = Sky->GetComponent();
+		if (Comp == nullptr)
+		{
+			continue;
+		}
+		// PlanetCenterAtComponentTransform + the actor AT the earth center + the origin's geocentric radius:
+		// the atmosphere (and the VolumetricCloud layer, which follows the atmosphere's planet) now curves
+		// with the streamed WGS84 globe instead of a fixed sphere pinned at the UE origin. The residual is
+		// the sphere-vs-ellipsoid difference (±~7 km by latitude) — absorbed later by the ellipsoid-depth AP
+		// pass; the gross ±15 km misplacement (clouds on station cameras, detached limb) is gone.
+		Sky->Modify(); // transactional in-editor (undoable; marks the level dirty so the anchor can be saved)
+		if (USceneComponent* Root = Sky->GetRootComponent(); Root != nullptr && Root->Mobility != EComponentMobility::Movable)
+		{
+			// SetActorLocation refuses Static actors in PIE/game worlds; the atmosphere isn't light-baked,
+			// so Movable costs nothing and the anchor works in every world type.
+			Root->SetMobility(EComponentMobility::Movable);
+		}
+		Sky->SetActorLocation(EarthCenter);
+		Comp->TransformMode = ESkyAtmosphereTransformMode::PlanetCenterAtComponentTransform;
+		Comp->SetBottomRadius(RadiusKm); // marks the render state dirty (re-creates the sky proxy)
+		Comp->MarkRenderStateDirty();    // TransformMode has no setter — make sure the proxy re-reads it
+		UE_LOG(LogLogiBevy, Log,
+			TEXT("Sky anchored to planet: %s center=(%.0f, %.0f, %.0f) cm, ground radius %.4f km."),
+			*Sky->GetName(), EarthCenter.X, EarthCenter.Y, EarthCenter.Z, RadiusKm);
+	}
+	// Exponential height fog is a FLAT-WORLD slab keyed to absolute UE Z — on the curved globe every region
+	// away from the ENU origin sinks kilometres below z=0 and saturates to max-opacity fog (rio ≈ −5,600 km ⇒
+	// the uniform veil burying the ground at every distant station, and the slab's flat boundary = the
+	// sharp-edged white wedges in earlier shots). A planet has no horizontal fog slab: disable it with the
+	// anchor and let the (now planet-true) aerial perspective carry the distance haze; a planet-aware
+	// near-ground haze can return with the ellipsoid-depth AP pass.
+	for (TActorIterator<AExponentialHeightFog> It(GetWorld()); It; ++It)
+	{
+		AExponentialHeightFog* Fog = *It;
+		if (UExponentialHeightFogComponent* FogComp = Fog->GetComponent(); FogComp != nullptr && FogComp->IsVisible())
+		{
+			Fog->Modify();
+			FogComp->SetVisibility(false);
+			UE_LOG(LogLogiBevy, Log,
+				TEXT("Sky anchored to planet: height fog '%s' disabled (flat-world slab on a curved globe)."),
+				*Fog->GetName());
+		}
+	}
+#endif
+}
+
+void ALogiBakedGeoTerrain::UpdateSunZenith(const FVector& CamUE)
+{
+	if (!bSkyAnchored || !bSunAtCameraZenith)
+	{
+		return;
+	}
+	const FVector Up = (CamUE - SkyEarthCenterUE).GetSafeNormal();
+	if (Up.IsNearlyZero())
+	{
+		return;
+	}
+	if (!SunLightCache.IsValid())
+	{
+		for (TActorIterator<ADirectionalLight> It(GetWorld()); It; ++It)
+		{
+			SunLightCache = *It; // the level has one sun; first hit is it
+			break;
+		}
+		if (!SunLightCache.IsValid())
+		{
+			return;
+		}
+	}
+	ADirectionalLight* Sun = SunLightCache.Get();
+	// Light direction = travel direction = straight DOWN the camera's geocentric up (local solar noon —
+	// matches the ~noon sun P3DT bakes into its albedo). Skip sub-0.1° changes: a parked camera re-orients
+	// nothing, so the atmosphere/cloud LUTs only churn while actually flying.
+	const FVector Target = -Up;
+	const FVector Current = Sun->GetActorRotation().Vector();
+	if (FVector::DotProduct(Current, Target) > 0.9999985) // cos(0.1°)
+	{
+		return;
+	}
+	if (USceneComponent* Root = Sun->GetRootComponent(); Root != nullptr && Root->Mobility != EComponentMobility::Movable)
+	{
+		Root->SetMobility(EComponentMobility::Movable); // a planet-true sun is dynamic by definition
+	}
+	Sun->SetActorRotation(Target.Rotation());
 }
 
 void ALogiBakedGeoTerrain::ReleaseWorld()
@@ -1980,6 +2740,7 @@ void ALogiBakedGeoTerrain::ReloadTerrain()
 	TerrainMaterial.Reset();   // re-resolve (displacement toggle/material/scale, or the Source, may have changed)
 	GlobeBaseMaterial.Reset();
 	GlobeLitMaterial.Reset();
+	GlobeClipMaterial.Reset();
 	bMaterialResolveAttempted = false;
 	bWarnedNoGlobeMaterial = false;
 	bWarnedNoLitGlobeMaterial = false;
@@ -2043,6 +2804,7 @@ void ALogiBakedGeoTerrain::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	TerrainMaterial.Reset();
 	GlobeBaseMaterial.Reset();
 	GlobeLitMaterial.Reset();
+	GlobeClipMaterial.Reset();
 	DebugMaterial.Reset();
 	ReleaseWorld();
 	Super::EndPlay(EndPlayReason);

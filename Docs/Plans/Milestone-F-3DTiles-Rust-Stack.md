@@ -54,8 +54,9 @@ per-tile texture render path; the `AGI_HQ.kmz` validation target.
 (`logi_3dtiles_ion` — ion is the chosen data source).
 
 **Out of scope (defer):** raster/imagery overlays, GeoJSON/vector, **full** ion OAuth / iTwin auth
-clients (only the minimal asset-endpoint resolver is in v1), S2-cell bounding volumes, ADD-refinement
-edge cases, multi-tileset weighted round-robin. (All are additive on the v1 trait surface.)
+clients (only the minimal asset-endpoint resolver is in v1), S2-cell bounding volumes,
+multi-tileset weighted round-robin. (All are additive on the v1 trait surface.) **(2026-06-09: ADD
+refinement is now implemented — REPLACE/ADD per-tile, inherited — so it is no longer out of scope.)**
 
 **Rejected — UE 5.8 "Mesh Terrain Mode" as a render backend.** Source-verified: it is an **editor-only
 authoring mode** (`MeshTerrainMode` is an `"Type": "Editor"` module over the `MeshPartition` "MegaMesh"
@@ -140,8 +141,9 @@ works" and "render a textured building / photoreal tile."
 
 - **Draco = the one FFI exception.** No usable pure-Rust Draco *decoder* exists (`draco-oxide` is
   encoder-only; `draco_decoder` is itself a C++ FFI). Vendor a thin **`cc`-compiled Draco C++ decode
-  shim inside `logi_gltf`** — single function `decode_draco(bytes, attrs) -> {pos,nrm,uv,idx}`,
-  decode-only, plain-data in/out, on Rust worker threads, statically linked into the existing cdylib.
+  shim in the standalone `logi_draco` crate (a dependency of `logi_gltf`)** — single function
+  `logi_draco::decode_mesh(data, &DracoAttributeIds, DecodeLimits) -> Result<DracoMesh>` yielding
+  pos/nrm/uv/idx, decode-only, plain-data in/out, on Rust worker threads, statically linked into the existing cdylib.
   It does **not** violate the FFI law (no Unreal types cross; plain data). Document it as an explicit,
   revisitable exception in ADR-0009. (`basis-universal` and `meshopt` are also C++-backed but are
   standard accepted Rust crates — not special cases.)
@@ -265,6 +267,9 @@ New crates under `Rust/crates/`, in dependency order (implement top-down):
 
 **Feature flags:** `synthetic` (the retired procgen lane, on for tests/offline), `ion`, `draco` (gate the
 C++ shim so a no-Draco build still compiles). `cargo test --workspace` runs `synthetic` for determinism.
+[correction 2026-06-09: the `draco` feature was never built — Draco compiles unconditionally in
+`logi_draco`, because the production P3DT lane is entirely Draco-compressed geometry and a no-Draco geo
+build has no use. The as-built optional feature on the io side is `cyper-h2` (the h3/QUIC fetch lane).]
 
 ### 9.2 The selection traversal (the M3 core — port faithfully)
 
@@ -311,8 +316,9 @@ golden-test it (9.5).
 > direction, since UE casts shadows from a larger-than-view frustum; only distance hard-culls). The camera
 > basis (forward + up + aspect) is plumbed UE→Rust as **ABI v5** (a `LogiGlobeView` struct; the deprecated
 > globe `step` shim was removed). Golden 3-frame trace + per-result-state + fallback-load + priority + frustum
-> (math + in-view-vs-off-view) unit tests are in place (9.5). **Still deferred:** `ADD` refinement (warned +
-> treated as REPLACE — no ADD tileset in the pipeline to validate). A tighter **dilated shadow frustum**
+> (math + in-view-vs-off-view) unit tests are in place (9.5). **ADD refinement is implemented**
+> (REPLACE/ADD per-tile, inherited — a parent's refinement mode propagates to children; an ADD tile renders
+> *together with* its children, a REPLACE tile is replaced by them). A tighter **dilated shadow frustum**
 > (pulled toward the light, clamped to CSM distance) could later hard-cull more off-view tiles once the light
 > direction is plumbed; today off-view stays a conservative coarse shell.
 

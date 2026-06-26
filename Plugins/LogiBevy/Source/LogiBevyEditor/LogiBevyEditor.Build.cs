@@ -1,5 +1,6 @@
 // Copyright LogiUE. All Rights Reserved.
 
+using System.IO;
 using UnrealBuildTool;
 
 // LogiBevyEditor: authoring / import / editor-only tooling for the Bevy bridge
@@ -29,7 +30,12 @@ public class LogiBevyEditor : ModuleRules
 			"PropertyEditor",         // SDetailsView for the selection proxy
 			"InputCore",
 			"Projects",
+			"Json",                   // geo bench runner: request parsing + metrics sidecars
 			"LogiBevyRuntime",
 		});
+
+		// The geo bench runner samples ALogiBakedGeoTerrain, which the runtime module keeps in
+		// Private/ (it is not part of the runtime's public surface). Editor-only tooling may peek.
+		PrivateIncludePaths.Add(Path.Combine(ModuleDirectory, "..", "LogiBevyRuntime", "Private"));
 	}
 }

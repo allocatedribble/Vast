@@ -4,7 +4,8 @@
 > (already a project dependency) as the orchestration layer for terrain's large-scale multi-threading**,
 > rather than a separate `rayon` pool. Method: deep multi-source research — 21 sources fetched, 98 claims
 > extracted, 25 adversarially verified (3-vote, majority-refute kills), **22 confirmed / 3 killed**.
-> Primary sources: `docs.rs` for `bevy_ecs`/`bevy` 0.18.1, checked-in `bevy` source
+> Primary sources: `docs.rs` for `bevy_ecs`/`bevy` 0.18.1 (the version studied; Cargo.lock now resolves
+> **0.19.0-rc.2** — the verified constraints below carry over unchanged), checked-in `bevy` source
 > (`par_iter.rs`, `batching.rs`, `pipelined_rendering.rs`), core-dev PRs (#4777, #6503, #16782).
 >
 > **This revises the earlier "ECS is not the lever for Geo" verdict.** That verdict was right about the

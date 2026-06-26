@@ -44,7 +44,8 @@ engine's own `UStaticMesh` path. There is no runtime Nanite encode.**
   shells (ADR-0007). Native Nanite LOD / GPU-driven culling / VSM — retires the
   `SetCastShadow(false)` hack the debug lane needs.
 - The lane is **`WITH_EDITOR`-only** (the Nanite encoder is an editor module; on an installed
-  engine it cannot be made to ship). Compiled behind `LOGI_TERRAIN_NANITE_LANE`
+  engine it cannot be made to ship). Compiled behind `LOGI_GEO_NANITE_LANE`
+  [correction 2026-06-09: renamed from `LOGI_TERRAIN_NANITE_LANE` in the Terrain→Geo rename; see Build.cs:109]
   (= `Target.bBuildEditor` && terrain DLL present); toggled at runtime by
   `ULogiBevyDeveloperSettings::bUseNaniteTerrainLane` (default **off**), coexisting with the
   proc-mesh debug lane (Milestone D) for live A/B.
@@ -63,11 +64,12 @@ Nanite and ships everywhere.
 - Real Nanite terrain in editor/PIE now, via the engine's own build path — no engine fork, no
   custom Nanite encoder, no `FPrimitiveSceneProxy` re-implementation.
 - Ship builds keep the proc-mesh debug lane (or a future ship lane); the Nanite lane compiles out
-  (`LOGI_TERRAIN_NANITE_LANE=0`), zero cost.
+  (`LOGI_GEO_NANITE_LANE=0` [correction 2026-06-09: renamed from `LOGI_TERRAIN_NANITE_LANE`]), zero cost.
 - Per-tile synchronous Nanite builds are heavy; budgeting trades fill-in latency (fast camera moves
   show fewer tiles until builds catch up) for editor responsiveness. If the measured per-tile cost
   is prohibitive, fall back to the fast-proxy option above.
 - The `LOGI_TERRAIN_RUNTIME_NANITE_BUILD` flag/plan from ADR-0007 is **retired**: runtime Nanite
-  encode is not viable in stock 5.8.
+  encode is not viable in stock 5.8. [correction 2026-06-09: this was the original *runtime-encode* plan
+  flag; the live *editor-only* lane this ADR ships is the separate `LOGI_GEO_NANITE_LANE` (Build.cs:109).]
 
 This refines the Milestone-E clause of ADR-0007; ADR-0007 otherwise stands.

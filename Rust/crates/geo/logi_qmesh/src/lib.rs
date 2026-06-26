@@ -1,10 +1,17 @@
 //! Decoder for Cesium **quantized-mesh-1.0** terrain tiles (the format Cesium World Terrain streams),
 //! for the actorless 3D-Tiles / real-world-terrain stack (ADR-0009, Milestone F).
 //!
+//! **Status (2026-06-09): pre-wired, no runtime consumer yet.** This is the planned Cesium-World-Terrain
+//! lane of Milestone F (`Docs/Plans/Milestone-F-3DTiles-Rust-Stack.md` §crate-map names it the "Cesium
+//! World Terrain path"); the streamer's production lane today is Google P3DT (glTF/Draco), which never
+//! touches this codec. It stays in the workspace — tested, audited, audit-hardened — until that lane
+//! lands; deliberately kept over deleted (the ADR names the format in scope), re-affirmed by the
+//! 2026-06-09 deferred-items re-evaluation. If the CWT lane is ever DESCOPED, delete this crate.
+//!
 //! [`parse`] is a pure byte codec (no geometry math): header → delta/zig-zag vertices → high-watermark
 //! indices → edge rings → extensions. [`QuantizedMeshTile::to_ecef_mesh`] then geocodes the quantized
-//! u/v/height into geocentric **ECEF f64** positions (+ normals) via [`logi_geospatial`]; the kernel
-//! rebases ECEF → local f32 against the camera-tracking floating origin downstream (plan §9.4).
+//! u/v/height into geocentric **ECEF f64** positions (+ normals) via [`logi_geospatial`]; the consumer
+//! rebases ECEF → render-local f32 downstream.
 //!
 //! Spec: `CesiumGS/quantized-mesh` (`README.md` binary layout, `SPECIFICATION.md` `layer.json`). All
 //! multi-byte values are little-endian.
@@ -612,9 +619,10 @@ mod tests {
         // A code stream that resolves to a vertex index past `vertex_count` is malformed, not aliased to 0.
         // First code 1 with highest=0 → wrapping_sub → u32::MAX, far past any vertex_count → BadIndex.
         assert_eq!(decode_indices_hw([1u32].into_iter(), 4), Err(QmError::BadIndex));
-        // A valid forward-difference run that walks one vertex past the declared count also errors.
-        // [0,0,0,0,0] declares vertices 0..4 then references nothing OOB; add a back-reference to 4:
-        let raw = [0u16, 0, 0, 0, 4]; // last code 4: index = highest(4) - 4 = 0 (in range) — sanity stays valid
+        // A valid forward-difference run with an in-range back-reference stays Ok.
+        // [0,0,0,0,4]: the first four codes walk the high-watermark up to vertex 4, then the last
+        // code 4 back-references index highest(4) - 4 = 0 (in range) — decode stays valid.
+        let raw = [0u16, 0, 0, 0, 4]; // last code 4: index = highest(4) - 4 = 0 (in range)
         assert!(decode_indices_hw(raw.iter().map(|&c| c as u32), 4).is_ok());
     }
 

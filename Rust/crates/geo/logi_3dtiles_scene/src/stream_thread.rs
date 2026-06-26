@@ -11,17 +11,20 @@
 //! ## Threading contract (ADR-0012)
 //! - The **stream thread** is the single owner/mutator of the `GeoWorld` (the §11 owner-thread rule,
 //!   relocated off the game thread). It is the only thread that decodes, rebases, traverses, or evicts.
-//! - The **game thread** is a pure producer (`set_view`, newest-wins) + consumer (`poll`/`Drop`). It shares
-//!   nothing mutable with the world — only the two brief-critical-section `Mutex`es and the lock-free
-//!   telemetry atomics below.
+//! - The **game thread** is a pure producer (`set_view`/`set_textured_keys`, newest-wins) + consumer
+//!   (`poll`/`Drop`). It shares nothing mutable with the world — only the three brief-critical-section
+//!   `Mutex`es (newest view, latest frame, textured set) and the lock-free telemetry atomics below.
 //! - Geometry crosses as `Arc<TileGeometry>` (ADR-0012): a polled frame holds owned `Arc` clones, so the
 //!   stream thread can evict/overwrite freely without ever dangling a frame the renderer still holds.
 
 use crate::geo_world::{GeoRenderFrame, GeoWorld};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use hashbrown::HashSet;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc as StdArc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The newest desired view pushed by the game thread (newest-wins). Unreal-space camera (cm), the frame the
 /// returned geometry is in (ENU origin at Unreal `(0,0,0)`).
@@ -43,13 +46,73 @@ pub struct ViewParams {
 
 /// The result of polling the streamer for the latest frame.
 pub enum StreamPoll {
-    /// A frame newer than the last poll — the renderer should (re)build from it. Owns its geometry via `Arc`,
-    /// valid until the renderer's next poll.
-    New(GeoRenderFrame),
+    /// A frame newer than the last poll — the renderer should (re)build from it. Shared via `Arc` (an O(1)
+    /// clone out of the mailbox — audit 2026-06-10 §2); geometry stays valid until the renderer's next poll.
+    New(StdArc<GeoRenderFrame>),
     /// No new frame since the last poll — reuse what was already built (no work).
     Same,
     /// Nothing published yet (the stream thread has not produced a frame).
     Empty,
+}
+
+/// The Geo streaming lane's telemetry, as ONE plain block (the cells-precedent fix for the hand-mirrored
+/// counter sprawl: `GeoStats` → ~25 individual atomics → 8 packed FFI accessors became this struct crossing
+/// each seam whole). Written by the stream thread once per full step ([`run_stream`]'s mirror), read by the
+/// game thread via [`GlobeStreamer::telemetry`]; the FFI copies it across the C ABI as `LogiGlobeTelemetry`
+/// (same fields, same order — ABI v17). All counts widen to `u64` at this membrane regardless of their
+/// source width. Adding a counter = one field here + one in the FFI mirror + an offset lock, NOT a new
+/// entry point.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GeoTelemetry {
+    /// Resident decoded tiles after the last step.
+    pub resident_tiles: u64,
+    /// Outstanding/undrained tile fetches.
+    pub in_flight: u64,
+    /// Frames published into the mailbox (`produced - polled` ≈ frames superseded before the renderer saw
+    /// them — intentional skips under latest-wins). Composed from the live counter at read time.
+    pub produced_frames: u64,
+    /// Stream-thread steps whose body panicked and was caught (the loop continues; see `run_stream`).
+    /// Non-zero = the streaming lane hit at least one poisoned step but kept running; rapidly climbing =
+    /// a deterministically-bad tile/input. Composed from the live counter at read time.
+    pub step_panics: u64,
+    // --- Pool pressure (2026-06-11 starvation stall): evicted flat-zero + pool_exhausted climbing at a
+    // full pool = eviction is dead and the streamer is starved.
+    pub free_slots: u64,
+    pub max_resident: u64,
+    pub evicted_total: u64,
+    pub pool_exhausted_total: u64,
+    // --- Give-ups: why a tile stays stuck at its coarse (blurry) ancestor. `fetch_failed` = bytes never
+    // arrived (dead URL / network / expired session, after retries); `decode_failed` = bytes arrived but
+    // didn't parse; `graft_failed` = a child manifest fetched but never grafted (region stuck coarse);
+    // `url_resolve_failed` = a content URI never resolved (never even fetched).
+    pub decode_failed_total: u64,
+    pub fetch_failed_total: u64,
+    pub graft_failed_total: u64,
+    pub url_resolve_failed_total: u64,
+    /// In-flight fetches pre-emptively cancelled because their tile left the selection (fast camera motion).
+    pub fetches_cancelled_total: u64,
+    /// Google P3DT session refreshes (root re-fetched for a fresh `?session=…` after a 401/403).
+    pub session_refreshes_total: u64,
+    // --- The TWO caches (owner directive 2026-06-12 + ADR-0019): hit-rate = hits / (hits + misses);
+    // `*_bytes` = occupancy. `flash` = the in-memory cell (the decoded-geometry LRU). `disk` = the disk
+    // cell's MEMBRANE aggregate over its two internal tiers (raw bytes + persisted decoded geometry,
+    // `TileDiskCache`): a disk hit is ANY tier serving (geometry restore or cached bytes), a disk miss is
+    // a request that ultimately needed the network. Per-tier detail stays inside the cell (`GeoStats`).
+    pub flash_hits: u64,
+    pub flash_misses: u64,
+    pub flash_bytes: u64,
+    pub disk_hits: u64,
+    pub disk_misses: u64,
+    pub disk_bytes: u64,
+    // --- The selection X-ray (snapshot of the last full step's hold-reason counts; see
+    // `logi_3dtiles_select::HoldCounts`). A scar = `hold_leaf_under_sse` / `fetch_skip_grafted` sustained
+    // at quiescence.
+    pub hold_kick: u64,
+    pub hold_dead: u64,
+    pub hold_loading: u64,
+    pub hold_leaf_under_sse: u64,
+    pub hold_pending_subtree: u64,
+    pub fetch_skip_grafted: u64,
 }
 
 /// Cross-thread state between the game thread (produces views, consumes frames) and the stream thread
@@ -58,29 +121,33 @@ pub enum StreamPoll {
 struct StreamShared {
     /// Newest desired view (newest-wins). `None` until the first `set_view`.
     view: Mutex<Option<ViewParams>>,
-    /// The latest published render frame (latest-wins mailbox). Geometry stays alive via `Arc` for whoever
-    /// holds a clone, so overwriting here never dangles a frame the renderer is still using.
-    latest: Mutex<Option<GeoRenderFrame>>,
+    /// The latest published render frame (latest-wins mailbox), shared as an `Arc`: both the stream thread's
+    /// store and the game thread's poll are O(1) refcount bumps — the lock is held for pointer-sized work, not
+    /// an O(R) clone (audit 2026-06-10 §2). Geometry stays alive for whoever holds a clone.
+    latest: Mutex<Option<StdArc<GeoRenderFrame>>>,
     /// Lifecycle: cleared to ask the stream thread to finish the current iteration and exit.
     running: AtomicBool,
-    /// Frames the stream thread published into the mailbox (telemetry; `produced - polled` ≈ frames
-    /// superseded before the renderer saw them, which under latest-wins are intentional skips).
+    /// Frames the stream thread published into the mailbox — the live counter behind
+    /// [`GeoTelemetry::produced_frames`] (bumped at mirror time, outside the per-step telemetry store).
     produced: AtomicU64,
-    resident_tiles: AtomicUsize,
-    in_flight: AtomicUsize,
-    cached_bytes: AtomicU64,
-    /// Cumulative tiles that GAVE UP loading, mirrored from `GeoStats` for the game thread (lock-free
-    /// telemetry). Split so a diagnostic can tell the two reasons a tile stays stuck at its coarse (blurry)
-    /// ancestor apart: `fetch_failed` = the bytes never arrived (dead URL / network / expired session, after
-    /// retries); `decode_failed` = bytes arrived but didn't parse (unsupported format like Draco/KTX2, or
-    /// corrupt). A climbing `fetch_failed` points at the network; a climbing `decode_failed` at the codec.
-    decode_failed: AtomicU64,
-    fetch_failed: AtomicU64,
-    /// External-tileset manifests that fetched but failed to GRAFT (subtree never appears → region stuck
-    /// coarse), and selected tiles whose content URI failed to RESOLVE (never fetched → region stuck coarse).
-    /// Both were silent before; a climbing count is the patchy-stuck-blur cause. Mirrored from `GeoStats`.
-    graft_failed: AtomicU64,
-    url_resolve_failed: AtomicU64,
+    /// The telemetry block, stored whole once per full step (single writer: the stream thread; the lock is
+    /// held for a 208-byte copy). The game thread reads it whole via [`GlobeStreamer::telemetry`].
+    telemetry: Mutex<GeoTelemetry>,
+    /// Tile keys the RENDERER (C++) has fully textured — the producer half of the texture gate that makes LOD
+    /// loading invisible. Newest-wins COMPLETE set, pushed by [`set_textured_keys`](GlobeStreamer::set_textured_keys).
+    /// The selector treats a tile as renderable (eligible to replace its coarse parent) only when it is
+    /// geometry-`Resident` AND in this set, so the kick holds the coarse parent rendered until the fine tile is
+    /// textured — never a gray placeholder. Empty until the renderer's first report (a brief startup where only
+    /// the coarsest already-textured tiles show).
+    textured: Mutex<HashSet<u64>>,
+    /// Raised when `textured` changed since the last advance, so the stream thread re-traverses (re-evaluates
+    /// the gate → promotes a now-textured tile out of its hidden "prepare" state) even with a still camera and
+    /// nothing in flight. Without it, a texture confirmed while the camera is parked would never promote.
+    textured_dirty: AtomicBool,
+    /// Steps whose body panicked and was caught (the loop continues; see `run_stream`). A non-zero value is
+    /// the "streaming hiccuped" signal: without the catch a single bad tile would kill the thread while
+    /// `running` stayed true, and the renderer would poll `Same` forever — a silent permanent freeze.
+    step_panics: AtomicU64,
 }
 
 /// The game-thread handle to a decoupled Geo stream. Owns the worker thread; dropping it stops + joins it.
@@ -102,13 +169,10 @@ impl GlobeStreamer {
             latest: Mutex::new(None),
             running: AtomicBool::new(true),
             produced: AtomicU64::new(0),
-            resident_tiles: AtomicUsize::new(0),
-            in_flight: AtomicUsize::new(0),
-            cached_bytes: AtomicU64::new(0),
-            decode_failed: AtomicU64::new(0),
-            fetch_failed: AtomicU64::new(0),
-            graft_failed: AtomicU64::new(0),
-            url_resolve_failed: AtomicU64::new(0),
+            telemetry: Mutex::new(GeoTelemetry::default()),
+            textured: Mutex::new(HashSet::new()),
+            textured_dirty: AtomicBool::new(false),
+            step_panics: AtomicU64::new(0),
         });
         let thread_shared = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
@@ -136,6 +200,19 @@ impl GlobeStreamer {
         }
     }
 
+    /// Report the COMPLETE set of tile keys the renderer has fully textured (newest-wins; producer half, like
+    /// [`set_view`](Self::set_view)). The selector's texture gate keeps a tile's coarse parent rendered until the
+    /// tile appears here, so LOD refinement never flashes an untextured (gray) tile. Wakes the stream thread so a
+    /// just-textured tile promotes promptly even if the camera is still. Cheap: collects the slice into the
+    /// shared set under a brief lock.
+    pub fn set_textured_keys(&self, keys: &[u64]) {
+        *lock(&self.shared.textured) = keys.iter().copied().collect();
+        self.shared.textured_dirty.store(true, Ordering::Release);
+        if let Some(t) = &self.thread {
+            t.thread().unpark();
+        }
+    }
+
     /// Poll the latest published frame. `New` carries an owned frame (geometry pinned via `Arc`) the renderer
     /// keeps until its next poll; `Same` means no new frame since the last poll; `Empty` means nothing yet.
     /// Non-blocking — a brief lock, then an `Arc`-bump clone out.
@@ -143,7 +220,7 @@ impl GlobeStreamer {
         let poll = {
             let latest = lock(&self.shared.latest);
             match latest.as_ref() {
-                Some(f) if f.frame != self.last_polled_id => StreamPoll::New(f.clone()),
+                Some(f) if f.frame != self.last_polled_id => StreamPoll::New(StdArc::clone(f)),
                 Some(_) => StreamPoll::Same,
                 None => StreamPoll::Empty,
             }
@@ -155,39 +232,17 @@ impl GlobeStreamer {
         poll
     }
 
-    /// Resident decoded tiles (telemetry, lock-free).
-    pub fn resident_tiles(&self) -> usize {
-        self.shared.resident_tiles.load(Ordering::Relaxed)
+    /// The streaming lane's telemetry, read WHOLE (one brief lock + a 208-byte copy): the per-step block the
+    /// stream thread last stored, with the two live counters (`produced_frames`, `step_panics`) composed in
+    /// at read time so they are current even mid-step. This is the single game-thread telemetry surface —
+    /// the FFI mirrors the block across the C ABI as `LogiGlobeTelemetry` (ABI v16).
+    pub fn telemetry(&self) -> GeoTelemetry {
+        let mut t = *lock(&self.shared.telemetry);
+        t.produced_frames = self.shared.produced.load(Ordering::Relaxed);
+        t.step_panics = self.shared.step_panics.load(Ordering::Relaxed);
+        t
     }
-    /// Outstanding/undrained tile fetches (telemetry, lock-free).
-    pub fn in_flight(&self) -> usize {
-        self.shared.in_flight.load(Ordering::Relaxed)
-    }
-    /// Bytes resident in the persistent disk cache (telemetry, lock-free).
-    pub fn cached_bytes(&self) -> u64 {
-        self.shared.cached_bytes.load(Ordering::Relaxed)
-    }
-    /// Cumulative tiles that gave up DECODING — bytes arrived but didn't parse (unsupported format like
-    /// Draco/KTX2, or corrupt). Terminal; the tile stays at its coarse ancestor (telemetry, lock-free).
-    pub fn decode_failed(&self) -> u64 {
-        self.shared.decode_failed.load(Ordering::Relaxed)
-    }
-    /// Cumulative tiles that gave up FETCHING after retries — bytes never arrived (dead URL / network /
-    /// expired session). Terminal; the tile stays at its coarse ancestor (telemetry, lock-free).
-    pub fn fetch_failed(&self) -> u64 {
-        self.shared.fetch_failed.load(Ordering::Relaxed)
-    }
-    /// Cumulative external-tileset manifests that fetched but FAILED TO GRAFT — the subtree never appears, so
-    /// its region is stuck at the coarse parent (telemetry, lock-free).
-    pub fn graft_failed(&self) -> u64 {
-        self.shared.graft_failed.load(Ordering::Relaxed)
-    }
-    /// Cumulative selected tiles whose content URI FAILED TO RESOLVE — never fetched, region stuck coarse
-    /// (telemetry, lock-free).
-    pub fn url_resolve_failed(&self) -> u64 {
-        self.shared.url_resolve_failed.load(Ordering::Relaxed)
-    }
-    /// Frames the stream thread has published (telemetry).
+    /// Frames the stream thread has published (telemetry; also in [`telemetry`](Self::telemetry)).
     pub fn produced(&self) -> u64 {
         self.shared.produced.load(Ordering::Relaxed)
     }
@@ -230,46 +285,125 @@ const SHORT_PARK: Duration = Duration::from_millis(1);
 fn run_stream(mut world: GeoWorld, shared: Arc<StreamShared>, idle_park: Duration) {
     let mut last_view: Option<ViewParams> = None;
     let mut frame: u64 = 0;
+    let mut last_mirrored: u64 = 0; // mailbox frame id last stored into `shared.latest` (0 = none)
     while shared.running.load(Ordering::Acquire) {
         let view = *lock(&shared.view);
         let view_changed = view != last_view;
-        // Advance when the camera moved OR fetches are still draining; else idle (no pointless re-traversal).
-        let work = view.is_some() && (view_changed || world.in_flight() > 0);
+        // The renderer reported a new textured-tile set → re-traverse so the gate promotes it (even a still
+        // camera). LOAD here (don't clear yet) so a report that lands before any view is set isn't lost; the
+        // clear happens inside the work branch, where it's actually consumed.
+        let textured_dirty = shared.textured_dirty.load(Ordering::Acquire);
+        // Advance when the camera moved, a texture confirmed, fetches are still draining, OR a backoff/
+        // session-refresh timer is still pending (audit H4/M1a) — the last term keeps `frame` advancing to the
+        // retry deadline even over a parked camera with nothing in flight, or a 429/5xx wave (or an expired
+        // session) that drained in-flight to 0 would freeze `frame` and strand the region at coarse LOD. Else
+        // idle (no pointless re-traversal of an unchanged, fully-textured scene).
+        let work =
+            view.is_some() && (view_changed || textured_dirty || world.in_flight() > 0 || world.has_pending_retry());
         match (work, view) {
             (true, Some(v)) => {
                 frame += 1;
-                world.advance_from_ue(
-                    v.camera_ue_cm,
-                    v.camera_dir_ue,
-                    v.camera_up_ue,
-                    v.aspect,
-                    v.fov_y_radians,
-                    v.viewport_height,
-                    v.max_sse,
-                    frame,
-                );
+                // The whole step body is unwind-caught (re-eval 2026-06-09): a panicking step (malformed
+                // tile, codec edge, arithmetic corner) must not kill this thread — `running` would stay
+                // true and the game thread would poll `Same` forever, a silent permanent freeze of the
+                // streaming lane with zero signal to C++. Geo is non-authoritative (ADR-0007), so
+                // continuing past a poisoned step is best-effort by design; `step_panics` + the stderr
+                // line make it observable. NOTE for the future gameplay `LogiSimRunner` mirror: the
+                // deterministic sim must NOT copy this skip-and-continue shape — a panicked fixed step
+                // there must hard-stop (replay integrity), not continue.
+                let step = catch_unwind(AssertUnwindSafe(|| {
+                    // Snapshot the renderer's textured set into the world before traversal (the gate reads
+                    // it) — only when it changed, so a still-but-refining scene doesn't pay a per-frame set
+                    // clone. The world keeps the last set between updates.
+                    if shared.textured_dirty.swap(false, Ordering::Acquire) {
+                        world.set_textured_keys(lock(&shared.textured).clone());
+                    }
+                    // H5: stamp this step's wall-clock — the retry-backoff + session-refresh deadlines read
+                    // it, so a backoff is real time, independent of the loop's variable park cadence.
+                    world.set_now(Instant::now());
+                    // Speculative frame id: the world consumes it only if the re-selection gate (§3.1) runs a
+                    // FULL step (returning `true`); a drain-only wake leaves the published frame — and the
+                    // counter — untouched, so frame ids keep counting full steps (LRU staleness semantics).
+                    let ran_full = world.advance_from_ue(
+                        v.camera_ue_cm,
+                        v.camera_dir_ue,
+                        v.camera_up_ue,
+                        v.aspect,
+                        v.fov_y_radians,
+                        v.viewport_height,
+                        v.max_sse,
+                        frame + 1,
+                    );
+                    if ran_full {
+                        // Mirror the freshly-published frame into the cross-thread mailbox — an O(1) Arc
+                        // clone, and only when its id actually advanced (the C9 fingerprint keeps the id
+                        // stable for identical content, so an unchanged publish skips the store + counter).
+                        let latest = world.latest_frame();
+                        if latest.frame != last_mirrored {
+                            last_mirrored = latest.frame;
+                            *lock(&shared.latest) = Some(latest);
+                            shared.produced.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    ran_full
+                }));
+                // Consume the view even when the step panicked: re-advancing the identical view would just
+                // repeat a deterministic panic at work cadence instead of idling until something changes.
                 last_view = Some(v);
-                // Mirror the GeoWorld's freshly-published frame into the cross-thread mailbox (an `Arc`-bump
-                // clone). `latest_frame` reads the schedule's `publish` output.
-                *lock(&shared.latest) = Some(world.latest_frame());
-                shared.produced.fetch_add(1, Ordering::Relaxed);
-                shared.resident_tiles.store(world.resident_tiles(), Ordering::Relaxed);
-                shared.in_flight.store(world.in_flight(), Ordering::Relaxed);
-                shared.cached_bytes.store(world.cached_bytes(), Ordering::Relaxed);
+                if let Ok(true) = &step {
+                    frame += 1; // commit the speculative id — a full step ran and (possibly) published it
+                }
+                if let Err(_panic) = &step {
+                    let n = shared.step_panics.fetch_add(1, Ordering::Relaxed) + 1;
+                    // Rate-limit the log: first few, then powers of two — a deterministic per-step panic
+                    // must not flood stderr at streaming cadence.
+                    if n <= 3 || n.is_power_of_two() {
+                        eprintln!("[logi_geo] stream step panicked (total {n}); step skipped, streaming continues");
+                    }
+                    std::thread::park_timeout(idle_park);
+                    continue;
+                }
+                // Mirror the step's telemetry as ONE block (flash/geom hit+miss from GeoStats, disk hit+miss
+                // from the source's DiskCache counters, occupancy bytes from the world). `produced_frames` /
+                // `step_panics` are composed from their live atomics at read time, not stored here.
                 let stats = world.stats();
-                shared
-                    .decode_failed
-                    .store(u64::from(stats.decode_failed_total), Ordering::Relaxed);
-                shared
-                    .fetch_failed
-                    .store(u64::from(stats.fetch_failed_total), Ordering::Relaxed);
-                shared
-                    .graft_failed
-                    .store(u64::from(stats.graft_failed_total), Ordering::Relaxed);
-                shared
-                    .url_resolve_failed
-                    .store(u64::from(stats.url_resolve_failed_total), Ordering::Relaxed);
-                std::thread::park_timeout(SHORT_PARK);
+                *lock(&shared.telemetry) = GeoTelemetry {
+                    resident_tiles: world.resident_tiles() as u64,
+                    in_flight: world.in_flight() as u64,
+                    produced_frames: 0,
+                    step_panics: 0,
+                    free_slots: world.free_slots(),
+                    max_resident: world.max_resident(),
+                    evicted_total: u64::from(stats.evicted_total),
+                    pool_exhausted_total: u64::from(stats.pool_exhausted_total),
+                    decode_failed_total: u64::from(stats.decode_failed_total),
+                    fetch_failed_total: u64::from(stats.fetch_failed_total),
+                    graft_failed_total: u64::from(stats.graft_failed_total),
+                    url_resolve_failed_total: u64::from(stats.url_resolve_failed_total),
+                    fetches_cancelled_total: u64::from(stats.fetches_cancelled_total),
+                    session_refreshes_total: u64::from(stats.session_refreshes_total),
+                    flash_hits: u64::from(stats.flash_cache_hits_total),
+                    flash_misses: u64::from(stats.flash_cache_miss_total),
+                    flash_bytes: world.flash_cache().1 as u64,
+                    // The disk cell's membrane aggregate: hit = any tier served (a geometry restore that
+                    // skipped fetch+decode, or cached bytes that skipped the network); miss = the byte
+                    // tier's misses ONLY (a geometry miss that then hit bytes already counted as a hit).
+                    disk_hits: u64::from(stats.geom_cache_hits_total) + world.disk_cache_hits(),
+                    disk_misses: world.disk_cache_misses(),
+                    disk_bytes: world.cached_bytes() + world.geom_cache_bytes(),
+                    hold_kick: u64::from(stats.hold_kick),
+                    hold_dead: u64::from(stats.hold_dead),
+                    hold_loading: u64::from(stats.hold_loading),
+                    hold_leaf_under_sse: u64::from(stats.hold_leaf_under_sse),
+                    hold_pending_subtree: u64::from(stats.hold_pending_subtree),
+                    fetch_skip_grafted: u64::from(stats.fetch_skip_grafted),
+                };
+                // Brief park to drain arriving tiles while fetches are in flight; otherwise (this advance only
+                // serviced a backoff/refresh timer, or the scene settled) the full idle park — so waiting out a
+                // retry deadline costs idle-cadence re-traversals, not a 1 ms busy-spin. A `set_view` / texture
+                // report unparks immediately regardless (audit H4).
+                let park = if world.in_flight() > 0 { SHORT_PARK } else { idle_park };
+                std::thread::park_timeout(park);
             }
             _ => std::thread::park_timeout(idle_park),
         }

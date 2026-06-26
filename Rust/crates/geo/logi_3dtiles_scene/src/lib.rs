@@ -14,8 +14,8 @@ pub(crate) mod frustum;
 pub mod geo_world;
 pub mod stream_thread;
 pub mod streaming;
-pub use geo_world::{GeoRenderFrame, GeoView, GeoWorld};
-pub use stream_thread::{GlobeStreamer, StreamPoll, ViewParams};
+pub use geo_world::{FetchBackend, GeoRenderFrame, GeoView, GeoWorld, DEFAULT_MAX_RESIDENT, DEFAULT_TILE_POOL_SIZE};
+pub use stream_thread::{GeoTelemetry, GlobeStreamer, StreamPoll, ViewParams};
 pub use streaming::{StreamError, TileGeometry};
 
 use logi_collada::{decode_collada, ColladaError};
@@ -47,6 +47,9 @@ pub struct BuildingMesh {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SceneError {
     Collada(ColladaError),
+    /// The document declares an `up_axis` this loader does not implement (only `Z_UP` — the AGI_HQ sample's
+    /// axis — has a conversion path). Fail loud rather than silently apply the wrong basis change (ADR-0004).
+    UnsupportedUpAxis(logi_collada::UpAxis),
 }
 
 #[inline]
@@ -58,12 +61,19 @@ fn wr(b: &mut [u8], o: usize, v: f32) {
     b[o..o + 4].copy_from_slice(&v.to_le_bytes());
 }
 
-/// Load a textured COLLADA building: decode the `dae_xml`, scale to cm, convert COLLADA (Z-up right-handed)
-/// → Unreal (Z-up left-handed) by negating Y + flipping triangle winding + flipping the V texcoord, and
-/// carry the raw `jpg_bytes` through. `placement` gives the geodetic origin, returned as the `ecef_origin`
-/// for the caller to position the mesh on the globe.
+/// Load a textured COLLADA building: decode the `dae_xml`, scale to cm, convert COLLADA (**`Z_UP`**
+/// right-handed — the only implemented `up_axis`; anything else is refused loud) → Unreal (Z-up left-handed)
+/// by negating Y + flipping triangle winding + flipping the V texcoord, and carry the raw `jpg_bytes`
+/// through. `placement` gives the geodetic origin, returned as the `ecef_origin` for the caller to position
+/// the mesh on the globe.
 pub fn load_building(dae_xml: &str, jpg_bytes: Vec<u8>, placement: &Placement) -> Result<BuildingMesh, SceneError> {
     let mesh = decode_collada(dae_xml).map_err(SceneError::Collada)?;
+    // The conversion below hard-codes the Z_UP basis (negate Y). A Y_UP/X_UP document would need a different
+    // axis permutation — refuse it rather than silently produce a sideways building (the decoder exports
+    // `up_axis` precisely so consumers make this check; AGI_HQ, the one production asset, is Z_UP).
+    if mesh.up_axis != logi_collada::UpAxis::Z {
+        return Err(SceneError::UnsupportedUpAxis(mesh.up_axis));
+    }
     let scale = mesh.unit_meters * 100.0; // document units → metres → cm
 
     let mut vertices = mesh.vertices;
@@ -97,13 +107,12 @@ pub fn load_building(dae_xml: &str, jpg_bytes: Vec<u8>, placement: &Placement) -
 
     // Guard the empty mesh on BOTH center and radius: with no vertices, `mn`/`mx` are still the
     // ±INF accumulator seeds, so center would be a meaningless `(MAX + -MAX)`. Emit a degenerate
-    // origin sphere instead.
+    // origin sphere instead; otherwise use the single-homed midpoint/half-diagonal (`logi_geo_mesh`,
+    // DUP-5 — this site used to re-implement it inline).
     let (bounds_center, bounds_radius) = if vcount == 0 {
         ([0.0, 0.0, 0.0], 0.0)
     } else {
-        let center = [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, (mn[2] + mx[2]) * 0.5];
-        let radius = 0.5 * ((mx[0] - mn[0]).powi(2) + (mx[1] - mn[1]).powi(2) + (mx[2] - mn[2]).powi(2)).sqrt();
-        (center, radius)
+        logi_geo_mesh::aabb_to_sphere(mn, mx)
     };
 
     let ecef = Ellipsoid::wgs84().cartographic_to_cartesian(Cartographic::from_degrees(
@@ -148,6 +157,22 @@ mod tests {
     </mesh></geometry>
   </library_geometries>
 </COLLADA>"##;
+
+    #[test]
+    fn refuses_a_non_z_up_document_loud() {
+        // The converter implements only the Z_UP basis; a Y_UP doc must be refused, not silently sideways.
+        let y_up = TRIANGLE_DAE.replace("<up_axis>Z_UP</up_axis>", "<up_axis>Y_UP</up_axis>");
+        let placement = Placement {
+            longitude_deg: 0.0,
+            latitude_deg: 0.0,
+            height_m: 0.0,
+            heading_deg: 0.0,
+        };
+        match load_building(&y_up, Vec::new(), &placement) {
+            Err(SceneError::UnsupportedUpAxis(logi_collada::UpAxis::Y)) => {}
+            other => panic!("expected UnsupportedUpAxis(Y), got {other:?}"),
+        }
+    }
 
     #[test]
     fn transforms_into_unreal_space() {

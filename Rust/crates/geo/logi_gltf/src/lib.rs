@@ -23,7 +23,7 @@ pub enum GltfError {
 /// One decoded primitive: raw vertex attribute arrays + u32 indices + its base-color material.
 ///
 /// Attributes are kept **un-interleaved** (audit D2): the 32-byte interleave is FUSED into the ENU rebase
-/// (`logi_3dtiles_scene::rebase_gltf`) so each vertex is interleaved exactly once — *after* its transform —
+/// (logi_3dtiles_scene's crate-internal interleave) so each vertex is interleaved exactly once — *after* its transform —
 /// instead of being interleaved here and then read back byte-by-byte there. A missing normal defaults to `+Z`
 /// and a missing uv to `(0, 0)`, per-vertex (matching `logi_geo_mesh::interleave`'s prior behavior).
 #[derive(Clone, Debug, PartialEq)]
@@ -41,11 +41,16 @@ pub struct DecodedPrimitive {
     /// lighting on top double-lights them. Read from `material.unlit()` (the `KHR_materials_unlit` glTF
     /// feature). False for an ordinary lit PBR material.
     pub unlit: bool,
-    /// The owning glTF node's WORLD transform (column-major 4×4), accumulated down the scene graph.
-    /// glTF vertices are node-local; this places them in the glTF scene frame. Google P3DT bakes each
-    /// tile's full **ECEF placement** (translation ≈ Earth radius) into this transform, so the renderer
-    /// MUST apply it before any ECEF→local rebase — dropping it collapses every tile to the geocenter.
-    pub node_transform: [[f32; 4]; 4],
+    /// The owning glTF node's WORLD transform (column-major 4×4), accumulated down the scene graph, in **f64**.
+    /// glTF vertices are node-local; this places them in the glTF scene frame. Google P3DT bakes each tile's
+    /// full **ECEF placement** (translation ≈ Earth radius, ~6.4e6 m) into this transform, so the renderer MUST
+    /// apply it before any ECEF→local rebase — dropping it collapses every tile to the geocenter.
+    ///
+    /// Kept **f64**, re-read from the GLB JSON (see [`node_local_transforms_f64`]) rather than via the `gltf`
+    /// crate's f32 accessors: at Earth-radius scale an f32 quantises to a ~0.76 m grid, and each tile is rounded
+    /// INDEPENDENTLY, so neighbours' shared edges land on different grid steps → per-tile geometry seams and
+    /// per-tile depth steps (which a depth-keyed renderer like SkyAtmosphere paints as a tile-aligned quilt).
+    pub node_transform: [[f64; 4]; 4],
 }
 
 /// A texture image as it sits in the glTF — raw encoded bytes (decode on the renderer side).
@@ -81,7 +86,7 @@ const MAX_INDICES_PER_PRIMITIVE: usize = 1 << 24; // ~16.8M
 /// Decode the primitives of one mesh under a node's world transform, appending to `out`.
 fn decode_mesh_primitives(
     mesh: gltf::Mesh,
-    node_transform: [[f32; 4]; 4],
+    node_transform: [[f64; 4]; 4],
     blob: Option<&[u8]>,
     doc: &gltf::Document,
     out: &mut Vec<DecodedPrimitive>,
@@ -198,7 +203,8 @@ fn decode_mesh_primitives(
 /// (a stack overflow aborts the process — the FFI panic guards can't catch it).
 fn walk_node(
     node: gltf::Node,
-    parent_world: glam::Mat4,
+    parent_world: glam::DMat4,
+    locals: &[glam::DMat4],
     blob: Option<&[u8]>,
     doc: &gltf::Document,
     out: &mut Vec<DecodedPrimitive>,
@@ -207,13 +213,97 @@ fn walk_node(
     if depth > MAX_NODE_DEPTH {
         return;
     }
-    let world = parent_world * glam::Mat4::from_cols_array_2d(&node.transform().matrix());
+    // f64 LOCAL transform, re-read from the JSON (`locals`, indexed by glTF node index). Fall back to the
+    // `gltf` crate's f32 accessor (widened) only if the JSON parse came up short — degraded but still correct.
+    let local = locals
+        .get(node.index())
+        .copied()
+        .unwrap_or_else(|| glam::Mat4::from_cols_array_2d(&node.transform().matrix()).as_dmat4());
+    let world = parent_world * local;
     if let Some(mesh) = node.mesh() {
         decode_mesh_primitives(mesh, world.to_cols_array_2d(), blob, doc, out);
     }
     for child in node.children() {
-        walk_node(child, world, blob, doc, out, depth + 1);
+        walk_node(child, world, locals, blob, doc, out, depth + 1);
     }
+}
+
+/// Extract the JSON chunk (chunk 0) of a GLB as raw bytes, or `None` if `bytes` isn't a GLB with a leading
+/// JSON chunk. GLB layout: 12-byte header (magic `glTF` | u32 version | u32 total length) then length-prefixed
+/// chunks; chunk 0 is required by the spec to be JSON. We re-read it (the `gltf` crate already parsed it, but
+/// to f32) to recover f64 node transforms — see [`node_local_transforms_f64`].
+fn glb_json_chunk(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < 20 || &bytes[0..4] != b"glTF" {
+        return None;
+    }
+    let len = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
+    let chunk_type = u32::from_le_bytes(bytes[16..20].try_into().ok()?);
+    if chunk_type != 0x4E4F_534A {
+        return None; // not "JSON"
+    }
+    bytes.get(20..20usize.checked_add(len)?)
+}
+
+/// Each glTF node's LOCAL transform read from the GLB JSON chunk as **f64**, indexed by node index — the
+/// precision the `gltf` crate discards by storing node matrices/TRS as f32. For P3DT the node transform carries
+/// the tile's full ECEF placement (~6.4e6 m), where f32 quantises to ~0.76 m PER TILE (rounded independently
+/// per tile → tile-aligned depth seams). Empty if there is no JSON chunk / no `nodes` array (callers fall back).
+fn node_local_transforms_f64(glb: &[u8]) -> Vec<glam::DMat4> {
+    let Some(json) = glb_json_chunk(glb) else {
+        return Vec::new();
+    };
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(nodes) = root.get("nodes").and_then(|n| n.as_array()) else {
+        return Vec::new();
+    };
+    nodes.iter().map(node_local_f64).collect()
+}
+
+/// One glTF node's LOCAL transform as an f64 matrix — the explicit column-major `matrix` if present, else the
+/// TRS triple (`translation` | `rotation` xyzw | `scale`, with glTF defaults), composed as M = T·R·S.
+fn node_local_f64(node: &serde_json::Value) -> glam::DMat4 {
+    if let Some(m) = node.get("matrix").and_then(|m| m.as_array()) {
+        if m.len() == 16 {
+            let mut a = [0.0f64; 16];
+            for (i, e) in m.iter().enumerate() {
+                a[i] = e.as_f64().unwrap_or(0.0);
+            }
+            return glam::DMat4::from_cols_array(&a);
+        }
+    }
+    let t = read_f64_n(node.get("translation"), [0.0, 0.0, 0.0]);
+    let r = read_f64_n(node.get("rotation"), [0.0, 0.0, 0.0, 1.0]); // xyzw; identity default
+    let s = read_f64_n(node.get("scale"), [1.0, 1.0, 1.0]);
+    // glTF requires a UNIT quaternion, but real exporters drift and a hostile zero quat would NaN the whole
+    // matrix (`from_scale_rotation_translation` uses q as-is, skewing R by |q|²): normalize when finite and
+    // non-degenerate, else fall back to identity rotation — same spirit as the non-finite-bounds guard
+    // downstream (`rebase_gltf` M14), but here the bad value would otherwise poison silently, not visibly.
+    let raw = glam::DQuat::from_xyzw(r[0], r[1], r[2], r[3]);
+    let rot = if raw.length_squared().is_finite() && raw.length_squared() > 1e-12 {
+        raw.normalize()
+    } else {
+        glam::DQuat::IDENTITY
+    };
+    glam::DMat4::from_scale_rotation_translation(
+        glam::DVec3::new(s[0], s[1], s[2]),
+        rot,
+        glam::DVec3::new(t[0], t[1], t[2]),
+    )
+}
+
+/// Read an N-element f64 array from a JSON value (per-element fallback to `default` on missing/short/non-number).
+fn read_f64_n<const N: usize>(v: Option<&serde_json::Value>, default: [f64; N]) -> [f64; N] {
+    let mut out = default;
+    if let Some(arr) = v.and_then(|x| x.as_array()) {
+        for (i, e) in arr.iter().take(N).enumerate() {
+            if let Some(f) = e.as_f64() {
+                out[i] = f;
+            }
+        }
+    }
+    out
 }
 
 /// Decode a GLB (binary glTF) — the form 3D Tiles content uses. Walks the scene graph so each primitive
@@ -226,15 +316,27 @@ pub fn decode_glb(bytes: &[u8]) -> Result<DecodedGltf, GltfError> {
     let mut primitives = Vec::new();
     let scene = gltf.document.default_scene().or_else(|| gltf.document.scenes().next());
     if let Some(scene) = scene {
+        // f64 node LOCAL transforms re-read from the GLB JSON (only needed when there's a scene to walk). The
+        // `gltf` crate's own transforms are f32 — fine for the small node-local vertices, but they TRUNCATE
+        // P3DT's per-tile Earth-radius placement to a ~0.76 m grid (see `DecodedPrimitive::node_transform`).
+        let locals = node_local_transforms_f64(bytes);
         for node in scene.nodes() {
-            walk_node(node, glam::Mat4::IDENTITY, blob, &gltf.document, &mut primitives, 0);
+            walk_node(
+                node,
+                glam::DMat4::IDENTITY,
+                &locals,
+                blob,
+                &gltf.document,
+                &mut primitives,
+                0,
+            );
         }
     } else {
         // No scene graph: decode every mesh with an identity transform (legacy / bare-mesh GLBs).
         for mesh in gltf.document.meshes() {
             decode_mesh_primitives(
                 mesh,
-                glam::Mat4::IDENTITY.to_cols_array_2d(),
+                glam::DMat4::IDENTITY.to_cols_array_2d(),
                 blob,
                 &gltf.document,
                 &mut primitives,
@@ -242,6 +344,11 @@ pub fn decode_glb(bytes: &[u8]) -> Result<DecodedGltf, GltfError> {
         }
     }
 
+    // Failure semantics (re-evaluated 2026-06-09, deliberate): a corrupt image bufferView fails the WHOLE
+    // tile (`?` below), geometry included. Salvaging the geometry would feed the renderer a never-texturing
+    // tile, and the texture-gate's give-up path would then bloom a flat placeholder OVER the photographic
+    // coarse parent the gate is currently holding — strictly worse than staying at the parent's real
+    // imagery. A whole-tile failure is counted (`decode_failed`) and the parent keeps covering.
     let mut images = Vec::new();
     for image in gltf.document.images() {
         let img = match image.source() {
@@ -436,5 +543,83 @@ mod tests {
 
         let d = decode_glb(&glb).expect("decode should not error");
         assert!(d.primitives.is_empty()); // no meshes anywhere in the chain
+    }
+
+    /// Minimal GLB: one triangle under a single scene node whose `matrix` carries `t` in its translation column.
+    fn build_glb_with_node_translation(t: [f64; 3]) -> Vec<u8> {
+        let positions: [[f32; 3]; 3] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let mut bin = Vec::new();
+        for p in positions {
+            for v in p {
+                bin.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let off_idx = bin.len();
+        for i in [0u16, 1, 2] {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        // Column-major 4×4: identity 3×3 with the translation in the last column (elements 12,13,14). `:.9`
+        // keeps the sub-metre digits in the JSON text so the f64 re-read has them to recover.
+        let json = format!(
+            r#"{{"asset":{{"version":"2.0"}},
+              "scenes":[{{"nodes":[0]}}],
+              "nodes":[{{"mesh":0,"matrix":[1,0,0,0,0,1,0,0,0,0,1,0,{tx:.9},{ty:.9},{tz:.9},1]}}],
+              "buffers":[{{"byteLength":{bl}}}],
+              "bufferViews":[
+                {{"buffer":0,"byteOffset":0,"byteLength":36}},
+                {{"buffer":0,"byteOffset":{off_idx},"byteLength":6}} ],
+              "accessors":[
+                {{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0,0,0],"max":[1,1,0]}},
+                {{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"}} ],
+              "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}},"indices":1}}]}}]}}"#,
+            tx = t[0],
+            ty = t[1],
+            tz = t[2],
+            bl = bin.len(),
+            off_idx = off_idx,
+        );
+        let mut json_bytes = json.into_bytes();
+        while json_bytes.len() % 4 != 0 {
+            json_bytes.push(b' ');
+        }
+        let total = 12 + 8 + json_bytes.len() + 8 + bin.len();
+        let mut glb = Vec::new();
+        glb.extend_from_slice(b"glTF");
+        glb.extend_from_slice(&2u32.to_le_bytes());
+        glb.extend_from_slice(&(total as u32).to_le_bytes());
+        glb.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+        glb.extend_from_slice(&0x4E4F_534Au32.to_le_bytes()); // "JSON"
+        glb.extend_from_slice(&json_bytes);
+        glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+        glb.extend_from_slice(&0x004E_4942u32.to_le_bytes()); // "BIN\0"
+        glb.extend_from_slice(&bin);
+        glb
+    }
+
+    /// The fix this guards: a glTF node `matrix` carrying an Earth-radius translation must reach
+    /// `DecodedPrimitive::node_transform` at **f64** precision. The `gltf` crate parses node matrices to f32,
+    /// which quantises ~6.4e6 m to a ~0.76 m grid; we re-read the JSON as f64. The chosen value differs from its
+    /// f32 round by ~0.12 m, so the old f32 path would fail the `< 1e-6` assertion below.
+    #[test]
+    fn node_matrix_translation_keeps_f64_precision() {
+        let tx: f64 = 6_378_137.123_456_789; // Earth-radius scale + sub-metre detail f32 cannot represent
+        assert!(
+            (tx - tx as f32 as f64).abs() > 0.1,
+            "test value must actually differ in f32 to be meaningful"
+        );
+        let d = decode_glb(&build_glb_with_node_translation([tx, 20.0, 30.0])).expect("decode");
+        assert_eq!(d.primitives.len(), 1);
+        // node_transform is column-major; the translation is the 4th column.
+        let m = d.primitives[0].node_transform;
+        assert!(
+            (m[3][0] - tx).abs() < 1e-6,
+            "x translation lost f64 precision: {} vs {tx}",
+            m[3][0]
+        );
+        assert_eq!(m[3][1], 20.0);
+        assert_eq!(m[3][2], 30.0);
     }
 }

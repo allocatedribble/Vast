@@ -1,6 +1,10 @@
 # ADR-0012 — Poll-Based FFI / Decoupled Sim Thread
 
-- **Status:** Accepted
+- **Status:** Accepted — **Geo half IMPLEMENTED** (the `LogiGeoStream` thread + poll-shaped geo FFI,
+  `stream_thread.rs` / `logi_geo_ffi`); **gameplay half PENDING** (the sim thread, the
+  `push_input`/`poll` split, and the ABI 6→7 bump are NOT yet built — `logi_world_tick` still runs the
+  whole schedule synchronously on the UE game thread at ABI v6). Tracked in ADR-0014 Decision 6 /
+  [the plan §3.7](../Plans/LogiRuntime-Design.md); honesty banner added by the 2026-06-09 runtime re-evaluation.
 - **Date:** 2026-06-06
 - **Deciders:** Vast architecture
 - **Amends:** [ADR-0005](ADR-0005-Bevy-ECS-Authority.md) — the single-owner-thread invariant
@@ -60,7 +64,8 @@ Concretely:
 
 1. **Poll, not step.** The per-frame FFI surface, callable only from the Unreal game thread, is three cheap
    non-blocking categories:
-   - **Push (producer):** `set_view(camera, fov, viewport, max_sse)` for Geo (newest-wins, a seqlock slot);
+   - **Push (producer):** `set_view(camera, fov, viewport, max_sse)` for Geo (newest-wins; **as built**: a
+     brief-critical-section `Mutex<Option<ViewParams>>` slot, not a seqlock — see Decision 4's correction);
      `push_input(UnrealFrameInput)` for gameplay (a bounded SPSC queue, drained deterministically).
    - **Poll (consumer):** `poll(&out)` returns the **latest complete** snapshot with a `NEW`/`SAME`/`EMPTY`
      status, so an unchanged frame is a no-op the C++ side skips rebuilding.
@@ -77,9 +82,14 @@ Concretely:
    conflict-correct and the result stays deterministic.**
 
 4. **The cross-thread FFI surface is a closed, race-free set.** Exactly `{set_view, push_input, poll,
-   release}` cross threads, each via a **lock-free seqlock / ring** or a **bounded SPSC queue** — *not*
-   shared mutable state. §1C's "no shared mutable state across the boundary → no data race" therefore still
-   holds: the producer and consumer touch disjoint, fenced slots, never the same mutable datum.
+   release}` cross threads, each via a small fenced handoff — *not* shared mutable world state. **Correction
+   (re-eval 2026-06-09):** the Geo lane as built uses **brief-critical-section `Mutex` slots** (newest-wins
+   view, latest-wins frame mailbox, textured set — `stream_thread.rs`), not lock-free seqlocks; that is
+   sound here because neither side ever holds a slot lock across real work. The "lock-free seqlock / ring"
+   wording is the *gameplay* aspiration, and the gameplay mirror carries a hard rule the Geo shape must not
+   silently relax: **never hold the view/snapshot lock across a fixed sub-step** (that would reintroduce the
+   game-thread priority inversion this ADR's Alternatives reject). §1C still holds either way: producer and
+   consumer touch disjoint, fenced slots, never the same mutable datum.
 
 5. **Retained, refcounted handoff — no use-after-free across the ABI.** Geo holds its per-tile geometry as
    **`Arc<TileGeometry>`**: a polled frame clones the `Arc`s of the tiles it references, so eviction merely

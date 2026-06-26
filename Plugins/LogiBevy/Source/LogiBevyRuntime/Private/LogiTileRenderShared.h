@@ -31,8 +31,10 @@ struct FLogiStreamView
 	float ViewportWidth = 1920.0f;
 };
 
-/// Resolve the streaming viewpoint: the PIE/game player camera, else (editor, no PIE) the active
-/// level-viewport. Fills `Loc`, the real viewport size, and the vertical FOV (converted from the camera's
+/// Resolve the streaming viewpoint: the PIE/game player camera, else (editor, no PIE) a PERSPECTIVE
+/// level viewport — the focused pane when it is perspective, otherwise the first visible perspective one,
+/// NEVER an ortho pane (streaming authority must not follow editor focus; the zenith sun keys off this
+/// view). Fills `Loc`, the real viewport size, and the vertical FOV (converted from the camera's
 /// horizontal FOV via the viewport aspect). Returns false when neither is available (no viewport this tick).
 bool LogiResolveStreamView(UWorld* World, FLogiStreamView& Out);
 

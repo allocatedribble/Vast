@@ -13,13 +13,57 @@ publish = false
 # silently break all GLB/tileset decoding with no compile error).
 ureq = { version = "2", features = ["gzip"] }
 url = "2"
-# MPMC channels for the fetch worker pool: request fan-out to N workers, results drained on the owner thread.
+# MPMC channel draining completed fetches (Loaded) from the worker pool to the owner thread.
 flume = { workspace = true }
 # SwissTable maps/sets for the pending / in-flight / disk-cache bookkeeping.
 hashbrown = { workspace = true }
+# CRC-32 (SIMD/hardware-accelerated) over each cached tile's bytes — baked into the cache filename and verified
+# on every read, so a bit-rotted / truncated / externally-corrupted file becomes a clean re-fetch instead of a
+# silently-served garbage tile (disk-cache audit M1). Already in the tree transitively (via flate2); pinned direct.
+crc32fast = "1"
+
+# ---- CyperSource backend (feature `cyper-h2`), the HTTP/3-over-QUIC + HTTP/2 tile lane ---------------------
+# The productionised winner of the Exp-B research (CyperSource): a `cyper::Client` on one dedicated owned
+# thread. It now negotiates **HTTP/3 over QUIC** (compio-quic = quinn-proto on the compio completion reactor —
+# NO tokio) for Google P3DT via Alt-Svc auto-upgrade, with HTTP/2 as the bootstrap + fallback for non-h3 hosts
+# (the QUIC adoption — user-directed `quinn`/QUIC, realised on compio per ADR-0014's "quinn-proto/QUIC later").
+# These are OPTIONAL deps; `--no-default-features` builds the lean ureq-only cdylib (none of the h2/h3/hyper/
+# compio/quinn-proto stack). The Exp-B spike tests (tests/{compio_spike,compio_http_bench,compio_tls,
+# cyper_h2_bench,cyper_p3dt_bench}.rs) are gated on this same feature. NOTE: the feature name `cyper-h2` is
+# legacy — it now enables the h2 *and* h3 cyper lane (kept to avoid a wide, silent-`cfg`-disable rename).
+#
+# compio: the completion-I/O runtime (IOCP on Windows; io_uring on Linux later). `net` = compio-net sockets,
+# `rustls`+`ring` = the TLS stack (ring avoids an aws-lc-rs build dep on the Windows nightly); `quic` = the
+# compio-quic transport (quinn-proto, sans-IO, driven on the proactor) + `h3` = compio's HTTP/3 glue — what
+# cyper's `http3` feature layers the `h3` crate over. No tokio RUNTIME is ever constructed in this stack —
+# precision (source-verified 2026-06-09): the tokio CRATE (net/io-util features) does ride the graph as a
+# transitive hyper-util/h2/h3 dependency, used only as io-compat trait shims.
+# `windows-gro` (UDP generic-receive-offload) was SPIKED AND REVERTED (2026-06-09): the interleaved live A/B
+# measured ~no gain in either arm (the warm-h3 single-tile penalty is userspace stack depth, NOT recv syscalls),
+# so the feature is deliberately ABSENT from the list below. Do not re-enable without a new measurement — quinn
+# ships it off by default over bug #2041 (oversized-packet parsing), so it is risk for zero proven gain here.
+compio = { version = "0.19", features = ["net", "rustls", "ring", "quic", "h3"], optional = true }
+# cyper: the compio HTTP client. `http2` negotiates h2 via ALPN; `http3` + `http3-altsvc` add the HTTP/3 client
+# (over compio-quic) and the Alt-Svc auto-upgrade (connect h2 → read `Alt-Svc: h3=":443"` → switch the host to
+# h3 on the long-lived client). No default features (drops native-tls/json/cookies we don't use).
+cyper = { version = "0.9", default-features = false, features = ["rustls", "http2", "http3", "http3-altsvc"], optional = true }
+
+[features]
+# `cyper-h2` (legacy name; now the h2 *and* h3/QUIC cyper lane) compiles the `CyperSource` backend + the Exp-B
+# spike tests. ON BY DEFAULT: the live keyed P3DT A/B promoted the cyper lane to the production default for
+# Google tiles (ADR-0014 I/O lane; LogiRuntime plan §7.1), and it now negotiates HTTP/3 over QUIC there.
+# Build `--no-default-features` for the lean ureq-only cdylib (none of the h2/h3/hyper/compio/quinn-proto
+# stack) — the runtime FFI `fetch_backend` knob can also force `ureq` at world-create time inside this build.
+default = ["cyper-h2"]
+# `flume/async` gives the runtime loop `recv_async` so it PARKS on the command channel (no busy-spin) while
+# awaiting work — enabled only under this feature, so a `--no-default-features` build's flume stays lean.
+cyper-h2 = ["dep:compio", "dep:cyper", "flume/async"]
 
 [dev-dependencies]
 # For the live P3DT streaming example (resolve → fetch → parse → fetch a tile → attempt decode).
 logi_3dtiles_ion = { path = "../logi_3dtiles_ion" }
 logi_3dtiles_tileset = { path = "../logi_3dtiles_tileset" }
 logi_gltf = { path = "../logi_gltf" }
+# Root certs for the TLS-over-compio assembly check in the spike test ONLY (tests/compio_tls.rs) — a
+# dev-dependency so the production cdylib never carries a root store it doesn't read.
+webpki-roots = "0.26"

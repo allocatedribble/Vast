@@ -70,6 +70,15 @@ impl BakedWorld {
         // Read each tile straight from its manifest entry (`read_tile_entry`, O(1) per tile) — no per-tile
         // linear manifest scan, so opening an N-tile store is O(N), not O(N²).
         for entry in manifest_tiles {
+            // Boundary validation (fail-loud, like every other on-disk parse): `TileId::key` packs x/y into
+            // 28-bit fields and only debug_asserts the bound — a corrupt/hostile manifest claiming a deeper
+            // level would silently ALIAS distinct tiles onto one key in release (wrong mesh served).
+            if entry.level >= 28 {
+                return Err(SemanticError::Manifest(format!(
+                    "tile level {} exceeds the 28-bit TileId key limit (max 27)",
+                    entry.level
+                )));
+            }
             let id = TileId::new(entry.level, entry.x, entry.y);
             let tile = store.read_tile_entry(entry)?;
             let mesh = triangulate(&tile, mode, skirt_depth_m).into_ue_cm(); // ENU mesh discarded → move, no copy
@@ -196,7 +205,7 @@ impl BakedWorld {
         // target holds its state instead of flip-flopping as the camera nudges SSE across the line.
         const SSE_HYSTERESIS: f64 = 0.25;
         let params = logi_geo_lod::RefineParams {
-            fov_y_radians,
+            tan_half_fov_y: logi_geo_lod::tan_half_fov_y(fov_y_radians), // precomputed once per pass
             viewport_height,
             sse_target,
             hysteresis: SSE_HYSTERESIS,

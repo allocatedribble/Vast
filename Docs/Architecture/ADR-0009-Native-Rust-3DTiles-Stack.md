@@ -58,12 +58,19 @@ per-tile texture channel.**
   (kick / skip-LOD / `ancestorMeetsSse` / REPLACE+ADD refine), generalising the regular-quadtree
   `select_hierarchical`. SSE / culling / cache / scheduler are reused; the existing anti-thrash
   hysteresis is kept.
+  [correction 2026-06-09: cesium-native's **skip-LOD** was intentionally NOT ported — the
+  show-coarse-ancestor-until-descendants-complete **kick** is the chosen alternative; `logi_3dtiles_select`
+  implements no skip-LOD path.]
 - **Content decode in Rust:** glTF (the `gltf` crate) + KTX2/Basis + meshopt + quantized-mesh-1.0;
   COLLADA 1.4.1 (`dae-parser`) for KML/DAE assets.
-- **Draco is the one accepted FFI exception:** a vendored, `cc`-built, **decode-only** C++ shim inside
-  `logi_gltf` (plain-data in/out, runs on Rust worker threads, **no Unreal types cross**). Gated behind a
-  `draco` feature. Revisit when a production pure-Rust decoder exists. (`basis-universal`/`meshopt` are
-  standard C++-backed Rust crates, not special cases.)
+- **Draco is the one accepted FFI exception:** a vendored, `cc`-built, **decode-only** C++ shim
+  (plain-data in/out, runs on Rust worker threads, **no Unreal types cross**). Revisit when a production
+  pure-Rust decoder exists. (`basis-universal`/`meshopt` are standard C++-backed Rust crates, not special
+  cases.)
+  [correction 2026-06-09: the shim lives in its own `logi_draco` crate (a dependency of `logi_gltf`),
+  exposing `logi_draco::decode_mesh(data, &DracoAttributeIds, DecodeLimits)`. The once-planned `draco`
+  cargo-feature gate was NEVER BUILT and is not wanted: the production lane (Google P3DT) is 100 %
+  Draco-compressed geometry, so a no-Draco geo build has no use (YAGNI) — Draco compiles unconditionally.]
 - **IO is synchronous — no tokio.** A `TileContentSource` trait (generalises the existing `Provider`)
   drives selection + integration + LRU on the **single owner thread**; a small `std::thread`/`crossbeam`
   worker pool does fetch → gunzip → decode → interleave and pushes owned blobs back. HTTP = `ureq`;

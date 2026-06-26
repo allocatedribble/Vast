@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 // material, texture, scene, animation, unity, maya, javascript) is encoder/transcoder/IO-only and not
 // reachable from Decoder::DecodeMeshFromBuffer with the transcoder feature off.
 //
+// The sweep is DIRECTORY-granular, so encoder `.cc` TUs living inside these dirs (e.g. compression/'s
+// *_encoder.cc) compile too — accepted: per-file trimming would make every re-vendor a curation chore,
+// and the static-lib link pulls only referenced objects into the cdylib, so the ride-along TUs cost
+// build time, not shipped bytes.
+//
 // Two files were deleted from the vendored mesh/ dir because they #include "draco/texture/..."
 // UNCONDITIONALLY (not behind DRACO_TRANSCODER_SUPPORTED) yet are off the decode path:
 // mesh_are_equivalent.{cc,h} (mesh equality testing) and mesh_splitter.{cc,h} (transcoder mesh split).

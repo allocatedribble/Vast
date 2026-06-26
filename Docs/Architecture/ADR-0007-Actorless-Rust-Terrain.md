@@ -59,9 +59,12 @@ deterministic representation (resolve before vehicles/pathing depend on it).
   streaming stress test intact.
 - Two render lanes (Milestones D/E): a debug `FPrimitiveSceneProxy` lane to prove
   actorless streaming, then a Nanite-compatible resource lane for production
-  (behind `LOGI_TERRAIN_RUNTIME_NANITE_BUILD`, off until an engine-source spike
-  passes). Mesh-voxel pages decode to mesh geometry so they ride the same
+  (behind `LOGI_TERRAIN_RUNTIME_NANITE_BUILD` [correction: the shipped editor-only
+  gate is now `LOGI_GEO_NANITE_LANE`, see ADR-0008/0013], off until an engine-source
+  spike passes). Mesh-voxel pages decode to mesh geometry so they ride the same
   Nanite/Lumen/VSM path.
+  [correction 2026-06-09: reframed by ADR-0013 — the scene-proxy lane is the production
+  default; the Nanite lane is editor-only (ADR-0008).]
 - CI gates: no terrain `AActor` created; no per-tile `Tick`; no terrain data in
   component properties; memory/in-flight/GPU-mirror budgets never exceeded.
 

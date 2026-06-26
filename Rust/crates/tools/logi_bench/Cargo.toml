@@ -1,0 +1,15 @@
+[package]
+name = "logi_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "geo-bench — the Geo streaming test/bench harness CLI (Docs/Testing/Geo-Bench.md)"
+
+[[bin]]
+name = "geo-bench"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+logi_geospatial = { path = "../../geo/logi_geospatial" }
+logi_geo_mesh = { path = "../../geo/logi_geo_mesh" }

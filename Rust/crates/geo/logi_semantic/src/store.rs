@@ -118,7 +118,7 @@ impl BakedTileSource {
 }
 
 impl TileContentSource for BakedTileSource {
-    fn request(&mut self, id: RequestId, url: &str, _now_tick: u64) {
+    fn request(&mut self, id: RequestId, url: &str, _priority: f64, _now_tick: u64) {
         // Synchronous local read — see the type doc (deterministic local lane, blocking by design).
         let path = self.dir.join(url);
         let bytes = std::fs::read(&path).unwrap_or_else(|e| {
@@ -130,7 +130,11 @@ impl TileContentSource for BakedTileSource {
         self.in_flight.insert(id);
         // A local read failure degrades to an empty body (logged above). Wrapped `Ok` to match the typed
         // fetch contract (audit A10); the baked owner treats an empty body as the missing-tile sentinel.
-        self.ready.push(Loaded { id, result: Ok(bytes) });
+        // L4: the contract now carries the bytes as a shared `Arc<[u8]>` (`Vec` → `Arc` is one move here).
+        self.ready.push(Loaded {
+            id,
+            result: Ok(bytes.into()),
+        });
     }
 
     fn poll_completed(&mut self, _now_tick: u64, out: &mut Vec<Loaded>) {
@@ -217,7 +221,7 @@ mod tests {
         write_tile(&dir, &t);
 
         let mut src = BakedTileSource::new(&dir);
-        src.request(42, &id.file_name(), 0);
+        src.request(42, &id.file_name(), 0.0, 0);
         assert_eq!(src.in_flight(), 1);
         let mut out = Vec::new();
         src.poll_completed(0, &mut out);
@@ -227,7 +231,7 @@ mod tests {
         assert_eq!(src.in_flight(), 0);
 
         // A missing file is an empty (failed) load, not a panic.
-        src.request(7, "does_not_exist.lst", 0);
+        src.request(7, "does_not_exist.lst", 0.0, 0);
         let mut out2 = Vec::new();
         src.poll_completed(0, &mut out2);
         assert_eq!(out2.len(), 1);

@@ -19,3 +19,7 @@ logi_geo_mesh = { path = "../logi_geo_mesh" }
 # Draco mesh decompression (KHR_draco_mesh_compression): Google P3DT + Cesium fine-LOD tiles ship Draco —
 # without it they decode to 0 primitives (the planet never reaches full detail). ADR-0009's Draco exception.
 logi_draco = { path = "../logi_draco" }
+# f64 node-transform recovery (the tile-quilt fix): the `gltf` crate parses node matrices/TRS to f32, which
+# truncates Google P3DT's Earth-radius ECEF placement to a ~0.76 m per-tile grid → tile-aligned depth seams.
+# We re-read the node transforms from the GLB JSON chunk as f64. (serde_json is already a workspace dep.)
+serde_json = { workspace = true }

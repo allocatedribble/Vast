@@ -4,8 +4,9 @@
 //!   `$env:CESIUM_ION_TOKEN="<token>"; cargo test -p logi_geo_ffi --release -- --ignored globe_streams_live`
 
 use logi_geo::ffi::{
-    logi_globe_world_cached_bytes, logi_globe_world_create, logi_globe_world_destroy, logi_globe_world_poll,
-    logi_globe_world_set_view, LogiGlobeCreateInfo, LogiGlobeFrame, LogiGlobeTile, LogiGlobeView, LogiStatus,
+    logi_globe_world_create, logi_globe_world_destroy, logi_globe_world_poll, logi_globe_world_set_view,
+    logi_globe_world_telemetry, LogiClipBox, LogiGlobeCreateInfo, LogiGlobeFrame, LogiGlobeTelemetry, LogiGlobeTile,
+    LogiGlobeView, LogiStatus,
 };
 use std::mem::size_of;
 
@@ -32,8 +33,9 @@ fn sample_view(cx: f64, cy: f64, cz: f64) -> LogiGlobeView {
 /// A mismatch means the header drifted from the Rust struct — the classic silent-ABI-corruption bug.
 #[test]
 fn globe_structs_have_the_documented_abi_layout() {
-    assert_eq!(size_of::<LogiGlobeCreateInfo>(), 56, "LogiGlobeCreateInfo");
-    assert_eq!(size_of::<LogiGlobeTile>(), 88, "LogiGlobeTile");
+    assert_eq!(size_of::<LogiGlobeCreateInfo>(), 64, "LogiGlobeCreateInfo"); // v11: +fetch_backend +_reserved (was 56)
+    assert_eq!(size_of::<LogiGlobeTile>(), 104, "LogiGlobeTile"); // v12: +clip_boxes +clip_box_count +_pad_clip (was 88)
+    assert_eq!(size_of::<LogiClipBox>(), 48, "LogiClipBox"); // v12: hole-clip OBB (center + 3 half-axes)
     assert_eq!(size_of::<LogiGlobeFrame>(), 80, "LogiGlobeFrame"); // v8: +delta lists +counts +frame_id (was 48)
     assert_eq!(size_of::<LogiGlobeView>(), 104, "LogiGlobeView"); // 13 × f64
 }
@@ -50,8 +52,10 @@ fn globe_null_args_rejected_not_crashed() {
         origin_height_m: 0.0,
         max_tile_distance_m: 6000.0,
         workers: 4,
-        mesh_cache_budget_mb: 0, // 0 = leave the in-memory mesh cache at its default budget
+        flash_cache_budget_mb: 0, // 0 = leave the in-memory flash cache at its default budget
         cache_budget_bytes: 0,
+        fetch_backend: 0, // Auto
+        _reserved: 0,
     };
     // Non-null info but null token is still rejected (no resolve attempted).
     assert!(unsafe { logi_globe_world_create(&info as *const _, std::ptr::null(), std::ptr::null()) }.is_null());
@@ -95,8 +99,10 @@ fn globe_streams_live() {
         origin_height_m: 0.0,
         max_tile_distance_m: 6000.0,
         workers: 8,
-        mesh_cache_budget_mb: 256, // exercise the in-memory mesh-cache budget path alongside the disk budget
+        flash_cache_budget_mb: 256, // exercise the in-memory flash-cache budget path alongside the disk budget
         cache_budget_bytes: 512 * 1024 * 1024,
+        fetch_backend: 0, // Auto → CyperSource (HTTP/3/QUIC) for this Google P3DT asset when built with cyper-h2 (default)
+        _reserved: 0,
     };
     let world = unsafe { logi_globe_world_create(&info as *const _, token.as_ptr(), cache_dir_c.as_ptr()) };
     assert!(!world.is_null(), "ion resolve / root fetch failed");
@@ -133,16 +139,57 @@ fn globe_streams_live() {
         "P3DT tiles carry a texture"
     );
 
+    // v12 hole-clip plumbing, validated WHEN present (presence is scene-dependent — a fully settled or fully
+    // unsettled frame may legitimately carry none — so this never *requires* a clip): a stand-in with
+    // `clip_box_count > 0` must expose a valid arena slice of sane, finite OBBs; a count of 0 must carry the
+    // documented NULL pointer (`build_globe_frame`'s contract).
+    let tiles = unsafe { std::slice::from_raw_parts(frame.tiles, frame.tile_count as usize) };
+    let mut clipped_tiles = 0u32;
+    for t in tiles {
+        if t.clip_box_count > 0 {
+            clipped_tiles += 1;
+            assert!(!t.clip_boxes.is_null(), "clip_box_count > 0 ⇒ non-null clip_boxes");
+            assert!(
+                t.clip_box_count <= 8,
+                "the selector caps clip children at 8 (LOGI_CLIP_MAX / MAX_CLIP_BOXES_PER_TILE)"
+            );
+            let boxes = unsafe { std::slice::from_raw_parts(t.clip_boxes, t.clip_box_count as usize) };
+            for b in boxes {
+                assert!(b.center.iter().all(|c| c.is_finite()), "clip center is finite");
+                assert!(
+                    b.half_axes.iter().flatten().all(|c| c.is_finite()),
+                    "clip half-axes are finite"
+                );
+            }
+        } else {
+            assert!(
+                t.clip_boxes.is_null(),
+                "clip_box_count == 0 ⇒ NULL clip_boxes (documented contract)"
+            );
+        }
+        assert_eq!(t._pad_clip, 0, "the v12 alignment pad is always written 0");
+    }
+    eprintln!(
+        "tiles carrying v12 clip boxes this frame: {clipped_tiles}/{}",
+        frame.tile_count
+    );
+
     // Null out-frame is rejected on a valid world.
     assert_eq!(
         unsafe { logi_globe_world_poll(world, std::ptr::null_mut()) },
         LogiStatus::NullArg
     );
 
-    // The persistent disk cache populated as tiles streamed.
-    let cached = unsafe { logi_globe_world_cached_bytes(world) };
-    assert!(cached > 0, "disk cache should have populated while streaming");
-    eprintln!("disk cache resident: {} MB", cached / (1024 * 1024));
+    // The v16 telemetry block fills whole (the size return is the layout handshake), and the persistent
+    // disk cache populated as tiles streamed.
+    let mut telemetry = unsafe { std::mem::zeroed::<LogiGlobeTelemetry>() };
+    let written = unsafe { logi_globe_world_telemetry(world, &mut telemetry) };
+    assert_eq!(written, size_of::<LogiGlobeTelemetry>(), "telemetry size handshake");
+    assert!(
+        telemetry.disk_bytes > 0,
+        "disk cache should have populated while streaming"
+    );
+    eprintln!("disk cache resident: {} MB", telemetry.disk_bytes / (1024 * 1024));
 
     unsafe { logi_globe_world_destroy(world) };
 }

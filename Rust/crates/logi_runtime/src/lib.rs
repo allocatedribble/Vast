@@ -22,7 +22,9 @@ use logi_sim::components::{
     Agent, AnimationDrive, CullState, Renderable, Representation, Shipment, Simulated, StableId, Transform3d,
     Velocity3d,
 };
-use logi_sim::resources::{RepresentationBudget, SimClock, SimRng, TerrainResource, UnrealFrameInput};
+use logi_sim::resources::{
+    RepresentationBudget, SignificanceIndex, SimClock, SimRng, TerrainResource, UnrealFrameInput,
+};
 use logi_sim::schedules::{run_if_populated, LogiSchedulerMode, LogiSchedules};
 use logi_sim::terrain::Terrain;
 
@@ -254,6 +256,9 @@ impl LogiWorld {
             }
         };
         world.insert_resource(budget);
+        // The persistent significance index the budget system ranks against (ADR-0020 R1);
+        // grows lazily with the entity index space.
+        world.insert_resource(SignificanceIndex::default());
         world.insert_resource(RenderSnapshotResource::default());
 
         let mut schedules = LogiSchedules::new(config.scheduler_mode(), config.worker_thread_count);
@@ -483,6 +488,19 @@ impl LogiWorld {
     /// Retire a published snapshot buffer (after Unreal has consumed it). §11.
     pub fn release_snapshot(&mut self, snapshot_id: u64) -> bool {
         self.ring.retire(snapshot_id)
+    }
+
+    /// Test-support seam for the CROSS-PROCESS determinism gate (`tests/parallel_determinism.rs`): seed
+    /// every agent's velocity from its stable index so `integrate_motion` does varying real work. Hidden —
+    /// not part of the runtime contract (the FFI spawn command carries no velocity), and an integration
+    /// test cannot reach the private `world` the in-crate tests use for the same seeding.
+    #[doc(hidden)]
+    pub fn debug_seed_velocities(&mut self, f: impl Fn(u64) -> [f32; 3]) {
+        use logi_sim::components::{StableId, Velocity3d};
+        let mut q = self.world.query::<(&StableId, &mut Velocity3d)>();
+        for (sid, mut vel) in q.iter_mut(&mut self.world) {
+            vel.linear_cm_s = f(sid.0.index);
+        }
     }
 
     // --- Published snapshot accessors (read by the FFI) ---
@@ -935,14 +953,13 @@ mod tests {
             out
         }
 
-        // The global `ComputeTaskPool` is a one-shot singleton: whichever mode runs first fixes its size for
-        // the whole process. Init a genuinely multi-threaded pool HERE (4 threads regardless of core count, so
-        // it is real even on small CI runners) before either run, so the BoundedParallel run actually fans
-        // `par_iter` across threads instead of silently degrading to serial-vs-serial. No hard thread-count
-        // assert: in a full `cargo test` another test may have already initialized the singleton, and the
-        // equality below is the real guard. (A rigorous serial-vs-parallel `par_iter` comparison would need a
-        // separate process; this asserts the multi-threaded EXECUTOR matches the single-threaded one — the
-        // concurrency the `multi_threaded` feature actually introduces.)
+        // The global `ComputeTaskPool` is a one-shot singleton: whichever test runs first fixes its size for
+        // the whole process, so within THIS binary both arms inevitably share one pool (and, since the Exp-C
+        // executor decision, one SingleThreaded system executor too) — making this an in-process SMOKE test,
+        // not the real serial-vs-parallel comparison. The rigorous gate is the CROSS-PROCESS
+        // `tests/parallel_determinism.rs` (re-eval 2026-06-09): its child process pins a genuine 1-thread
+        // pool for the serial-fold arm, the parent hard-asserts a multi-thread pool, and the full per-tick
+        // snapshot stream is digested. Keep this one as fast in-binary coverage of the scenario itself.
         bevy_tasks::ComputeTaskPool::get_or_init(|| bevy_tasks::TaskPoolBuilder::new().num_threads(4).build());
 
         let single = run(LOGI_FLAG_FORCE_SINGLE_THREADED);

@@ -11,7 +11,7 @@
 
 use core::mem::{align_of, offset_of, size_of};
 use logi_geo::ffi::{
-    LogiBuildingData, LogiGlobeCreateInfo, LogiGlobeFrame, LogiGlobeTile, LogiGlobeView, LogiPlacement,
+    LogiBuildingData, LogiClipBox, LogiGlobeCreateInfo, LogiGlobeFrame, LogiGlobeTile, LogiGlobeView, LogiPlacement,
 };
 use logi_geo::ffi_baked::{LogiBakedCreateInfo, LogiBakedFrame, LogiBakedProceduralInfo, LogiBakedTile};
 
@@ -55,18 +55,20 @@ fn globe_and_building_structs_match_the_header() {
         ecef_origin => 72,
     });
 
-    assert_layout!(LogiGlobeCreateInfo, size = 56, align = 8, {
+    assert_layout!(LogiGlobeCreateInfo, size = 64, align = 8, {
         ion_asset_id => 0,
         origin_longitude_deg => 8,
         origin_latitude_deg => 16,
         origin_height_m => 24,
         max_tile_distance_m => 32,
         workers => 40,
-        mesh_cache_budget_mb => 44,
+        flash_cache_budget_mb => 44,
         cache_budget_bytes => 48,
+        fetch_backend => 56,
+        _reserved => 60,
     });
 
-    assert_layout!(LogiGlobeTile, size = 88, align = 8, {
+    assert_layout!(LogiGlobeTile, size = 104, align = 8, {
         tile_key => 0,
         vertices => 8,
         vertices_len => 16,
@@ -81,6 +83,14 @@ fn globe_and_building_structs_match_the_header() {
         bounds_radius => 76,
         depth => 80,
         geometric_error => 84,
+        clip_boxes => 88,
+        clip_box_count => 96,
+        _pad_clip => 100,
+    });
+
+    assert_layout!(LogiClipBox, size = 48, align = 4, {
+        center => 0,
+        half_axes => 12,
     });
 
     assert_layout!(LogiGlobeFrame, size = 80, align = 8, {

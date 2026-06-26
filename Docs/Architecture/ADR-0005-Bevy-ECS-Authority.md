@@ -22,7 +22,8 @@ things overturn the Mass half of that decision:
    a narrow C ABI.** That contract — *Rust owns truth, Unreal renders it, Unreal calls Rust, Rust never
    calls Unreal* — is correct and should be **general**, not a terrain special case.
 
-**`bevy_ecs` 0.18.1** is a mature, widely-used, **standalone** ECS that runs as a plain Rust library,
+**`bevy_ecs` 0.18.1** [correction 2026-06-09: Cargo.lock now resolves 0.19.0-rc.2; the verified constraints
+carry over] is a mature, widely-used, **standalone** ECS that runs as a plain Rust library,
 independent of the full Bevy engine. It provides archetypal **and** sparse-set storage, schedules,
 systems, queries, change detection, events, and command buffers — everything Mass offered as authority —
 but in deterministic, portable, headless-testable Rust. Adopting it is therefore **not** the

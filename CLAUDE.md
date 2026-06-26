@@ -58,6 +58,61 @@ Efficiency is a design criterion here, not an afterthought — see [`AGENTS.md`]
   solution is the lowest-order one, with the fewest and cheapest instructions, that a teammate can still
   read.
 
+## Cells within cells, interlinked — *precedent*
+
+When shaping an algorithm or abstraction, hold the baseline: **"cells within cells, interlinked."**
+This is established precedent for how structure is chosen here — the recurring winning shape in this
+codebase is a nested hierarchy of bounded, self-similar cells, coupled only through narrow, explicit
+links. Constitutional home: [ADR-0019](Docs/Architecture/ADR-0019-Cells-Within-Cells-Interlinked.md)
+(this section is its operational mirror; the ADR governs on any divergence).
+
+- **Cells within cells — nest, don't flatten.** Prefer the self-similar hierarchy: tiles within
+  subtrees within the tile tree (ADR-0009/0018); individuals within flows within the statistical far
+  field (ADR-0015); components within entities within archetypes within the `World`; tasks within lanes
+  under one arbiter (ADR-0014). Each cell is bounded — it owns its invariants, its budget, and its
+  working set — and the same shape repeats at every scale. Nesting is what turns `O(n)` into
+  `O(log n)` / `O(active)`: a flat scan over a planet or a million agents does not ship.
+- **Interlinked — couple through narrow, explicit links.** Cells touch only at deliberate seams: the
+  C ABI boundary (ADR-0005/0012), `Promoted<T>` between determinism lanes (ADR-0016), parent↔child
+  graft and clip links in the tile tree, the retained snapshot between sim and renderer. The link *is*
+  the contract; everything behind it stays private. A design whose cells reach into each other's
+  interiors is entangled, not interlinked — redraw it.
+- **The ladder — run the lens at both ends, then climb.** Hold every abstraction at its *lowest* rung
+  (bytes in a 32-byte vertex, bits folded into a key, one chain of dependent instructions) and — in
+  parallel — at the *highest* rung in view (threads, processes, the Rust sim ↔ Unreal renderer
+  organism). The two ends discipline each other: the bottom shows which shape actually repeats; the top
+  shows what the containment must serve. Then use both views together to draw the cell **one level
+  above** the current highest — the container not yet named, whose absence shows up as sibling cells
+  describing the same truth with no link between them — and repeat from there. The climb closes only at
+  the North-Star cell: the shipped game at a million agents. An abstraction is settled when the same
+  cells-interlinked shape reads true at *every* rung; a rung where it doesn't is the next piece of work.
+  (The method is itself self-similar: each rung of analysis is a cell, interlinked with the rungs above
+  and below it.)
+- **The bi-tree optimization rule — optimize both ends for each other, simultaneously, independently.**
+  The hierarchy is a tree with two ends; an optimization pass runs at both at once, each end shaped FOR
+  the opposite end: the bottom for the top (the 32-byte vertex makes the upload one flat memcpy; the
+  incremental path key makes every map above probe O(1)), and the top for the bottom (the poll-FFI keeps
+  per-tile work off the game thread; the working-set law keeps per-step instructions O(active)). The two
+  passes are independent lanes (§1E) that meet only at the link between them — a change at one end that
+  forces re-opening the other end's interior means the link is mis-drawn, not that the passes must fuse.
+  An optimization is finished only when both ends have been asked "what does the opposite end now make
+  cheap that wasn't before?" — one-ended optimization leaves half the win on the table. (ADR-0019 § 4.)
+- **Superposed interiors; deliberate alphabets.** A cell's interior need not hold a definite value —
+  the cheapest faithful state is often a *distribution over an alphabet* (a statistical aggregate, a
+  seed, an unbaked derivation) collapsed only when an observation crosses a link, by a deterministic
+  keyed rule so the measurement replays (the kick and Sim-LOD promotion are both collapse events;
+  store-the-amplitude is the third option beside store-the-value and compute-on-demand). And the
+  alphabet itself is a design axis — the bit is its degenerate two-letter case; identities are words
+  (the path key), validity sets are grammars (availability), and every branching factor or tier count
+  is a radix choice to argue, not inherit. Classical distributions only: compression + deferred
+  choice are the harvest, never a claimed speedup. (ADR-0019 §§ 8–9; ADR-0023 § 7 — fidelity tiers
+  are an observer-indexed alphabet.)
+- **The design test.** Before building, name the cell (the bounded self-similar unit), the cell that
+  contains it, and the links it exposes — then run the ladder through it. If the design can't be drawn
+  as cells within cells, interlinked — if it's one flat sweep, or a web of cross-references with no
+  hierarchy — that is the signal to find the structure first. New work follows this precedent or
+  argues, in an ADR, why it can't.
+
 ## Architecture decision records (read before designing)
 
 - [ADR-0005 — Bevy ECS Authority](Docs/Architecture/ADR-0005-Bevy-ECS-Authority.md) — **the current law.**
@@ -86,6 +141,71 @@ Efficiency is a design criterion here, not an afterthought — see [`AGENTS.md`]
   loop advance on **Rust-owned threads**, and Unreal (on its game thread) only pushes view/input and pulls
   the latest retained snapshot. Geo runs fully async (ADR-0007); gameplay stays fixed-step deterministic.
   Plan in [Docs/Plans/Async-Sim-Decoupling-and-Geo-Performance.md](Docs/Plans/Async-Sim-Decoupling-and-Geo-Performance.md).
+- [ADR-0013 — Terrain Static Relevance + GPU-Scene](Docs/Architecture/ADR-0013-Terrain-Static-Relevance-GPU-Scene.md) —
+  **implements ADR-0008's static-relevance option.** The proc-mesh tile proxy renders via static relevance
+  (cached draw commands, GPU-Scene + GPU culling) instead of per-frame dynamic `FMeshBatch` rebuilds; the
+  `Mesh.LODIndex = INDEX_NONE` renders-nothing gotcha is documented inside.
+- [ADR-0014 — LogiRuntime: Unified Executor + Reactor](Docs/Architecture/ADR-0014-LogiRuntime-Unified-Executor-Reactor.md) —
+  **generalizes ADR-0012 into one runtime.** Two cooperating lanes (work-stealing CPU + `compio` completion
+  I/O) under one core arbiter, joined at the frame poll; compose the proven cores, build only the coordinator
+  (arbiter + frame-harvest + the morsel/precomputed-stage CPU engines). Completes ADR-0012's gameplay
+  decoupling; arbitrates ADR-0005's shared pool (physical-core budget); narrows ADR-0004 (a vendored
+  `bevy_ecs` patch). Plan in [Docs/Plans/LogiRuntime-Design.md](Docs/Plans/LogiRuntime-Design.md).
+- [ADR-0015 — Simulation-LOD](Docs/Architecture/ADR-0015-Simulation-LOD.md) — **extends ADR-0003 to govern
+  whether an entity is simulated at all.** Active set bounded by **budget, not population**; statistical
+  far field (one ODE per flow, O(#flows)); deterministic keyed-seed promotion. The only path past the
+  ~10–30 M memory-bandwidth wall toward billions; necessitates ADR-0014's precomputed-stage executor.
+- [ADR-0016 — Per-Lane Determinism](Docs/Architecture/ADR-0016-Per-Lane-Determinism.md) — **refines ADR-0001's
+  determinism to per-lane scope.** A bounded deterministic near-set + a free non-deterministic far field,
+  bridged by a typed `Promoted<T>`; counter-based RNG. Non-determinism is almost never the win — "no shared
+  state" is, and determinism gets it too.
+- [ADR-0017 — GPU-Resident Statistical Offload](Docs/Architecture/ADR-0017-GPU-Resident-Statistical-Offload.md) —
+  **deferred / dark by default.** Warm/Cold bands resident in a Rust-owned `wgpu` device, shared read-only to
+  UE via an OS handle; amends ADR-0005 by splitting **authority** (Rust keeps) from per-individual
+  **reproducibility** (forfeited on GPU). Gated on a measured bandwidth-bound profile.
+- [ADR-0018 — Geo Streaming Parallelism](Docs/Architecture/ADR-0018-Geo-Streaming-Parallelism.md) — **the Geo
+  step is bounded by the active working-set, not the entity pool.** Drive every per-tile pass off a maintained
+  live-set / explicit transition set (not a `par_iter` scan of the pre-spawned pool), event-drive
+  `reconcile_index` to O(Δ), run the (fully-chained) Geo schedule SingleThreaded, and decouple decode off the
+  stream-thread critical path (measure-gated). Per-step Geo work becomes O(active + Δ), never O(pool); refines
+  ADR-0014 (the bevy *system* executor is idle in Geo by design — the lever is the working-set, not the DAG).
+  From the round-4 research ([Docs/Research/2026-06-09-ECS-Round4-Pipeline-Fork-GPU-Research.md](Docs/Research/2026-06-09-ECS-Round4-Pipeline-Fork-GPU-Research.md)).
+- [ADR-0019 — Cells Within Cells, Interlinked](Docs/Architecture/ADR-0019-Cells-Within-Cells-Interlinked.md) —
+  **the structural precedent** (constitutional home of the section above). Every abstraction = bounded,
+  self-similar cells nested hierarchically, coupled only through narrow explicit links; the both-ends
+  ladder is the design procedure; cross-hierarchy links carry their own refresh discipline; the kick ≈
+  Sim-LOD promotion (one pattern, two rungs). First enforcement 2026-06-11: the `GeoStreaming` sub-cell
+  decomposition + the unified telemetry block (ABI v16) + the perspective-pinned stream view.
+- [ADR-0020 — logi_ecs: the Adopted ECS Fork](Docs/Architecture/ADR-0020-LogiEcs-Incremental-World-Cell.md) —
+  **the ECS is ours.** bevy_ecs 0.19.0-rc.2 adopted as `Rust/crates/logi_ecs` (+ `logi_ecs_macros`);
+  divergences ledgered in `crates/logi_ecs/FORK.md`. Refactor law = ADR-0019 applied to the World itself:
+  a cell bounded by budget, interior maintained O(Δ) (never flat sweeps), interlinked by narrow typed
+  links. Consumers still write `use bevy_ecs::…` (dependency key; the crate SYMBOL stays `bevy_ecs`
+  until D-paramset — a rustc ParamSet hack is keyed on the name).
+- [ADR-0021 — Sim-Tiles: Temporal Simulation-LOD](Docs/Architecture/ADR-0021-Sim-Tiles-Temporal-Simulation-LOD.md) —
+  **extends ADR-0015 with a second refinement axis: time.** A sim-cell's timestep is a resolution
+  (frame → day → **never**: seed + lazy fast-forward — determinism-from-seed is the compression scheme;
+  O(observed), never O(elapsed)). The sim-cell contract: bounds (space, population, dt band, budget) +
+  an **exported error metric** (the program's SSE — designed first) + conserving flux links (settle on
+  the coarse cadence) + a bounded commitments ledger + replay-stable hazard triggers (keyed RNG —
+  promotion is observer-driven AND event-driven). Cross-shard links carry the coarser cadence (tick
+  rate = latency tolerance). Entity count unbounded — a million agents is the floor, never a baked-in
+  cap. Re-scopes R3/R4/R5 of ADR-0020's program; build slots live there.
+- [ADR-0022 — LogiSky: the Rust-Modeled Atmosphere](Docs/Architecture/ADR-0022-LogiSky-Rust-Modeled-Atmosphere.md) —
+  **remakes the stock SkyAtmosphere.** Rust owns the sky model (parameters, sun, WGS84 — single-homed
+  with the terrain geodesy) and BAKES the LUTs; UE is a thin GPU shell. Aerial perspective is analytic
+  from ELLIPSOID depth, never scene depth — the tile quilt + orbital froxel checkerboard become
+  unrepresentable. Event-gated cadence; renderer-agnostic `LogiSkyFrame` + LUT buffers generalize the
+  ECS render abstraction. Absorbs Fix B; retires the v15 anchor on completion. **Scope: ALL atmospheric
+  rendering** (sky/AP/clouds/haze/twilight — one cell, no second atmospheric system). Plan in
+  [Docs/Plans/LogiSky-Atmosphere-Remake.md](Docs/Plans/LogiSky-Atmosphere-Remake.md).
+- [ADR-0023 — One Truth, Many Formulas](Docs/Architecture/ADR-0023-One-Truth-Many-Formulas.md) —
+  **the resolution-ladder precedent, brother to ADR-0019** (0019 = the structure axis, 0023 = the
+  evaluation axis). Every continuously-evaluated quantity = ONE parameter truth + a FAMILY of formulas
+  at declared (cost, error) tiers — the exact/reference form always in-repo as the test oracle, baked
+  and analytic tiers with TESTED bounds (agreement gates), seamless handoffs inside overlapping
+  validity domains, joint coverage of every scale (orbit → on-foot). Generalizes ADR-0003/0015/0021 to
+  rendering; first enforcement = logi_sky's fidelity tiers + cross-tier agreement gate.
 - [ADR-0001 — Mass-First Unreal](Docs/Architecture/ADR-0001-Mass-First-Unreal.md) — **superseded in part**
   by ADR-0005. Its Determinism section and the "Unreal is a shell" principle still hold.
 - [ADR-0002 — Rust Terrain Kernel](Docs/Architecture/ADR-0002-Rust-Terrain-Kernel.md) — terrain truth in
@@ -103,7 +223,9 @@ Efficiency is a design criterion here, not an afterthought — see [`AGENTS.md`]
 - **Engine:** Unreal Engine 5.8 (`LogiUE.uproject`). Mass plugins (`MassGameplay`, `MassAI`) remain
   enabled **only** as a transitional, non-authoritative bridge — do not build gameplay on them.
 - **Rust:** cargo/rustc 1.97 nightly, host `x86_64-pc-windows-msvc`. The simulation lives in `Rust/` and
-  is built/tested with `cargo` (headless, no editor). `bevy_ecs` only — never the full `bevy` engine.
+  is built/tested with `cargo` (headless, no editor). The ECS is **our fork** `logi_ecs`
+  (`Rust/crates/logi_ecs`, ADR-0020) consumed under the `bevy_ecs` dependency key — never the full
+  `bevy` engine.
 - **C ABI header:** generated by `cbindgen` from `logi_ffi` and checked in.
 - **Unreal↔Rust:** `Plugins/LogiBevy` builds/links the Rust artifact via `LogiBevyRuntime.Build.cs`.
 - **MCP bridge:** a **running** Unreal Editor exposes MCP tools at `http://localhost:3000/mcp`. Treat it

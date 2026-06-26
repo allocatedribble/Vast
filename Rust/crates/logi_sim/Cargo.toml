@@ -10,6 +10,10 @@ bevy_tasks.workspace = true
 logi_schema = { path = "../logi_schema" }
 # Coarse deterministic ground for gameplay queries (ADR-0007 / plan §10).
 logi_geo_procgen = { path = "../geo/logi_geo_procgen" }
+# Physical-core probe for the compute-pool budget (ADR-0014, Exp C): size the pool
+# off PHYSICAL cores so we don't over-subscribe UE's TaskGraph on SMT CPUs. Tiny
+# pure utility (already in the lock tree via bevy_tasks) — not a GPU/render crate.
+num_cpus = "1"
 
 [dev-dependencies]
 # Test-only: a result map keyed by entity index for the representation-budget assertions.

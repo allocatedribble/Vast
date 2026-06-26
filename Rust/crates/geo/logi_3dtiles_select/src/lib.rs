@@ -5,7 +5,7 @@
 //!
 //! Implements: per-volume distance (region/box/sphere → an ECEF bounding sphere, plan §9.4 globe geometry),
 //! the SSE refine decision (the same model as `logi_geo_lod` / 3D Tiles) with a **hysteresis dead-band**,
-//! `REPLACE` refinement, and the cesium-native **cross-frame kick** (plan §9.2): a per-tile
+//! both `REPLACE` and `ADD` refinement (per-tile, inherited), and the cesium-native **cross-frame kick** (plan §9.2): a per-tile
 //! [`SelectionResult`] is folded up as [`TraversalDetails`] and persisted as a [`SelectionState`] so a fresh,
 //! not-yet-loaded refinement renders the coarse ancestor instead of a hole-y partial split, then switches to
 //! the fine LOD **atomically** once the subtree fully loads (and never pops backward once it's been shown).
@@ -15,8 +15,9 @@
 //! `culled_screen_space_error` (a resident coarse shell — shadow-safe, since the engine casts shadows from a
 //! larger-than-view frustum — never hard-culled by direction; only distance hard-culls). Also done: the
 //! `ancestor_meets_sse` coarse-fallback load (§9.2 step 6) and, in the Geo World, the view-direction fetch
-//! priority (§9.2 step 7) + the ECEF view frustum. Only `ADD` refinement is still deferred (warned + treated
-//! as REPLACE — no ADD tileset in the pipeline to validate against).
+//! priority (§9.2 step 7) + the ECEF view frustum. `ADD` refinement is implemented (REPLACE/ADD chosen
+//! per-tile and inherited): an ADD tile renders its own content alongside its refined children, so the kick +
+//! `ancestor_meets_sse` coarse fallback are gated off for ADD (it has no holes). Both lanes are unit-tested.
 
 #![forbid(unsafe_code)]
 
@@ -38,6 +39,164 @@ use std::rc::Rc;
 // clamps. The 3D-Tiles selection traversal below calls it exactly as the quadtree streamer does.
 pub use logi_geo_lod::screen_space_error;
 
+/// Canonical 64-bit tile identity: FNV-1a over the path's little-endian segment bytes. The single home of
+/// the hash the whole stack keys on — the entity `TileId`, the `FlashCache` key, and (published as
+/// `LogiGlobeTile.tile_key`) the C++ section-cache key. [`PathArena`] computes it INCREMENTALLY per node
+/// (FNV-1a is a sequential fold, so a child's key extends its parent's), guaranteed identical to this
+/// definition; tests and path-only callers use this free function directly.
+pub fn path_key(path: &[u32]) -> u64 {
+    let mut h = FNV_OFFSET;
+    for &seg in path {
+        h = fnv_extend(h, seg);
+    }
+    h
+}
+
+const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+
+/// Extend an FNV-1a state by one path segment's 4 LE bytes — the incremental step [`PathArena`] applies
+/// per interned child so `arena.key(node) == path_key(path_of(node))` holds by construction.
+#[inline]
+fn fnv_extend(mut h: u64, seg: u32) -> u64 {
+    for b in seg.to_le_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// One interned tile-path node: its parent id + the child-index step that reaches it, with the derived
+/// depth and the canonical [`path_key`] cached at intern time.
+struct ArenaNode {
+    parent: u32,
+    step: u32,
+    depth: u32,
+    key: u64,
+}
+
+/// Sentinel "no node" id (also the root's parent). The arena can never hold `u32::MAX` real nodes (the
+/// edge map alone would exceed memory long before), so the sentinel is unambiguous.
+pub const NO_NODE: u32 = u32::MAX;
+/// The interned id of the root path `[]` — always the first node of every [`PathArena`].
+pub const ROOT_NODE: u32 = 0;
+
+/// **Path-interning arena** (audit 2026-06-10 §3.2): maps every discovered tile path to a stable small
+/// `u32` node id, so the per-tile maps that used to key on `Vec<u32>` (the selection state here; the
+/// scene's index / failure / retry / in-flight bookkeeping) key on a `u32` instead — O(1) probes with no
+/// per-segment byte hashing, and no per-node `Vec` clones in the traversal's state log (previously O(V·d)
+/// per pass). Ids are stable for the arena's lifetime (the scene owns one arena per streaming world), so
+/// they are valid cross-frame identities. The canonical 64-bit [`path_key`] is computed incrementally at
+/// intern time and cached per node.
+///
+/// Growth: append-only — nodes accumulate with explored extent (~32 B/node + an edge-map entry). A planet
+/// fly-through discovering 1M tiles costs ~50 MB; bounding this (free-listing pruned graft subtrees, or an
+/// epoch compaction) is DEFERRED until telemetry shows it matters — every id consumer would need epoch
+/// coordination, and the cold-graft prune already bounds the much larger `Tile` tree itself.
+pub struct PathArena {
+    nodes: Vec<ArenaNode>,
+    /// `(parent, step) → child` edge map — the intern lookup. u32-pair keys hash in one shot.
+    edges: HashMap<(u32, u32), u32>,
+}
+
+impl Default for PathArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PathArena {
+    pub fn new() -> Self {
+        Self {
+            nodes: vec![ArenaNode {
+                parent: NO_NODE,
+                step: 0,
+                depth: 0,
+                key: FNV_OFFSET, // == path_key(&[])
+            }],
+            edges: HashMap::new(),
+        }
+    }
+
+    /// Intern (or look up) the child of `parent` reached by child-index `step`. Amortized O(1).
+    #[inline]
+    pub fn child_of(&mut self, parent: u32, step: u32) -> u32 {
+        if let Some(&id) = self.edges.get(&(parent, step)) {
+            return id;
+        }
+        let p = &self.nodes[parent as usize];
+        let node = ArenaNode {
+            parent,
+            step,
+            depth: p.depth + 1,
+            key: fnv_extend(p.key, step),
+        };
+        let id = self.nodes.len() as u32;
+        self.nodes.push(node);
+        self.edges.insert((parent, step), id);
+        id
+    }
+
+    /// Intern a whole path from the root — O(d); used by tests and rare scene paths (graft targets).
+    pub fn intern_path(&mut self, path: &[u32]) -> u32 {
+        let mut n = ROOT_NODE;
+        for &step in path {
+            n = self.child_of(n, step);
+        }
+        n
+    }
+
+    /// The node's parent id (`None` for the root).
+    #[inline]
+    pub fn parent(&self, id: u32) -> Option<u32> {
+        let p = self.nodes[id as usize].parent;
+        (p != NO_NODE).then_some(p)
+    }
+
+    /// Tree depth (root = 0) — equals `path_of(id).len()`.
+    #[inline]
+    pub fn depth(&self, id: u32) -> u32 {
+        self.nodes[id as usize].depth
+    }
+
+    /// The canonical [`path_key`] of this node's path, cached at intern time.
+    #[inline]
+    pub fn key(&self, id: u32) -> u64 {
+        self.nodes[id as usize].key
+    }
+
+    /// Reconstruct the node's child-index path (root-first) — O(d) with one allocation; for the rare
+    /// path-shaped consumers (tree grafting/walking), never the per-tile hot loops.
+    pub fn path_of(&self, id: u32) -> Vec<u32> {
+        let mut out = vec![0u32; self.nodes[id as usize].depth as usize];
+        let mut n = id;
+        for slot in out.iter_mut().rev() {
+            let node = &self.nodes[n as usize];
+            *slot = node.step;
+            n = node.parent;
+        }
+        out
+    }
+
+    /// Is `ancestor` an ancestor of — or equal to — `node`? O(depth difference) parent hops.
+    pub fn is_ancestor_or_self(&self, ancestor: u32, node: u32) -> bool {
+        let target_depth = self.nodes[ancestor as usize].depth;
+        let mut n = node;
+        while self.nodes[n as usize].depth > target_depth {
+            n = self.nodes[n as usize].parent;
+        }
+        n == ancestor
+    }
+
+    /// Interned node count (telemetry — watch growth over a long session).
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        false // the root always exists
+    }
+}
+
 /// The per-frame view + LOD parameters that drive selection (camera in ECEF, plan §9.4).
 #[derive(Clone, Copy, Debug)]
 pub struct SelectParams {
@@ -46,11 +205,17 @@ pub struct SelectParams {
     pub viewport_height: f64,
     /// Refine while a tile's screen-space error exceeds this many pixels (3D Tiles `maxScreenSpaceError`).
     pub max_screen_space_error: f64,
-    /// The (looser) SSE target for tiles the visibility predicate reports [`Visibility::Offscreen`] — outside
-    /// the view frustum but kept resident (for shadows the engine casts from a larger-than-view frustum, and
-    /// so a camera turn finds them already coarse-loaded). Typically several× `max_screen_space_error` so
-    /// off-view tiles refine to a coarse shell, not full detail. Set it equal to `max_screen_space_error` to
-    /// disable the distinction (off-view tiles then load at full detail).
+    /// The SSE target for [`Visibility::Distant`] tiles — INSIDE the frustum but beyond the caller's
+    /// full-detail band. These are *visible* (the far vista), so the demotion is mild: typically ~2×
+    /// `max_screen_space_error`. Set it equal to `max_screen_space_error` to disable the distinction.
+    pub distant_screen_space_error: f64,
+    /// The (much looser) SSE target for tiles the visibility predicate reports [`Visibility::Offscreen`] —
+    /// outside the view frustum but kept resident (for shadows the engine casts from a larger-than-view
+    /// frustum, and so a camera turn finds them already coarse-loaded). These are *invisible*, so the
+    /// demotion should be aggressive AND floored by the caller (cesium's `culledScreenSpaceError` is 64 px
+    /// vs a 16 px max): without a floor, a fine `max_screen_space_error` knob makes the whole off-frustum
+    /// hemisphere refine near-full — the 2026-06-10 ground "cut flood" (19k published tiles at 2.5 km,
+    /// max_sse=1, the entire hidden disc at 2 px).
     pub culled_screen_space_error: f64,
     /// Hysteresis dead-band fraction for the refine decision (`0.0` = stateless plain threshold). A tile that
     /// was `Refined` last pass holds its split until SSE drops below `max_screen_space_error / (1 + hysteresis)`,
@@ -66,20 +231,33 @@ pub struct SelectParams {
 /// subtree — reserve it for genuinely out-of-range tiles (e.g. beyond the streaming distance).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Visibility {
-    /// Inside the view frustum (+ any edge margin) — refine to the full `max_screen_space_error`.
+    /// Inside the view frustum (+ any edge margin) and within the full-detail band — refine to the full
+    /// `max_screen_space_error`.
     Visible,
-    /// Outside the view frustum but kept resident — refine only to the coarse `culled_screen_space_error`.
+    /// Inside the frustum but beyond the full-detail band — the VISIBLE far vista; mildly demoted to
+    /// `distant_screen_space_error` (typically ~2× max).
+    Distant,
+    /// Outside the view frustum but kept resident — INVISIBLE; aggressively demoted to the floored
+    /// `culled_screen_space_error` coarse shell.
     Offscreen,
     /// Out of range entirely — drop the whole subtree (no fetch, no render).
     Culled,
 }
 
-/// A tile chosen to render or load. `path` is the child-index path from the root — a stable identity for
-/// dedup + cross-frame state.
+/// A tile chosen to render or load. `path` is the child-index path from the root; `node` is its interned
+/// [`PathArena`] id (the key the per-tile maps use) and `key` the canonical [`path_key`] hash.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectedTile {
     pub path: Vec<u32>,
+    /// Interned [`PathArena`] id — the stable O(1) identity the caller's per-tile maps key on.
+    pub node: u32,
+    /// Canonical 64-bit [`path_key`] of `path` (cached from the arena) — the FlashCache / FFI tile key.
+    pub key: u64,
     pub world_transform: DMat4,
+    /// Content URIs to fetch — populated ONLY for `load` tiles (audit 2026-06-10 §4.7). A `render` tile's
+    /// URIs are never consumed downstream (renderers key by `node`/`key`), and building them eagerly
+    /// allocated a `String` per URI for every loaded interior node per pass — so the render flavor leaves
+    /// this empty. (The traversal builds the same tile in both flavors when it is both rendered and queued.)
     pub content_uris: Vec<String>,
     pub geometric_error: f64,
     pub distance: f64,
@@ -87,6 +265,24 @@ pub struct SelectedTile {
     /// consumer (the ECS Geo World) can populate per-tile bounds without recomputing it.
     pub bounds_center: DVec3,
     pub bounds_radius: f64,
+    /// `true` if this tile uses ADD refinement (renders *in addition to* its children, by design). An ADD tile
+    /// is never hole-clipped — its content is meant to show alongside its descendants — so the post-process
+    /// neither populates its `clip_children` nor clips a descendant against it.
+    pub is_add: bool,
+    /// **Geometric hole-clip** relationship (empty for almost every tile): `(group, key)` for each finer
+    /// tile drawn over this one — its *immediate rendered descendants*, the loaded LOD frontier directly
+    /// beneath it. Populated by the post-process in [`select_tree_implicit`] only when this tile is a coarse
+    /// REPLACE stand-in covering a region where finer tiles have loaded. The selector deliberately emits the
+    /// *relationship*, not clip geometry: a tileset bounding volume is only a loose cover of the actual mesh
+    /// (3D Tiles guarantees a child's content lies inside it, not that it's tight), so the scene materializes
+    /// each child's clip box from its decoded mesh's true AABB — which only the scene holds — and the renderer
+    /// discards this tile's fragments inside those boxes. Coarse + fine then tile the ground edge-to-edge with
+    /// no coplanar overlap (no z-fight, no PDO). (Keys, not paths: the scene resolves a clip child by its
+    /// `tile_key` anyway.) `group` = the FIRST path step below this stand-in (which DIRECT-CHILD subtree the
+    /// descendant lies in, ≤4 quadtree / ≤8 octree values) — the scene UNIONS each group's member boxes into
+    /// one box when they tile the subtree densely, so a skip-level cut with dozens of descendants can't
+    /// overflow the renderer's per-tile clip-box cap (the 2026-06-11 fast-camera coarse-over-fine sheets).
+    pub clip_children: Vec<(u8, u64)>,
 }
 
 /// What the traversal decided for a tile this pass — the **cross-frame selection state** (cesium-native's
@@ -104,10 +300,35 @@ pub enum SelectionResult {
     Kicked,
 }
 
-/// Per-tile [`SelectionResult`] from one pass, keyed by child-index path — the state a stateful caller feeds
-/// back next frame (cesium-native's per-tile `TileSelectionState`, minus the frame number: the *whole map*
-/// is "last frame"). An empty map ⇒ a cold / stateless pass (no hysteresis, no cross-frame kick).
-pub type SelectionState = hashbrown::HashMap<Vec<u32>, SelectionResult>;
+/// Per-tile [`SelectionResult`] from one pass, keyed by interned [`PathArena`] node id — the state a
+/// stateful caller feeds back next frame (cesium-native's per-tile `TileSelectionState`, minus the frame
+/// number: the *whole map* is "last frame"). Node ids are arena-stable, so the map is valid across frames
+/// as long as the SAME arena is passed back. An empty map ⇒ a cold / stateless pass (no hysteresis, no
+/// cross-frame anti-pop state — the cold kick still fires). u32 keys: O(1) probes, no per-segment hashing,
+/// no per-entry `Vec` clone (the old `HashMap<Vec<u32>, _>` cost O(V·d) per pass — audit 2026-06-10 §3.2).
+pub type SelectionState = hashbrown::HashMap<u32, SelectionResult>;
+
+/// Per-pass "why is this region coarser than SSE wants" counters — the selection X-RAY (2026-06-11, built
+/// to attribute the stuck-coarse scars). SNAPSHOT semantics: one pass's counts, never cumulative. A healthy
+/// converging scene shows `loading`/`kick` falling to zero; **a scar is `leaf_under_sse` (or the scene-side
+/// grafted-skip counter) sustained at quiescence** — a loaded tile rendering coarser than the SSE target
+/// with nothing below it to refine into.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HoldCounts {
+    /// Kicked subtrees: the coarse stand-in drawn while descendants load/texture (normal during convergence).
+    pub kick: u32,
+    /// Dead footprints covered by an ancestor (terminal fetch/decode failures below — never re-queued).
+    pub dead: u32,
+    /// Unloaded tiles queued to load this pass (covered by an ancestor meanwhile). Sustained nonzero at an
+    /// IDLE fetch pipe ⇒ the loads are being dropped downstream (see the scene's grafted-skip counter).
+    pub loading: u32,
+    /// LOADED tiles rendered COARSER than the SSE target with NO children to refine into — a genuine tree
+    /// leaf at extreme zoom, an implicit branch tip, or a graft whose children are MISSING (the scar suspect).
+    pub leaf_under_sse: u32,
+    /// Implicit children answered [`TileAvailability::Pending`] (their `.subtree` not fetched yet) — the
+    /// walk holds the coarse ancestor until it arrives.
+    pub pending_subtree: u32,
+}
 
 /// The result of one selection pass.
 #[derive(Clone, Debug, Default)]
@@ -119,6 +340,8 @@ pub struct Selection {
     /// This pass's per-tile [`SelectionResult`] — feed it back next frame as `prev_state` to enable the
     /// hysteresis dead-band + the cross-frame kick. Empty for a cold/stateless pass.
     pub state: SelectionState,
+    /// The pass's hold-reason X-ray (see [`HoldCounts`]).
+    pub holds: HoldCounts,
 }
 
 // ---- Implicit tiling: the availability-provider seam ----------------------------------------------
@@ -144,6 +367,10 @@ pub struct ImplicitContext<'a> {
     /// tile; synthesized descendants extend below it sharing this `path` prefix — their `SelectedTile::path`
     /// is this prefix followed by one child-index step per implicit level, `dx | dy<<1 | dz<<2`.)
     pub root_path: &'a [u32],
+    /// The implicit root's interned [`PathArena`] id — the same identity as `root_path`, for providers whose
+    /// bookkeeping is node-keyed (the scene's grafted-subtree base map). Resolve ancestors via the `arena`
+    /// the provider methods receive.
+    pub root_node: u32,
     /// The root's `implicitTiling`: subdivision scheme (quadtree/octree), `subtree_levels` (how many levels
     /// each `.subtree` file spans), `available_levels` (the number of levels that can exist (a count; level 0
     /// is the implicit root, so the deepest valid level is `available_levels - 1`)), and the `subtrees`
@@ -178,15 +405,33 @@ pub enum TileAvailability {
 /// `Subtree`s is the provider's job; this traversal stays fetch-free and deterministic.
 ///
 /// `&mut self` so an implementation can record "fetch this subtree" / "this coord is pending" as it answers.
+/// `arena` is the traversal's [`PathArena`] (read-only), so a node-keyed provider (the scene's grafted-base
+/// map) can walk `ctx.root_node`'s ancestors without aliasing the traversal's mutable arena borrow.
 pub trait AvailabilityProvider {
     /// Is the tile at global `(level, x, y, z)` (relative to `ctx.root_path`) available? See
     /// [`TileAvailability`] — `Pending` signals the covering `.subtree` must be fetched first.
-    fn tile_availability(&mut self, ctx: &ImplicitContext, level: u32, x: u32, y: u32, z: u32) -> TileAvailability;
+    fn tile_availability(
+        &mut self,
+        ctx: &ImplicitContext,
+        arena: &PathArena,
+        level: u32,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) -> TileAvailability;
 
     /// Is **content** available at global `(level, x, y, z)`? (A tile may exist without renderable content — an
     /// interior node that only subdivides.) Only called for tiles already reported [`TileAvailability::Available`];
     /// a `false` answer means "this tile exists but has no content URI to fetch" (so it's a pure interior node).
-    fn content_availability(&mut self, ctx: &ImplicitContext, level: u32, x: u32, y: u32, z: u32) -> bool;
+    fn content_availability(
+        &mut self,
+        ctx: &ImplicitContext,
+        arena: &PathArena,
+        level: u32,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) -> bool;
 }
 
 /// The no-op [`AvailabilityProvider`] for explicit-only tilesets: every tile is `Unavailable`, so an
@@ -197,11 +442,19 @@ pub struct NoImplicit;
 
 impl AvailabilityProvider for NoImplicit {
     #[inline]
-    fn tile_availability(&mut self, _: &ImplicitContext, _: u32, _: u32, _: u32, _: u32) -> TileAvailability {
+    fn tile_availability(
+        &mut self,
+        _: &ImplicitContext,
+        _: &PathArena,
+        _: u32,
+        _: u32,
+        _: u32,
+        _: u32,
+    ) -> TileAvailability {
         TileAvailability::Unavailable
     }
     #[inline]
-    fn content_availability(&mut self, _: &ImplicitContext, _: u32, _: u32, _: u32, _: u32) -> bool {
+    fn content_availability(&mut self, _: &ImplicitContext, _: &PathArena, _: u32, _: u32, _: u32, _: u32) -> bool {
         false
     }
 }
@@ -260,7 +513,20 @@ pub fn bounding_sphere_ecef(bv: &BoundingVolume, world: &DMat4, ellipsoid: &Elli
             let u = world.transform_vector3(DVec3::new(b[3], b[4], b[5]));
             let v = world.transform_vector3(DVec3::new(b[6], b[7], b[8]));
             let w = world.transform_vector3(DVec3::new(b[9], b[10], b[11]));
-            (center, u.length() + v.length() + w.length()) // OBB → enclosing sphere (conservative)
+            // EXACT circumscribed-sphere radius = the farthest OBB corner from the center. The 8 corners are
+            // `center ± u ± v ± w`; opposite corners share a magnitude, so the radius is the max over the 4 sign
+            // combinations of `|±u ± v ± w|`. For the ORTHOGONAL axes 3D Tiles `box` volumes use in practice this
+            // equals √(|u|²+|v|²+|w|²) — TIGHT. It replaces the old `|u|+|v|+|w|` L1 bound, which was up to √3×
+            // too loose (a ~5× volume envelope): that slack over-streamed a band of view-edge tiles to full
+            // detail AND shortened the SSE distance (→ over-refinement). Unlike a bare √Σ|·|², the per-corner max
+            // stays a SAFE over-bound even under shear / non-orthogonal axes (where √Σ|·|² would *under*-bound and
+            // risk culling a tile that pokes into the frustum) — important for hostile/adversarial tilesets.
+            let radius = (u + v + w)
+                .length()
+                .max((u + v - w).length())
+                .max((u - v + w).length())
+                .max((u - v - w).length());
+            (center, radius)
         }
         BoundingVolume::Region(r) => {
             // 8 ellipsoid corners → enclosing sphere: tight for small leaf regions (the real case); for a
@@ -358,16 +624,19 @@ fn tile_bounding_sphere_ecef(tile: &Tile, world: &DMat4, ellipsoid: &Ellipsoid) 
 
 /// Select the tiles to render + load for `params`, driven from a root [`Tile`], with implicit tiling wired in
 /// via an [`AvailabilityProvider`]. The pluggable predicates:
-/// - `is_loaded(path)` — is that tile's content resident?
-/// - `is_dead(path)` — is that tile's content terminally dead (fetch/decode gave up)? A dead tile is treated as
-///   ABSENT (not rendered, not requested, doesn't block its parent's refine). Pass `&mut |_| false` for callers
-///   with no terminal-failure signal (e.g. explicit-only tilesets).
+/// - `is_loaded(path, node)` — is that tile's content resident? (`path` for path-shaped callers/tests; `node`
+///   the interned [`PathArena`] id for O(1) map-keyed callers — both name the same tile.)
+/// - `is_dead(path, node)` — is that tile's content terminally dead (fetch/decode gave up)? A dead tile is
+///   treated as ABSENT (not rendered, not requested, doesn't block its parent's refine). Pass
+///   `&mut |_, _| false` for callers with no terminal-failure signal (e.g. explicit-only tilesets).
 /// - `visibility(center, radius)` — the bounding sphere's [`Visibility`] (frustum-aware LOD; `|_, _|
 ///   Visibility::Visible` disables culling — everything at full detail).
 ///
-/// `prev_state` is the [`SelectionState`] returned by the **previous** pass (pass an empty map for a cold /
-/// stateless pass); it drives the hysteresis dead-band (`params.hysteresis`) AND the cross-frame anti-pop
-/// **kick**. This pass's state is returned in [`Selection::state`] for the caller to feed back next frame.
+/// `arena` is the caller-owned path interner: pass THE SAME arena every pass (node ids are the cross-frame
+/// identities `prev_state` and the caller's maps key on). `prev_state` is the [`SelectionState`] returned by
+/// the **previous** pass (pass an empty map for a cold / stateless pass); it drives the hysteresis dead-band
+/// (`params.hysteresis`) AND the cross-frame anti-pop **kick**. This pass's state is returned in
+/// [`Selection::state`] for the caller to feed back next frame.
 ///
 /// For an explicit-only tileset (no `implicitTiling`), pass [`NoImplicit`] as the provider — every implicit
 /// root then refines to nothing extra. When the walk reaches a tile whose `implicit_tiling.is_some()`, it
@@ -383,8 +652,9 @@ pub fn select_tree_implicit(
     root: &Tile,
     ellipsoid: &Ellipsoid,
     params: &SelectParams,
-    is_loaded: &mut dyn FnMut(&[u32]) -> bool,
-    is_dead: &mut dyn FnMut(&[u32]) -> bool,
+    arena: &mut PathArena,
+    is_loaded: &mut dyn FnMut(&[u32], u32) -> bool,
+    is_dead: &mut dyn FnMut(&[u32], u32) -> bool,
     visibility: &mut dyn FnMut(DVec3, f64) -> Visibility,
     prev_state: &SelectionState,
     provider: &mut dyn AvailabilityProvider,
@@ -395,10 +665,12 @@ pub fn select_tree_implicit(
     // their final (deduped) forms once, after the walk.
     let mut render: Vec<Rc<SelectedTile>> = Vec::new();
     let mut load: Vec<SelectedTile> = Vec::new();
-    let mut state_log: Vec<(Vec<u32>, SelectionResult)> = Vec::new();
+    let mut state_log: Vec<(u32, SelectionResult)> = Vec::new();
     let mut ctx = Ctx {
         ellipsoid,
         params,
+        tan_half_fov: logi_geo_lod::tan_half_fov_y(params.fov_y_radians),
+        arena,
         is_loaded,
         is_dead,
         visibility,
@@ -408,27 +680,119 @@ pub fn select_tree_implicit(
         load: &mut load,
         state: &mut state_log,
         nearest_loaded: None,
+        holds: HoldCounts::default(),
     };
     let mut path = Vec::new();
     // The root's refine mode is REQUIRED by spec; pass REPLACE as the inherited default for a malformed root
     // that omits it (matches Cesium's lenient default). `refine_or` in `visit` then uses the root's own mode.
-    visit(root, &mut path, root.matrix(), Refine::Replace, &mut ctx);
-    // Collapse the state log into the keyed map (each path appears once — a kicked subtree's entries were
+    visit(root, &mut path, ROOT_NODE, root.matrix(), Refine::Replace, &mut ctx);
+    let holds = ctx.holds;
+    // Collapse the state log into the keyed map (each node appears once — a kicked subtree's entries were
     // truncated off, never duplicated). This is next frame's `prev_state`.
     let state: SelectionState = state_log.into_iter().collect();
-    // Dedup by path (an ancestor used as fallback for several descendants, or pushed before a sibling kicked,
-    // appears once). Collapsing into a map first drops the duplicate `Rc`s eagerly, so the survivor is the
-    // sole owner and `try_unwrap` *moves* it out — only a genuinely-shared tile would clone. Draw order is
+    // Dedup by node id (an ancestor used as fallback for several descendants, or pushed before a sibling
+    // kicked, appears once). Collapsing into a map first drops the duplicate `Rc`s eagerly, so the survivor is
+    // the sole owner and `try_unwrap` *moves* it out — only a genuinely-shared tile would clone. Draw order is
     // intentionally NOT sorted: the Geo engine is render-only / non-authoritative (ADR-0007).
-    let mut dedup: HashMap<Vec<u32>, Rc<SelectedTile>> = HashMap::with_capacity(render.len());
+    let mut dedup: HashMap<u32, Rc<SelectedTile>> = HashMap::with_capacity(render.len());
     for rc in render {
-        dedup.entry(rc.path.clone()).or_insert(rc);
+        dedup.entry(rc.node).or_insert(rc);
     }
-    let render: Vec<SelectedTile> = dedup
+    let mut render: Vec<SelectedTile> = dedup
         .into_values()
         .map(|rc| Rc::try_unwrap(rc).unwrap_or_else(|rc| (*rc).clone()))
         .collect();
-    Selection { render, load, state }
+    // Deterministic draw order — sort by path (lexicographic == DFS pre-order). The engine is render-only /
+    // non-authoritative (ADR-0007), so order doesn't affect render *correctness*; but a STABLE order makes the
+    // published frame reproducible run-to-run (the dedup above drains a `HashMap`, whose iteration order is
+    // seed-dependent) — a precondition for an incremental/diff selection that compares this frame's cut against
+    // last frame's. And it's effectively free: `attach_clip_children` already required this exact ordering and
+    // was paying its own O(R log R) sort of an index permutation to get it — now it consumes the sorted `render`
+    // directly (one sort, not two).
+    render.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    // Geometric hole-clip (see `SelectedTile::clip_children`): hand each coarse REPLACE stand-in the paths of
+    // the finer tiles drawn over it, so the host can discard the overlap instead of z-fighting it.
+    attach_clip_children(&mut render);
+    Selection {
+        render,
+        load,
+        state,
+        holds,
+    }
+}
+
+/// Cap on clip CANDIDATES carried per tile (the scene reduces them to ≤ the renderer's box cap by unioning
+/// each direct-child GROUP — see `SelectedTile::clip_children`). 32 bounds the per-publish AABB work and the
+/// per-tile Vec while comfortably covering a two-skip-level frontier; candidates are attached LARGEST-first
+/// ([`attach_clip_children`]), so anything past the cap is the least-visible residue. The RENDERER's per-tile
+/// box cap (`LOGI_CLIP_MAX` = 8 in the C++ material) is enforced scene-side at materialization, where the
+/// group-union reduction makes overflow structurally rare (≤4 quadtree / ≤8 octree groups).
+const MAX_CLIP_CANDIDATES_PER_TILE: usize = 32;
+
+/// **Geometric hole-clip** post-process: for every rendered tile, attach to its `clip_children` the paths of
+/// the finer tiles drawn over it — its *immediate rendered descendants* (the loaded LOD frontier directly
+/// beneath it). A coarse REPLACE stand-in covering a partially-loaded region thereby learns exactly which finer
+/// tiles took over; the scene materializes each child's clip box from its decoded mesh's tight AABB, and the
+/// renderer discards the stand-in's fragments there: no coplanar double-draw, no z-fight, no PDO. The
+/// relationship is purely structural — by 3D Tiles' spatial coherence a descendant's content lies inside its
+/// ancestor's footprint — and only the NEAREST rendered ancestor in each branch needs it (a deeper descendant
+/// is covered transitively by the nearer one). ADD tiles are skipped: they render alongside their children by
+/// design and must not be clipped. **`render` must already be path-sorted** (the caller sorts it for
+/// deterministic draw order); given that, this is an O(R) linear sweep over the render set `R` — no sort here.
+fn attach_clip_children(render: &mut [SelectedTile]) {
+    if render.len() < 2 {
+        return; // need an ancestor AND a descendant for any clip to exist
+    }
+    // `render` is path-sorted (lexicographic == DFS pre-order: a path sorts immediately before its extensions,
+    // and a whole subtree is one contiguous run), so we walk it directly. `stack` holds the chain of rendered
+    // ancestors of the cursor (each entry's path a prefix of the next). For each tile, pop entries that aren't
+    // its prefix; the top is then its nearest rendered ancestor. Defer the mutations (they borrow `render`
+    // mutably) until after the immutable sweep.
+    let mut stack: Vec<usize> = Vec::new();
+    let mut attach: Vec<(usize, usize)> = Vec::new(); // (ancestor, descendant) indices into `render`
+    for i in 0..render.len() {
+        while let Some(&top) = stack.last() {
+            if is_path_prefix(&render[top].path, &render[i].path) {
+                break;
+            }
+            stack.pop();
+        }
+        if let Some(&anc) = stack.last() {
+            // ADD ancestors render in addition to their children — never hole-clipped.
+            if !render[anc].is_add {
+                attach.push((anc, i));
+            }
+        }
+        stack.push(i);
+    }
+    // Cap order matters under skip-level overflow (> MAX candidates for one ancestor): take the LARGEST
+    // footprints first, so the surplus that draws coplanar-unclipped is the least-visible slivers — path
+    // order picked an arbitrary subset and left big blur-over-sharp patches (PIE 2026-06-09). Group by
+    // ancestor, largest `bounds_radius` first within each group; the sort is O(A log A) over the (small)
+    // attach list and deterministic (`total_cmp`, unique indices).
+    attach.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| render[b.1].bounds_radius.total_cmp(&render[a.1].bounds_radius))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    for (anc, desc) in attach {
+        if render[anc].clip_children.len() < MAX_CLIP_CANDIDATES_PER_TILE {
+            // Group tag: which DIRECT-CHILD subtree of the ancestor this descendant lies in — the first path
+            // step below the ancestor (a child index, ≤3 quadtree / ≤7 octree; u8 is ample). The scene unions
+            // each group's boxes so deep skip-level frontiers reduce to ≤ one box per direct child.
+            let group = render[desc].path[render[anc].path.len()].min(u8::MAX as u32) as u8;
+            let key = render[desc].key;
+            render[anc].clip_children.push((group, key));
+        }
+    }
+}
+
+/// Is `a` a (non-strict) prefix of `b`? In [`attach_clip_children`]'s sweep `a` is always a stacked ancestor and
+/// `b` the cursor, and all render paths are unique, so a `true` here always means a STRICT ancestor (shorter
+/// path) — equal-length distinct paths can't be prefix-related.
+#[inline]
+fn is_path_prefix(a: &[u32], b: &[u32]) -> bool {
+    a.len() <= b.len() && b[..a.len()] == *a
 }
 
 /// cesium-native's `loadingDescendantLimit`: when a fresh (nothing-shown-last-frame) refinement has more than
@@ -448,12 +812,18 @@ pub const MAX_TILE_DEPTH: u32 = 512;
 struct Ctx<'a> {
     ellipsoid: &'a Ellipsoid,
     params: &'a SelectParams,
-    is_loaded: &'a mut dyn FnMut(&[u32]) -> bool,
+    /// `tan(params.fov_y_radians / 2)`, computed ONCE per pass (the FOV is constant across the whole
+    /// traversal) so the per-tile `should_refine` does no transcendental on the hot path.
+    tan_half_fov: f64,
+    /// The caller-owned path interner: every visited node interns its id here (amortized O(1)), and the
+    /// per-tile state/dedup key on those ids instead of hashing path Vecs (audit 2026-06-10 §3.2).
+    arena: &'a mut PathArena,
+    is_loaded: &'a mut dyn FnMut(&[u32], u32) -> bool,
     /// Is that tile's content **terminally dead** (fetch/decode gave up — the scene will never serve it)? A dead
     /// tile is treated as ABSENT (like a culled / non-existent tile): not rendered, not requested, and it does
     /// NOT block its parent's refinement — so one dead fine tile can't pin its whole region to the coarse parent
-    /// (which, drawn as the stand-in, would blur every loaded sibling). `|_| false` ⇒ no deaths (explicit lanes).
-    is_dead: &'a mut dyn FnMut(&[u32]) -> bool,
+    /// (which, drawn as the stand-in, would blur every loaded sibling). `|_, _| false` ⇒ no deaths (explicit lanes).
+    is_dead: &'a mut dyn FnMut(&[u32], u32) -> bool,
     visibility: &'a mut dyn FnMut(DVec3, f64) -> Visibility,
     /// Subtree-availability seam for implicit tiling: consulted only when [`visit`] reaches an `implicitTiling`
     /// root, to synthesize its quadtree/octree descendants. [`NoImplicit`] for explicit-only callers.
@@ -465,12 +835,15 @@ struct Ctx<'a> {
     load: &'a mut Vec<SelectedTile>,
     /// This pass's per-tile results as an **append log**, parallel to `render` so the kick truncates both in
     /// lockstep (a kicked descendant leaves no `Rendered` entry). Collapsed to [`SelectionState`] after the walk.
-    state: &'a mut Vec<(Vec<u32>, SelectionResult)>,
+    state: &'a mut Vec<(u32, SelectionResult)>,
     /// The nearest loaded **ancestor** of the node currently being visited — the coarse stand-in to draw while
     /// finer tiles stream. Threaded on `Ctx` (saved/restored by [`decide`] around each refine) rather than as a
     /// recursion argument, so the explicit and implicit lanes share it uniformly. `None` until some ancestor is
     /// resident.
     nearest_loaded: Option<Rc<SelectedTile>>,
+    /// This pass's hold-reason X-ray (see [`HoldCounts`]). NOT truncated by the kick: a kicked subtree's
+    /// interior holds still happened this pass and are exactly what the kick is waiting on.
+    holds: HoldCounts,
 }
 
 /// The frame-varying facts a node contributes to the per-node decision core ([`decide`]) — computed the same
@@ -495,26 +868,56 @@ struct NodeFacts {
     refined_last: bool,
     /// The SSE pixel target for this node this frame (full detail in view; coarser when `Offscreen`).
     sse_target: f64,
+    /// Is this node inside the view frustum + detail band ([`Visibility::Visible`])? `false` for an `Offscreen`
+    /// coarse-shell tile. Gates `mustContinueRefiningToDeeperTiles`: the anti-detail-VANISH rule only protects
+    /// CURRENTLY-VISIBLE detail; an off-view tile has no shown detail to hold, so it coarsens to the shell
+    /// normally (otherwise turning the camera away would freeze the previously-in-view detail off-screen).
+    in_view: bool,
     /// Does this node have any children to refine into? (Explicit: `!children.is_empty()`. Implicit: at least
     /// one available child coordinate, or more implicit levels remain — see [`visit_implicit`].)
     has_children: bool,
 }
 
-/// Build a `SelectedTile`. This allocates a `Vec<String>` of content URIs (+ the path), so it is called
-/// ONLY when the tile is actually kept — a resident fallback or an SSE-leaf to request — never for the
-/// transient interior nodes that just pass an inherited fallback down.
-fn make_selected(path: &[u32], world: DMat4, tile: &Tile, distance: f64, center: DVec3, radius: f64) -> SelectedTile {
+/// Build a `SelectedTile`. This allocates the path Vec (and, for the LOAD flavor, a `Vec<String>` of
+/// content URIs), so it is called ONLY when the tile is actually kept — a resident fallback or an SSE-leaf
+/// to request — never for the transient interior nodes that just pass an inherited fallback down.
+/// `with_uris` picks the flavor (audit 2026-06-10 §4.7): `true` for `load` tiles (the fetch path consumes the
+/// URIs), `false` for `render`/coverage tiles (URIs are never read downstream — renderers key by `node`/`key`
+/// — and eagerly cloning a String per URI for every loaded interior node was a per-pass allocation tax).
+#[allow(clippy::too_many_arguments)]
+fn make_selected(
+    path: &[u32],
+    node: u32,
+    key: u64,
+    world: DMat4,
+    tile: &Tile,
+    distance: f64,
+    center: DVec3,
+    radius: f64,
+    is_add: bool,
+    scaled_geometric_error: f64,
+    with_uris: bool,
+) -> SelectedTile {
     SelectedTile {
         path: path.to_vec(),
+        node,
+        key,
         world_transform: world,
-        content_uris: tile.content_uris().map(String::from).collect(),
-        // 3D Tiles 1.1: geometricError is scaled by the transform's largest scaling factor (a tile scaled k×
-        // has k× the error). `max_axis_scale(world) == 1.0` for rotation+translation (Google P3DT), so this is
-        // a no-op there and pure correctness for scaled general-1.1 tilesets.
-        geometric_error: tile.geometric_error * max_axis_scale(&world),
+        content_uris: if with_uris {
+            tile.content_uris().map(String::from).collect()
+        } else {
+            Vec::new()
+        },
+        // 3D Tiles 1.1: geometricError scaled by the transform's largest scaling factor (a tile scaled k× has
+        // k× the error; no-op for P3DT, scale=1). Computed ONCE per visit — `visit` already derived this exact
+        // value for `NodeFacts` (the formula's single home), so it is threaded here rather than re-paying
+        // `max_axis_scale`'s three sqrts and risking the two copies drifting.
+        geometric_error: scaled_geometric_error,
         distance,
         bounds_center: center,
         bounds_radius: radius,
+        is_add,
+        clip_children: Vec::new(),
     }
 }
 
@@ -522,7 +925,14 @@ fn make_selected(path: &[u32], world: DMat4, tile: &Tile, distance: f64, center:
 /// effects land in `ctx`: tiles to draw appended to `render`, tiles to fetch pushed to `load`, each tile's
 /// [`SelectionResult`] recorded in `state`. The nearest loaded **ancestor** (the coarse stand-in to draw while
 /// finer tiles stream) is threaded on `ctx.nearest_loaded`, saved/restored by [`decide`] around each refine.
-fn visit(tile: &Tile, path: &mut Vec<u32>, world: DMat4, parent_refine: Refine, ctx: &mut Ctx) -> TraversalDetails {
+fn visit(
+    tile: &Tile,
+    path: &mut Vec<u32>,
+    node: u32,
+    world: DMat4,
+    parent_refine: Refine,
+    ctx: &mut Ctx,
+) -> TraversalDetails {
     // Depth cap (C1) — `path.len()` is this tile's depth. Beyond the cap, drop the subtree (no render/fetch/kick
     // pressure): bounds the recursion's stack against a pathological external-tileset graft chain, and — since
     // an undescended tile is never requested — transitively bounds the grafting that would deepen the tree.
@@ -548,15 +958,18 @@ fn visit(tile: &Tile, path: &mut Vec<u32>, world: DMat4, parent_refine: Refine, 
     }
     // Frustum-aware LOD: out-of-range drops the subtree; off-view tiles are KEPT (shadow casters + camera-turn
     // readiness) but refine only to the coarser `culled_screen_space_error`; in-view tiles get full detail.
-    let sse_target = match (ctx.visibility)(center, radius) {
+    let vis = (ctx.visibility)(center, radius);
+    let sse_target = match vis {
         Visibility::Culled => return TraversalDetails::NEUTRAL, // out of range — no fetch/render, no kick pressure
         Visibility::Offscreen => ctx.params.culled_screen_space_error,
+        Visibility::Distant => ctx.params.distant_screen_space_error,
         Visibility::Visible => ctx.params.max_screen_space_error,
     };
+    let in_view = vis == Visibility::Visible;
     let distance = ((ctx.params.camera_position - center).length() - radius).max(0.0);
-    let loaded = (ctx.is_loaded)(path);
-    let dead = (ctx.is_dead)(path);
-    let prev = ctx.prev_state.get(path.as_slice()).copied();
+    let loaded = (ctx.is_loaded)(path, node);
+    let dead = (ctx.is_dead)(path, node);
+    let prev = ctx.prev_state.get(&node).copied();
     // 3D Tiles `refine` mode, inherited from the parent when this tile omits it (spec: required on the root,
     // inherited otherwise). Drives ADD-vs-REPLACE in `decide` and is passed down to this tile's children.
     let refine = tile.refine_or(parent_refine);
@@ -571,6 +984,7 @@ fn visit(tile: &Tile, path: &mut Vec<u32>, world: DMat4, parent_refine: Refine, 
         rendered_last: matches!(prev, Some(SelectionResult::Rendered | SelectionResult::Kicked)),
         refined_last: matches!(prev, Some(SelectionResult::Refined)),
         sse_target,
+        in_view,
         // An implicit-tiling root's descendants are NOT in `tile.children` (normally empty) — they live at
         // level 1+ of the implicit tree, which exists only if `available_levels > 1`. So an implicit root has
         // children iff it permits at least one level below the root; their per-coordinate existence is then the
@@ -586,8 +1000,24 @@ fn visit(tile: &Tile, path: &mut Vec<u32>, world: DMat4, parent_refine: Refine, 
     // ONLY things that differ between an explicit tile and an implicit root. Everything else — SSE, render/
     // load, the kick, the cross-frame state — is the shared [`decide`] core. `build` takes the `path` from
     // `decide` (not by capture) so `decide` can still hand `&mut path` to the `refine` closure; `refine` reads
-    // `ctx.nearest_loaded` (which `decide` sets to this node's coverage before calling it).
-    let build = |p: &[u32]| make_selected(p, world, tile, distance, center, radius);
+    // `ctx.nearest_loaded` (which `decide` sets to this node's coverage before calling it). The bool is the
+    // [`make_selected`] flavor: `true` = a `load` tile (with content URIs), `false` = render/coverage.
+    let key = ctx.arena.key(node);
+    let build = |p: &[u32], with_uris: bool| {
+        make_selected(
+            p,
+            node,
+            key,
+            world,
+            tile,
+            distance,
+            center,
+            radius,
+            refine == Refine::Add,
+            facts.geometric_error,
+            with_uris,
+        )
+    };
     if let Some(implicit) = &tile.implicit_tiling {
         // Implicit root (the implicit tree's level 0): synthesize its quadtree/octree descendants from the
         // availability provider. The implicit content template lives on THIS tile's content; its bounds +
@@ -596,13 +1026,15 @@ fn visit(tile: &Tile, path: &mut Vec<u32>, world: DMat4, parent_refine: Refine, 
         let root_error = tile.geometric_error;
         let template = tile.content_uris().next();
         let root_path_len = path.len();
-        decide(ctx, path, &facts, build, |ctx, path| {
+        decide(ctx, path, node, &facts, build, |ctx, path| {
             // The implicit root itself is level 0, coordinate (0,0,0); descend its children.
             descend_implicit_children(
                 ctx,
                 path,
+                node,
                 world,
                 root_path_len,
+                node, // this implicit ROOT's interned id, threaded to every descendant's ImplicitContext
                 &root_bounds,
                 implicit,
                 root_error,
@@ -616,11 +1048,12 @@ fn visit(tile: &Tile, path: &mut Vec<u32>, world: DMat4, parent_refine: Refine, 
         })
     } else {
         // Explicit subtree: descend `tile.children` — each inherits THIS tile's resolved refine mode.
-        decide(ctx, path, &facts, build, |ctx, path| {
+        decide(ctx, path, node, &facts, build, |ctx, path| {
             let mut sub = TraversalDetails::REFINING;
             for (i, child) in tile.children.iter().enumerate() {
+                let cnode = ctx.arena.child_of(node, i as u32);
                 path.push(i as u32);
-                let cd = visit(child, path, world * child.matrix(), refine, ctx);
+                let cd = visit(child, path, cnode, world * child.matrix(), refine, ctx);
                 path.pop();
                 sub.fold_child(cd);
             }
@@ -635,21 +1068,32 @@ fn visit(tile: &Tile, path: &mut Vec<u32>, world: DMat4, parent_refine: Refine, 
 /// runs the identical SSE-leaf-or-refine decision, the not-loaded coarse-fallback, the cross-frame **kick**,
 /// and the `Rendered`/`Refined`/`Kicked` state recording. Factoring it here is what lets implicit children
 /// reuse every subtlety of the streaming behavior (kick, hysteresis, anti-hole loads) verbatim.
-fn decide<B, R>(ctx: &mut Ctx, path: &mut Vec<u32>, facts: &NodeFacts, build: B, refine: R) -> TraversalDetails
+fn decide<B, R>(
+    ctx: &mut Ctx,
+    path: &mut Vec<u32>,
+    node: u32,
+    facts: &NodeFacts,
+    build: B,
+    refine: R,
+) -> TraversalDetails
 where
-    B: Fn(&[u32]) -> SelectedTile,
+    B: Fn(&[u32], bool) -> SelectedTile,
     R: FnOnce(&mut Ctx, &mut Vec<u32>) -> TraversalDetails,
 {
     let (loaded, rendered_last) = (facts.loaded, facts.rendered_last);
 
     // The coarse stand-in for this region: this node if it's resident (built now, shared via Rc), else the
     // nearest resident ancestor handed down on `ctx.nearest_loaded`. We never build a SelectedTile for an
-    // unloaded interior node here.
+    // unloaded interior node here. RENDER flavor (no content URIs — see `make_selected`): coverage only ever
+    // lands in `render`, whose consumers key by node/key and never read URIs.
     let coverage: Option<Rc<SelectedTile>> = if loaded {
-        Some(Rc::new(build(path)))
+        Some(Rc::new(build(path, false)))
     } else {
         ctx.nearest_loaded.clone()
     };
+    // Is the nearest loaded ancestor my DIRECT parent? Marks this node as the FIRST unloaded level below the
+    // rendered frontier — the only interior rung the ladder loads this pass (see the refine-tail load arm).
+    let parent_is_coverage = !loaded && coverage.as_ref().is_some_and(|c| c.path.len() + 1 == path.len());
 
     // Refine criterion single-homed in `logi_geo_lod::should_refine` (audit M22), with the hysteresis
     // dead-band: a tile `Refined` last frame holds its split until SSE drops below `target/(1+hysteresis)`.
@@ -657,7 +1101,7 @@ where
         facts.geometric_error,
         facts.distance,
         &logi_geo_lod::RefineParams {
-            fov_y_radians: ctx.params.fov_y_radians,
+            tan_half_fov_y: ctx.tan_half_fov, // precomputed once per pass (no per-tile transcendental)
             viewport_height: ctx.params.viewport_height,
             sse_target: facts.sse_target, // full detail in view; coarser when off-view (Offscreen)
             hysteresis: ctx.params.hysteresis,
@@ -665,28 +1109,66 @@ where
         facts.refined_last,
     );
 
-    // RENDER at this level: this node meets SSE, or is a leaf (nothing finer to refine into).
-    if meets || !facts.has_children {
+    // mustContinueRefiningToDeeperTiles (cesium-native `Tileset::_mustContinueRefiningToDeeperTiles`): a tile
+    // that NOW meets SSE but was `Refined` last frame and isn't loaded yet must KEEP refining — its finer
+    // descendants that were already on screen stay shown, instead of popping down to a coarse stand-in while
+    // this level streams in. This is the anti-detail-VANISH rule (the zoom-out / fast-pull-back case), distinct
+    // from the hysteresis dead-band (which prevents threshold *dithering*): without it, the instant the camera
+    // retreats far enough that a coarser tile satisfies SSE, Geo would drop to `nearest_loaded` (a possibly much
+    // coarser ancestor) until this tile's own mesh arrives. We also queue this tile's own content (in the refine
+    // tail below — cesium loads it Urgent) so it can take over as the proper coarse base once it lands. REPLACE
+    // only (ADD always draws itself anyway) and only when it actually HAS children to keep showing.
+    let must_continue = meets
+        && facts.in_view // only protect CURRENTLY-VISIBLE detail; an off-view tile coarsens to its shell
+        && facts.has_children
+        && facts.refined_last
+        && !loaded
+        && !facts.dead
+        && facts.refine != Refine::Add;
+
+    // RENDER at this level: this node meets SSE (and isn't holding deeper already-shown detail via
+    // `must_continue`), or is a leaf (nothing finer to refine into).
+    if (meets || !facts.has_children) && !must_continue {
         if loaded {
+            // X-ray: rendered COARSER than the SSE target with nothing to refine into (entered via
+            // `!has_children` while `should_refine` said refine) — the structural can't-refine hold.
+            if !meets {
+                ctx.holds.leaf_under_sse += 1;
+            }
             ctx.render.push(coverage.expect("loaded ⇒ coverage is self"));
-            ctx.state.push((path.clone(), SelectionResult::Rendered));
+            ctx.state.push((node, SelectionResult::Rendered));
             return TraversalDetails {
                 all_renderable: true,
                 any_rendered_last_frame: rendered_last,
                 not_yet_renderable: 0,
             };
         }
-        // Terminally-dead content → ABSENT (see `Ctx::is_dead`): don't request it (the scene won't fetch it),
-        // don't draw the coarse ancestor for it (the stand-in is the WHOLE parent tile → it would blur every
-        // loaded sibling — the "coarse blur over sharp" overlap), and don't block the parent's refinement. Its
-        // footprint is a hole; if the WHOLE sibling set is dead the parent's `empty_refine` below renders the
-        // coarse parent instead, so a large dead region still falls back to coarse rather than a big hole.
+        // Terminally-dead content (see `Ctx::is_dead`): never requested again, BUT its footprint must not be
+        // a hole (audit 2026-06-10 holes follow-up). Draw the nearest loaded ancestor over it — exactly like
+        // an unloaded leaf, minus the load. The pre-hole-clip code left dead footprints ABSENT because the
+        // stand-in was the WHOLE parent tile blurring every loaded sibling; the geometric hole-clip now cuts
+        // the stand-in to precisely the uncovered area (the siblings clip it), so coverage is strictly better
+        // than a see-through-to-space hole — and a fetch/decode give-up burst no longer punches permanent
+        // wedges in the ground. `not_yet_renderable: 0` (it will never load — it must not hold a kick or feed
+        // the pending count); `all_renderable: false` (the ancestor stand-in must keep covering forever).
         if facts.dead {
-            return TraversalDetails::NEUTRAL;
+            ctx.holds.dead += 1; // X-ray: dead footprint covered by the ancestor forever
+            if let Some(anc) = &coverage {
+                ctx.render.push(Rc::clone(anc));
+            }
+            // `all_renderable: true`: the dead footprint must never BLOCK its parent's atomic reveal (the
+            // loaded siblings would otherwise wait forever on a tile that can never load) — the coverage push
+            // above keeps the ancestor drawn over the dead area regardless, clipped by the revealed siblings.
+            return TraversalDetails {
+                all_renderable: true,
+                any_rendered_last_frame: rendered_last,
+                not_yet_renderable: 0,
+            };
         }
         // Not loaded → request it; meanwhile draw the coarse ancestor (if any) so the region isn't a hole.
         // Its OWN content wasn't drawn, so leave it absent from `state` (≠ Rendered for next frame's kick).
-        ctx.load.push(build(path));
+        ctx.holds.loading += 1; // X-ray: queued; covered by the ancestor meanwhile
+        ctx.load.push(build(path, true));
         if let Some(anc) = &coverage {
             ctx.render.push(Rc::clone(anc));
         }
@@ -709,13 +1191,15 @@ where
     let (add_self_renderable, add_self_not_yet) = if is_add {
         if loaded {
             ctx.render.push(coverage.clone().expect("loaded ⇒ coverage is self"));
-            ctx.state.push((path.clone(), SelectionResult::Rendered));
+            ctx.state.push((node, SelectionResult::Rendered));
             (true, 0)
         } else if !facts.dead {
-            ctx.load.push(build(path)); // stream the parent's own additive content (no ancestor stand-in)
+            ctx.holds.loading += 1; // X-ray: additive parent content queued
+            ctx.load.push(build(path, true)); // stream the parent's own additive content (no ancestor stand-in)
             (false, 1)
         } else {
-            (true, 0) // dead ADD parent — nothing to add; doesn't block
+            ctx.holds.dead += 1; // X-ray: dead ADD parent (nothing to add; doesn't block)
+            (true, 0)
         }
     } else {
         (true, 0)
@@ -756,19 +1240,32 @@ where
         }
         // REPLACE: no tentative child state to truncate (nothing was appended); just emit self as a leaf.
         if loaded {
+            // X-ray: this node WANTED to refine (it took the refine path) but the refine produced nothing —
+            // an implicit branch tip, every child culled, or a graft whose children are MISSING (scar suspect).
+            ctx.holds.leaf_under_sse += 1;
             ctx.render.push(coverage.expect("loaded ⇒ coverage is self"));
-            ctx.state.push((path.clone(), SelectionResult::Rendered));
+            ctx.state.push((node, SelectionResult::Rendered));
             return TraversalDetails {
                 all_renderable: true,
                 any_rendered_last_frame: rendered_last,
                 not_yet_renderable: 0,
             };
         }
-        // Dead content with an empty refine → ABSENT (same reasoning as the leaf branch above).
+        // Dead content with an empty refine → COVERED by the nearest loaded ancestor, never a hole (the same
+        // holes follow-up as the leaf branch above; never re-queued).
         if facts.dead {
-            return TraversalDetails::NEUTRAL;
+            ctx.holds.dead += 1; // X-ray
+            if let Some(anc) = &coverage {
+                ctx.render.push(Rc::clone(anc));
+            }
+            return TraversalDetails {
+                all_renderable: true, // never blocks the reveal — see the leaf dead-branch note
+                any_rendered_last_frame: rendered_last,
+                not_yet_renderable: 0,
+            };
         }
-        ctx.load.push(build(path));
+        ctx.holds.loading += 1; // X-ray: empty-refine leaf queued
+        ctx.load.push(build(path, true));
         if let Some(anc) = &coverage {
             ctx.render.push(Rc::clone(anc));
         }
@@ -786,19 +1283,35 @@ where
     // KICK — REPLACE only. ADD has no holes (the parent always renders its own content), so it never falls back
     // to a coarse stand-in: gate the entire kick off for ADD.
     let kick = !is_add && !sub.all_renderable && !sub.any_rendered_last_frame;
+    // ATOMIC REVEAL for a loaded parent (holes follow-up, 2026-06-10 — restores the `|| loaded` arm the
+    // 2026-06-09 partial-reveal change removed). The partial-reveal experiment let a loaded parent's children
+    // render the instant each arrived, with the parent's coarse mesh hole-clipped to fill only the unloaded
+    // footprints. Its first full-scale eyeball showed why cesium never coexists parent+child for REPLACE: the
+    // clip primitive is a BOX, but a P3DT tile's plan-view footprint is IRREGULAR — the box-cover's corners
+    // outside the child's actual mesh clip the parent over ground the child never draws (triangular
+    // see-through holes), while any under-cover leaves coplanar z-fighting. No box can exact-clip an
+    // irregular footprint, so for the LOADING path the parent now holds its own render until the subtree is
+    // fully renderable, then switches atomically — no coexistence, no clip needed, no holes, no z-fight, by
+    // construction. The reveal latency this re-buys is far smaller than when partial reveal was introduced
+    // (fetch-priority concentration + the flash/geom caches + the texture gate converge a sibling set fast).
+    // Coverage + clip still serve the states with no atomic alternative: dead footprints (covered forever,
+    // clipped by live siblings), unloaded parents (the nearest loaded ancestor covers a partially-loaded
+    // frontier), and `must_continue` transitions. The exact-footprint upgrade, if reveal latency ever bites
+    // again, is a stencil/custom-depth footprint mask — not a tighter box.
     let will_kick = kick && (sub.not_yet_renderable > LOADING_DESCENDANT_LIMIT || loaded);
     if will_kick {
-        // Drop the descendants' tentative renders AND state entries ("kick" them) — leaving no stale
-        // `Rendered` behind — then draw the coarse stand-in and record this tile as `Kicked`.
+        ctx.holds.kick += 1; // X-ray: coarse stand-in held until the subtree is fully renderable
+                             // Drop the descendants' tentative renders AND state entries ("kick" them) — leaving no stale
+                             // `Rendered` behind — then draw the coarse stand-in and record this tile as `Kicked`.
         ctx.render.truncate(render_mark);
         ctx.state.truncate(state_mark);
         if let Some(cov) = &coverage {
             ctx.render.push(Rc::clone(cov)); // draw the coarse stand-in instead
         }
         if !loaded && !facts.dead {
-            ctx.load.push(build(path)); // and keep loading it (a dead tile is never requested)
+            ctx.load.push(build(path, true)); // and keep loading it (a dead tile is never requested)
         }
-        ctx.state.push((path.clone(), SelectionResult::Kicked));
+        ctx.state.push((node, SelectionResult::Kicked));
         return TraversalDetails {
             all_renderable: loaded,
             any_rendered_last_frame: sub.any_rendered_last_frame || rendered_last,
@@ -807,17 +1320,44 @@ where
     }
     // Refine accepted — the children render (already appended). Record `Refined` for the hysteresis dead-band.
     //
-    // `ancestor_meets_sse` fallback load (plan §9.2 step 6): if this refining subtree is **active** (drew
-    // something last frame) but isn't fully loaded AND has no loaded ancestor to fall back on (`coverage` is
-    // `None` ⇒ when this tile is unloaded, `coverage == nearest_loaded`), enqueue THIS tile's own content so
-    // a coarse stand-in becomes available for its still-loading descendants instead of holes. The
-    // `any_rendered_last_frame` gate keeps it from eagerly loading the whole chain on a cold first frame; the
-    // coarser ancestor's higher geometric error sorts it ahead of the fine leaves in the load queue.
-    // ancestor_meets_sse fallback load — REPLACE only (an ADD parent already queued its own content above).
-    if !is_add && !loaded && !facts.dead && coverage.is_none() && sub.any_rendered_last_frame && !sub.all_renderable {
-        ctx.load.push(build(path));
+    // **Coarse-ancestor load** (REPLACE only — an ADD parent already queued its own content above): enqueue THIS
+    // refining tile's own (coarser) content so a coarse stand-in becomes available for its still-loading
+    // descendants instead of holes. Fires (once) when the subtree isn't fully loaded AND any of:
+    //   (a) `must_continue` — this tile just met SSE but is holding its already-shown deeper detail until its own
+    //       mesh lands (cesium loads it Urgent); load even if the subtree is fully renderable so it can coarsen.
+    //   (b) `coverage.is_none()` — there is NO loaded ancestor to stand in for the holes. This is the
+    //       cesium-native **`preloadAncestors`** behavior (issue #7): on a COLD approach to a never-visited
+    //       region, warm the coarse ancestor chain top-down so a coarse base appears before the fine frontier,
+    //       not a hole. It is **self-limiting** — it fires only along the *uncovered* frontier (the moment any
+    //       ancestor loads, descendants have `coverage.is_some()` and stop triggering it), and the coarser
+    //       tile's higher geometric error sorts it ahead of the fine leaves in the (priority + per-step-capped)
+    //       load queue, so the chain lands coarse-first. (This replaces an earlier `any_rendered_last_frame`
+    //       gate that suppressed the cold-approach case — the gate is what left a never-visited region without a
+    //       coarse base. A literal cesium `preloadSiblings` is NOT added: Geo's `Offscreen` classification
+    //       already keeps the whole in-range hemisphere coarse-resident, a superset of culled-sibling preload.)
+    // THE REFINEMENT LADDER, ONE RUNG AT A TIME (atomic-reveal follow-up, 2026-06-10): under the atomic
+    // reveal a kicked ancestor releases when its DIRECT children are loaded+textured (a loaded child that
+    // must keep refining kicks LOCALLY and reports renderable), so the cut sharpens level-by-level — but
+    // only if the intermediate levels actually LOAD. Two over-corrections book-end the right arm:
+    //  * the old `coverage.is_none()`-only gate (preloadAncestors, tuned for the partial-reveal era where
+    //    intermediates never rendered) starved the ladder entirely — a kicked parent waited on the whole
+    //    multi-level SSE frontier ("zoom in and it never sharpens");
+    //  * queueing EVERY unloaded interior flooded the pipeline — thousands of levels-deep prepares parked
+    //    Resident-untextured behind the C++ texture round-trip, ballooning the published set to the resident
+    //    cap (render=17k, flash-restore thrash) while the fetch lane idled.
+    // The bounded form: queue an unloaded refining interior ONLY when it is the FIRST unloaded level below
+    // the rendered frontier (`parent_is_coverage` — my direct parent is the loaded stand-in), or when NOTHING
+    // above is loaded (`coverage.is_none()` — the cold-approach top-down warm-up). Each branch then carries
+    // at most one in-flight rung; the next queues when this one lands+textures and the anchor descends.
+    // `must_continue` keeps its urgent self-load (the zoom-out take-over case).
+    if !is_add
+        && !loaded
+        && !facts.dead
+        && (must_continue || ((coverage.is_none() || parent_is_coverage) && !sub.all_renderable))
+    {
+        ctx.load.push(build(path, true));
     }
-    ctx.state.push((path.clone(), SelectionResult::Refined));
+    ctx.state.push((node, SelectionResult::Refined));
     // Fold the ADD self-contribution into the returned details (no-op for REPLACE: `(true, 0)`).
     TraversalDetails {
         all_renderable: sub.all_renderable && add_self_renderable,
@@ -837,8 +1377,10 @@ where
 fn visit_implicit(
     ctx: &mut Ctx,
     path: &mut Vec<u32>,
+    node: u32,
     world: DMat4,
     root_path_len: usize,
+    root_node: u32,
     root_bounds: &BoundingVolume,
     implicit: &ImplicitTiling,
     root_error: f64,
@@ -860,15 +1402,18 @@ fn visit_implicit(
     if !center.is_finite() || !radius.is_finite() {
         return TraversalDetails::NEUTRAL; // hostile/degenerate bounds — drop, exactly like `visit` (H7)
     }
-    let sse_target = match (ctx.visibility)(center, radius) {
+    let vis = (ctx.visibility)(center, radius);
+    let sse_target = match vis {
         Visibility::Culled => return TraversalDetails::NEUTRAL,
         Visibility::Offscreen => ctx.params.culled_screen_space_error,
+        Visibility::Distant => ctx.params.distant_screen_space_error,
         Visibility::Visible => ctx.params.max_screen_space_error,
     };
+    let in_view = vis == Visibility::Visible;
     let distance = ((ctx.params.camera_position - center).length() - radius).max(0.0);
-    let loaded = (ctx.is_loaded)(path);
-    let dead = (ctx.is_dead)(path);
-    let prev = ctx.prev_state.get(path.as_slice()).copied();
+    let loaded = (ctx.is_loaded)(path, node);
+    let dead = (ctx.is_dead)(path, node);
+    let prev = ctx.prev_state.get(&node).copied();
     // Geometric error halves each implicit level (3D Tiles implicit convention): root_error / 2^level. Saturate
     // a pathological deep level to a 0 error (⇒ "meets SSE" ⇒ a leaf), never an overflowing/negative value.
     let denom = 1u64.checked_shl(level).unwrap_or(u64::MAX) as f64;
@@ -891,38 +1436,49 @@ fn visit_implicit(
         rendered_last: matches!(prev, Some(SelectionResult::Rendered | SelectionResult::Kicked)),
         refined_last: matches!(prev, Some(SelectionResult::Refined)),
         sse_target,
+        in_view,
         has_children,
     };
     // Content URI: the implicit root's templated content URI filled at this coordinate — but ONLY if the
-    // provider reports content available here (a tile may exist purely to subdivide). Built lazily in `build`.
+    // provider reports content available here (a tile may exist purely to subdivide). Built lazily in `build`
+    // (and only for the LOAD flavor — the render flavor's URIs are never consumed; audit 2026-06-10 §4.7).
     let content_available = {
         let ctx_implicit = ImplicitContext {
             root_path: &path[..root_path_len],
+            root_node,
             tiling: implicit,
         };
-        ctx.provider.content_availability(&ctx_implicit, level, x, y, z)
+        ctx.provider
+            .content_availability(&ctx_implicit, ctx.arena, level, x, y, z)
     };
-    let build = |p: &[u32]| {
-        let content_uris = match (content_available, template) {
+    let key = ctx.arena.key(node);
+    let build = |p: &[u32], with_uris: bool| {
+        let content_uris = match (with_uris && content_available, template) {
             (true, Some(t)) => vec![logi_3dtiles_tileset::substitute_template(t, level, x, y, z)],
-            _ => Vec::new(), // no content available here, or no template ⇒ an availability-only (interior) tile
+            _ => Vec::new(), // render flavor, no content available, or no template ⇒ no URI to fetch
         };
         SelectedTile {
             path: p.to_vec(),
+            node,
+            key,
             world_transform: world,
             content_uris,
             geometric_error,
             distance,
             bounds_center: center,
             bounds_radius: radius,
+            is_add: refine == Refine::Add,
+            clip_children: Vec::new(),
         }
     };
-    decide(ctx, path, &facts, build, |ctx, path| {
+    decide(ctx, path, node, &facts, build, |ctx, path| {
         descend_implicit_children(
             ctx,
             path,
+            node,
             world,
             root_path_len,
+            root_node,
             root_bounds,
             implicit,
             root_error,
@@ -952,8 +1508,10 @@ fn visit_implicit(
 fn descend_implicit_children(
     ctx: &mut Ctx,
     path: &mut Vec<u32>,
+    node: u32,
     world: DMat4,
     root_path_len: usize,
+    root_node: u32,
     root_bounds: &BoundingVolume,
     implicit: &ImplicitTiling,
     root_error: f64,
@@ -977,9 +1535,11 @@ fn descend_implicit_children(
                 let availability = {
                     let ctx_implicit = ImplicitContext {
                         root_path: &path[..root_path_len],
+                        root_node,
                         tiling: implicit,
                     };
-                    ctx.provider.tile_availability(&ctx_implicit, child_level, cx, cy, cz)
+                    ctx.provider
+                        .tile_availability(&ctx_implicit, ctx.arena, child_level, cx, cy, cz)
                 };
                 match availability {
                     TileAvailability::Unavailable => {} // child doesn't exist — prune this branch
@@ -991,6 +1551,7 @@ fn descend_implicit_children(
                         // count it as one still-loading descendant. If the parent later kicks, this tentative
                         // ancestor render is truncated with the rest; if it doesn't (few holes), the coarse
                         // ancestor covers the gap until the subtree arrives and the child becomes Available.
+                        ctx.holds.pending_subtree += 1; // X-ray: held coarse on a missing `.subtree`
                         if let Some(anc) = ctx.nearest_loaded.clone() {
                             ctx.render.push(anc);
                         }
@@ -998,12 +1559,15 @@ fn descend_implicit_children(
                         sub.not_yet_renderable = sub.not_yet_renderable.saturating_add(1);
                     }
                     TileAvailability::Available => {
+                        let cnode = ctx.arena.child_of(node, step);
                         path.push(step);
                         let cd = visit_implicit(
                             ctx,
                             path,
+                            cnode,
                             world,
                             root_path_len,
+                            root_node,
                             root_bounds,
                             implicit,
                             root_error,
@@ -1057,7 +1621,8 @@ mod tests {
             fov_y_radians: std::f64::consts::FRAC_PI_3, // 60°
             viewport_height: 1080.0,
             max_screen_space_error: 16.0,
-            culled_screen_space_error: 64.0, // 4× — off-view tiles refine to a coarse shell
+            distant_screen_space_error: 32.0, // 2× — the visible far vista, mildly demoted
+            culled_screen_space_error: 64.0,  // 4× — off-view tiles refine to a coarse shell
             hysteresis: 0.0,
         }
     }
@@ -1066,9 +1631,60 @@ mod tests {
         tiles.iter().map(|t| t.path.clone()).collect()
     }
 
-    /// An empty prior state ⇒ a cold / stateless pass (no hysteresis, no cross-frame kick).
+    /// An empty prior state ⇒ a cold / stateless pass (no hysteresis, no cross-frame anti-pop state —
+    /// the cold kick still fires).
     fn cold() -> SelectionState {
         SelectionState::new()
+    }
+
+    #[test]
+    fn hold_counts_xray_attributes_leaf_kick_and_loading() {
+        let ts = nested_tileset();
+        let e = Ellipsoid::wgs84();
+        // Camera at 100 m: the gE=10 grandchildren are leaves and still FAR over the 16 px target there —
+        // every loaded grandchild renders coarser-than-wanted ⇒ leaf_under_sse (4); nothing else holds.
+        let all_loaded = select_tree_implicit(
+            &ts.root,
+            &e,
+            &params_at(100.0),
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
+            &mut |_, _| Visibility::Visible,
+            &cold(),
+            &mut NoImplicit,
+        );
+        assert_eq!(
+            all_loaded.holds.leaf_under_sse, 4,
+            "4 under-SSE leaves (the scar counter)"
+        );
+        assert_eq!(all_loaded.holds.kick, 0);
+        assert_eq!(all_loaded.holds.loading, 0);
+        // Same camera, only the ROOT loaded: the unloaded descendants count `loading`, and the loaded root
+        // KICKS (a ready stand-in over a fresh, not-fully-renderable refinement holds its own render).
+        let root_only = select_tree_implicit(
+            &ts.root,
+            &e,
+            &params_at(100.0),
+            &mut PathArena::new(),
+            &mut |path, _| path.is_empty(),
+            &mut |_, _| false,
+            &mut |_, _| Visibility::Visible,
+            &cold(),
+            &mut NoImplicit,
+        );
+        assert!(
+            root_only.holds.loading > 0,
+            "unloaded descendants count as loading holds"
+        );
+        assert!(
+            root_only.holds.kick > 0,
+            "the loaded root kicks over its loading subtree"
+        );
+        assert_eq!(
+            root_only.holds.leaf_under_sse, 0,
+            "no loaded under-SSE leaf in this state"
+        );
     }
 
     #[test]
@@ -1079,8 +1695,9 @@ mod tests {
             &ts.root,
             &e,
             &params_at(200_000.0),
-            &mut |_| true,
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
@@ -1098,8 +1715,9 @@ mod tests {
             &ts.root,
             &e,
             &params_at(2000.0),
-            &mut |_| true,
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
@@ -1140,8 +1758,9 @@ mod tests {
             &ts.root,
             &e,
             &params_at(2000.0),
-            &mut |_| true,
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
@@ -1165,8 +1784,9 @@ mod tests {
             &ts.root,
             &e,
             &params_at(2000.0),
-            &mut |_| true,
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
@@ -1205,8 +1825,9 @@ mod tests {
             &ts.root,
             &e,
             &params_at(2000.0),
-            &mut |_| true,
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
@@ -1220,8 +1841,9 @@ mod tests {
             &ts.root,
             &e,
             &params_at(500.0),
-            &mut |_| true,
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
@@ -1234,27 +1856,109 @@ mod tests {
     }
 
     #[test]
-    fn one_unloaded_grandchild_kicks_its_subtree_to_the_loaded_parent() {
+    fn a_loaded_parent_with_an_unready_child_reveals_atomically_not_partially() {
         let ts = nested_tileset();
         let e = Ellipsoid::wgs84();
         // Grandchild [0,0] isn't resident; everything else is. A cold pass (nothing shown last frame).
-        let mut is_loaded = |p: &[u32]| p != [0, 0];
-        let sel = select_tree_implicit(
+        // ATOMIC REVEAL (holes follow-up 2026-06-10): the loaded [0] KICKS — it renders its own coarse
+        // content alone (no coexistence with [0,1], so no clip box and none of the box-vs-irregular-footprint
+        // holes) — while [0,0] keeps loading underneath (the kick truncates renders, never loads). [1]'s
+        // subtree is fully loaded → it reveals its grandchildren independently (the kick anchors per tile,
+        // not at the root: kicked-loaded [0] reports all_renderable, so the root refines normally).
+        let mut is_loaded = |p: &[u32], _: u32| p != [0, 0];
+        let arena = &mut PathArena::new();
+        let s1 = select_tree_implicit(
             &ts.root,
             &e,
             &params_at(2000.0),
+            arena,
             &mut is_loaded,
-            &mut |_| false,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
         );
-        // The KICK: [0]'s subtree isn't fully loaded and showed nothing last frame, so rather than a partial
-        // refinement (fine [0,1] beside a coarse stand-in for [0,0]), the loaded parent [0] renders coarse
-        // for its whole region — [0,1]'s tentative render is kicked. [1]'s subtree is fully loaded → it
-        // refines to its grandchildren. Only [0,0] is queued to load.
-        assert_eq!(paths(&sel.render), BTreeSet::from([vec![0], vec![1, 0], vec![1, 1]]));
-        assert_eq!(paths(&sel.load), BTreeSet::from([vec![0, 0]]));
+        assert_eq!(
+            paths(&s1.render),
+            BTreeSet::from([vec![0], vec![1, 0], vec![1, 1]]),
+            "[0] holds its own render atomically; [1] reveals; nothing coexists"
+        );
+        assert_eq!(paths(&s1.load), BTreeSet::from([vec![0, 0]]));
+        assert!(
+            s1.render.iter().all(|t| t.clip_children.is_empty()),
+            "atomic reveal needs no hole-clip boxes on the loading path"
+        );
+
+        // The straggler lands → [0] switches to its grandchildren ATOMICALLY next pass.
+        let s2 = select_tree_implicit(
+            &ts.root,
+            &e,
+            &params_at(2000.0),
+            arena,
+            &mut |_, _| true,
+            &mut |_, _| false,
+            &mut |_, _| Visibility::Visible,
+            &s1.state,
+            &mut NoImplicit,
+        );
+        assert_eq!(
+            paths(&s2.render),
+            BTreeSet::from([vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1]]),
+            "once the subtree is fully renderable the fine cut replaces the kicked parent atomically"
+        );
+    }
+
+    #[test]
+    fn a_loaded_ancestor_anchors_the_kick_over_an_unloaded_parent_then_converges() {
+        // root loaded; the mid-tile [0] is NOT loaded and neither is its child [0,1]; [0,0] and the whole [1]
+        // subtree are. The nearest LOADED ancestor able to cover [0]'s unready region is the ROOT, so the root
+        // KICKS (atomic — it renders alone, no coexistence, no clip), while the unready frontier keeps
+        // loading underneath (kick truncates renders, never the load queue).
+        let ts = nested_tileset();
+        let e = Ellipsoid::wgs84();
+        let mut is_loaded = |p: &[u32], _: u32| p != [0] && p != [0, 1];
+        let arena = &mut PathArena::new();
+        let s1 = select_tree_implicit(
+            &ts.root,
+            &e,
+            &params_at(2000.0),
+            arena,
+            &mut is_loaded,
+            &mut |_, _| false,
+            &mut |_, _| Visibility::Visible,
+            &cold(),
+            &mut NoImplicit,
+        );
+        assert_eq!(
+            paths(&s1.render),
+            BTreeSet::from([vec![]]),
+            "the loaded root anchors the kick: one coarse cover, never holes, never coexistence"
+        );
+        assert_eq!(
+            paths(&s1.load),
+            BTreeSet::from([vec![0], vec![0, 1]]),
+            "the unready frontier keeps streaming under the kick — INCLUDING the unloaded intermediate [0]              (the refinement ladder: the root releases per level, so the next level down must load)"
+        );
+
+        // [0,1] lands → the whole cut is renderable ([0] itself is an unloaded INTERIOR tile — a refining
+        // interior needs no own content) → the root reveals the fine cut atomically.
+        let mut is_loaded2 = |p: &[u32], _: u32| p != [0];
+        let s2 = select_tree_implicit(
+            &ts.root,
+            &e,
+            &params_at(2000.0),
+            arena,
+            &mut is_loaded2,
+            &mut |_, _| false,
+            &mut |_, _| Visibility::Visible,
+            &s1.state,
+            &mut NoImplicit,
+        );
+        assert_eq!(
+            paths(&s2.render),
+            BTreeSet::from([vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1]]),
+            "convergence releases the anchor and the fine cut replaces it atomically"
+        );
     }
 
     #[test]
@@ -1265,22 +1969,33 @@ mod tests {
         // still-loading. WITHOUT R1 the dead [0,0] kept [0] kicked to coarse forever (drawing the whole coarse
         // parent over the loaded sibling [0,1] — the "blurry coarse over sharp" overlap). WITH R1 it's treated
         // as absent: [0,1] refines sharp, [0,0]'s footprint is a hole, and [0,0] is NOT re-queued for load.
-        let mut is_loaded = |p: &[u32]| p != [0, 0];
-        let mut is_dead = |p: &[u32]| p == [0, 0];
+        let mut is_loaded = |p: &[u32], _: u32| p != [0, 0];
+        let mut is_dead = |p: &[u32], _: u32| p == [0, 0];
         let sel = select_tree_implicit(
             &ts.root,
             &e,
             &params_at(2000.0),
+            &mut PathArena::new(),
             &mut is_loaded,
             &mut is_dead,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
         );
+        // Holes follow-up (2026-06-10): the dead [0,0]'s footprint is COVERED by its loaded parent [0],
+        // which renders as a stand-in hole-clipped by the loaded sibling [0,1] — so the sibling still
+        // refines sharp (the original R1 bug stays fixed, by the CLIP now, not by absence) and the dead
+        // footprint shows coarse imagery instead of a see-through hole.
         assert_eq!(
             paths(&sel.render),
-            BTreeSet::from([vec![0, 1], vec![1, 0], vec![1, 1]]),
-            "dead [0,0] is absent; its loaded sibling [0,1] refines sharp instead of being blurred by coarse [0]"
+            BTreeSet::from([vec![0], vec![0, 1], vec![1, 0], vec![1, 1]]),
+            "dead [0,0] is covered by the clipped stand-in [0]; its loaded sibling [0,1] still refines sharp"
+        );
+        let standin = sel.render.iter().find(|t| t.path == [0]).unwrap();
+        assert_eq!(
+            standin.clip_children,
+            vec![(1u8, path_key(&[0, 1]))], // group 1 = the [0,1] direct-child subtree
+            "the stand-in is clipped by the loaded sibling, so only the dead footprint shows coarse"
         );
         assert!(sel.load.is_empty(), "a dead tile must never be re-queued for load");
     }
@@ -1291,12 +2006,13 @@ mod tests {
         let e = Ellipsoid::wgs84();
         // BOTH of [0]'s children are dead. R1 must NOT punch a big hole: with the whole sibling set dead, [0]'s
         // refine is empty, so it renders the coarse parent [0] for its region (no holes), while [1] refines.
-        let mut is_loaded = |p: &[u32]| p != [0, 0] && p != [0, 1];
-        let mut is_dead = |p: &[u32]| p == [0, 0] || p == [0, 1];
+        let mut is_loaded = |p: &[u32], _: u32| p != [0, 0] && p != [0, 1];
+        let mut is_dead = |p: &[u32], _: u32| p == [0, 0] || p == [0, 1];
         let sel = select_tree_implicit(
             &ts.root,
             &e,
             &params_at(2000.0),
+            &mut PathArena::new(),
             &mut is_loaded,
             &mut is_dead,
             &mut |_, _| Visibility::Visible,
@@ -1317,21 +2033,24 @@ mod tests {
         let e = Ellipsoid::wgs84();
         // Only the root is resident; the whole tree is a fresh, unloaded refinement → the root kicks (it is a
         // ready coarse stand-in) and renders alone, while all four leaves are queued.
-        let mut is_loaded = |p: &[u32]| p.is_empty();
+        let mut is_loaded = |p: &[u32], _: u32| p.is_empty();
         let sel = select_tree_implicit(
             &ts.root,
             &e,
             &params_at(2000.0),
+            &mut PathArena::new(),
             &mut is_loaded,
-            &mut |_| false,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
         );
         assert_eq!(paths(&sel.render), BTreeSet::from([vec![]])); // root only — no holes
+                                                                  // The whole ladder is queued: the mid LEVELS as well as the leaves, so the kicked root can release
+                                                                  // one level at a time (mids land first — higher geometric error sorts them ahead in the fetch queue).
         assert_eq!(
             paths(&sel.load),
-            BTreeSet::from([vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1]])
+            BTreeSet::from([vec![0], vec![0, 0], vec![0, 1], vec![1], vec![1, 0], vec![1, 1]])
         );
     }
 
@@ -1360,8 +2079,9 @@ mod tests {
             &ts.root,
             &e,
             &params_at(2000.0),
-            &mut |_| true,
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut visibility,
             &cold(),
             &mut NoImplicit,
@@ -1381,8 +2101,9 @@ mod tests {
             &ts.root,
             &e,
             &p,
-            &mut |_| true,
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
@@ -1396,8 +2117,9 @@ mod tests {
             &ts.root,
             &e,
             &p,
-            &mut |_| true,
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Offscreen,
             &cold(),
             &mut NoImplicit,
@@ -1406,6 +2128,52 @@ mod tests {
             paths(&offscreen.render),
             BTreeSet::from([vec![0], vec![1]]),
             "off view ⇒ coarse shell (stop at the children, the culled SSE target)"
+        );
+    }
+
+    #[test]
+    fn distant_tiles_refine_to_the_mid_demoted_distant_sse() {
+        // The 3-way split (2026-06-10 ground cut flood): Distant (in-frustum far vista) sits BETWEEN
+        // Visible and Offscreen. Same 3000 m offset as the test above — mid-children at SSE ≈ 31 px:
+        // above the 16 px view target, BELOW the 32 px distant target, below the 64 px culled target —
+        // so a Distant tile stops exactly where an Offscreen one does here, but a finer distant target
+        // (24 px) refines past them while the culled target still would not.
+        let ts = nested_tileset();
+        let e = Ellipsoid::wgs84();
+        let p = params_at(3000.0);
+        let distant = select_tree_implicit(
+            &ts.root,
+            &e,
+            &p,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
+            &mut |_, _| Visibility::Distant,
+            &cold(),
+            &mut NoImplicit,
+        );
+        assert_eq!(
+            paths(&distant.render),
+            BTreeSet::from([vec![0], vec![1]]),
+            "distant ⇒ stops at the children (31 px < the 32 px distant target)"
+        );
+        let mut finer = p;
+        finer.distant_screen_space_error = 24.0; // now 31 px EXCEEDS the distant target ⇒ refine on
+        let distant_finer = select_tree_implicit(
+            &ts.root,
+            &e,
+            &finer,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
+            &mut |_, _| Visibility::Distant,
+            &cold(),
+            &mut NoImplicit,
+        );
+        assert_eq!(
+            paths(&distant_finer.render),
+            BTreeSet::from([vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1]]),
+            "a finer distant target refines Distant tiles deeper — it is read, not the culled one"
         );
     }
 
@@ -1420,6 +2188,8 @@ mod tests {
         let p = params_at(2000.0); // near → wants the gE-10 grandchildren
         let mut loaded: HashSet<Vec<u32>> = HashSet::from([vec![], vec![0], vec![1]]); // mids loaded, leaves not
         let mut state = cold();
+        // ONE arena across all three frames: the threaded `state` is keyed by its node ids.
+        let arena = &mut PathArena::new();
 
         // Frame 1: no grandchild is loaded → each loaded mid-tile KICKS to its own coarse content (no holes);
         // all four grandchildren are queued.
@@ -1427,8 +2197,9 @@ mod tests {
             &ts.root,
             &e,
             &p,
-            &mut |q: &[u32]| loaded.contains(q),
-            &mut |_| false,
+            arena,
+            &mut |q: &[u32], _| loaded.contains(q),
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &state,
             &mut NoImplicit,
@@ -1451,8 +2222,9 @@ mod tests {
             &ts.root,
             &e,
             &p,
-            &mut |q: &[u32]| loaded.contains(q),
-            &mut |_| false,
+            arena,
+            &mut |q: &[u32], _| loaded.contains(q),
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &state,
             &mut NoImplicit,
@@ -1470,8 +2242,9 @@ mod tests {
             &ts.root,
             &e,
             &p,
-            &mut |q: &[u32]| loaded.contains(q),
-            &mut |_| false,
+            arena,
+            &mut |q: &[u32], _| loaded.contains(q),
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &state,
             &mut NoImplicit,
@@ -1483,6 +2256,109 @@ mod tests {
         );
     }
 
+    /// `mustContinueRefiningToDeeperTiles`: a tile that NOW meets SSE but was `Refined` last frame and isn't
+    /// resident keeps showing its finer (loaded) descendants instead of popping to a coarse stand-in — the
+    /// anti-detail-VANISH rule (zoom-out / pull-back). Here the camera sits where the MID level [0]/[1]
+    /// (gE=100) meets SSE=16 but the root (gE=1000) does not; the mid tiles are NOT resident while their leaves
+    /// ARE. Without the rule, [0]/[1] would render their coarse loaded ancestor (the root) and the detail would
+    /// collapse; with it, the leaves keep drawing and the mid tiles are queued so they can later take over.
+    #[test]
+    fn must_continue_refining_holds_shown_detail_until_the_coarser_tile_loads() {
+        let ts = nested_tileset();
+        let e = Ellipsoid::wgs84();
+        let p = params_at(7000.0); // gE=100 meets SSE 16 (≈13.4); gE=1000 does not (≈134) → root refines
+                                   // Resident: root + the four leaves, but NOT the mid tiles [0],[1].
+        let loaded: BTreeSet<Vec<u32>> = BTreeSet::from([vec![], vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1]]);
+        // Last frame: root + mids `Refined`, leaves `Rendered` → `refined_last` holds for [0],[1]. The
+        // prior state is node-keyed, so intern its paths in the SAME arena the pass will use.
+        let arena = &mut PathArena::new();
+        let mut state = SelectionState::new();
+        for refined in [&[][..], &[0], &[1]] {
+            state.insert(arena.intern_path(refined), SelectionResult::Refined);
+        }
+        for leaf in [&[0u32, 0][..], &[0, 1], &[1, 0], &[1, 1]] {
+            state.insert(arena.intern_path(leaf), SelectionResult::Rendered);
+        }
+        let sel = select_tree_implicit(
+            &ts.root,
+            &e,
+            &p,
+            arena,
+            &mut |q: &[u32], _| loaded.contains(q),
+            &mut |_, _| false,
+            &mut |_, _| Visibility::Visible,
+            &state,
+            &mut NoImplicit,
+        );
+        // Detail held: the leaves keep rendering (NOT collapsed to the coarse root).
+        assert_eq!(
+            paths(&sel.render),
+            BTreeSet::from([vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1]]),
+            "must_continue keeps the already-shown leaves instead of popping to the coarse root"
+        );
+        // And the now-SSE-adequate mid tiles are queued so they can take over (coarsen) once loaded.
+        let load_paths = paths(&sel.load);
+        assert!(
+            load_paths.contains(&vec![0]) && load_paths.contains(&vec![1]),
+            "the now-SSE-adequate mid tiles are queued to load so they can replace their leaves, got {load_paths:?}"
+        );
+    }
+
+    /// The companion to the rule above: WITHOUT the prior `Refined` state (a cold pass), the same view+residency
+    /// must NOT hold deep detail — a mid tile that meets SSE but isn't loaded falls back to its coarse ancestor.
+    #[test]
+    fn cold_pass_does_not_hold_unrequested_deep_detail() {
+        let ts = nested_tileset();
+        let e = Ellipsoid::wgs84();
+        let p = params_at(7000.0);
+        let loaded: BTreeSet<Vec<u32>> = BTreeSet::from([vec![], vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1]]);
+        let sel = select_tree_implicit(
+            &ts.root,
+            &e,
+            &p,
+            &mut PathArena::new(),
+            &mut |q: &[u32], _| loaded.contains(q),
+            &mut |_, _| false,
+            &mut |_, _| Visibility::Visible,
+            &cold(), // no prior Refined state ⇒ no must_continue
+            &mut NoImplicit,
+        );
+        // Mid tiles meet SSE and aren't loaded ⇒ they render the coarse loaded root, not their leaves.
+        assert_eq!(
+            paths(&sel.render),
+            BTreeSet::from([vec![]]),
+            "cold pass: mid tiles meet SSE and aren't loaded ⇒ fall back to the coarse root"
+        );
+    }
+
+    /// #7 `preloadAncestors`: on a COLD approach (nothing resident, no prior state) to a region whose subtree
+    /// refines below the kick threshold, the coarse-ancestor chain is queued top-down so a coarse base lands
+    /// before the fine frontier — instead of only the deep leaves loading (no coarse stand-in until they do).
+    /// The interior refining tiles (root + mids), which have NO loaded ancestor (`coverage.is_none()`), enqueue
+    /// their own content; without the arm only the 4 leaves would (< the kick threshold, so no kick fires).
+    #[test]
+    fn cold_approach_warms_the_coarse_ancestor_chain() {
+        let ts = nested_tileset();
+        let e = Ellipsoid::wgs84();
+        let sel = select_tree_implicit(
+            &ts.root,
+            &e,
+            &params_at(2000.0), // close: root→mids→leaves all refine
+            &mut PathArena::new(),
+            &mut |_, _| false, // NOTHING resident (cold)
+            &mut |_, _| false,
+            &mut |_, _| Visibility::Visible,
+            &cold(), // no prior state
+            &mut NoImplicit,
+        );
+        let load = paths(&sel.load);
+        // The coarse ancestors are warmed (queued), not just the deep leaves.
+        assert!(
+            load.contains(&vec![]) && load.contains(&vec![0]) && load.contains(&vec![1]),
+            "cold approach must queue the coarse ancestor chain (root + mids), got {load:?}"
+        );
+    }
+
     #[test]
     fn bounding_sphere_for_each_volume_type() {
         let e = Ellipsoid::wgs84();
@@ -1491,13 +2367,24 @@ mod tests {
         let (c, r) = bounding_sphere_ecef(&BoundingVolume::Sphere([1.0, 2.0, 3.0, 9.0]), &id, &e);
         assert_eq!(c, DVec3::new(1.0, 2.0, 3.0));
         assert!((r - 9.0).abs() < 1e-9);
-        // box: radius = sum of half-axis lengths.
+        // box: radius = the farthest corner = √(3²+4²+12²) = 13 for these orthogonal half-axes (the EXACT
+        // circumscribed sphere). NOT the old `|u|+|v|+|w|` = 19 L1 over-bound (√169 vs 3+4+12) — that was
+        // √(169)/19 ≈ 1.46× too large here (up to √3× for a cube), over-streaming view-edge tiles.
         let (_, rb) = bounding_sphere_ecef(
             &BoundingVolume::Box([0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 12.0]),
             &id,
             &e,
         );
-        assert!((rb - 19.0).abs() < 1e-9);
+        assert!((rb - 13.0).abs() < 1e-9);
+        // Sheared (non-orthogonal) axes: the per-corner max must stay a SAFE OVER-bound (≥ every corner
+        // distance), where a bare √Σ|·|² would UNDER-bound. Axes u=v=w=(1,0,0) collapse to a degenerate box
+        // whose farthest "corner" is at |u+v+w| = 3; √Σ|·|² would give √3 ≈ 1.73 < 3 (unsafe). We must get 3.
+        let (_, rsheared) = bounding_sphere_ecef(
+            &BoundingVolume::Box([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
+            &id,
+            &e,
+        );
+        assert!((rsheared - 3.0).abs() < 1e-9, "sheared box must not under-bound");
         // a translation+scale transform moves the sphere center and scales its radius.
         let m = DMat4::from_scale_rotation_translation(
             glam::DVec3::splat(2.0),
@@ -1534,60 +2421,51 @@ mod tests {
     }
 
     #[test]
-    fn active_subtree_with_no_loaded_ancestor_loads_a_coarse_fallback() {
-        // §9.2 step 6 (`ancestor_meets_sse`): once a refinement is *active* (a descendant drew last frame)
-        // but isn't fully loaded and has no loaded ancestor, the traversal loads the interior tile as a coarse
-        // stand-in — so its still-loading siblings show coarse instead of holes. The gate is "active": this
-        // must NOT fire on a cold frame (else it eagerly loads the whole chain).
+    fn refining_interiors_are_queued_as_the_ladder_even_under_a_resident_ancestor() {
+        // The REFINEMENT LADDER (2026-06-10, replaces the old `coverage.is_none()` self-limiting preload —
+        // that suppression starved the atomic reveal: a kicked ancestor releases per LEVEL, so the unloaded
+        // intermediate levels must load even when a coarse ancestor is already resident and covering).
         use hashbrown::HashSet;
         let ts = nested_tileset();
         let e = Ellipsoid::wgs84();
-        let p = params_at(2000.0); // near → wants the grandchildren
-                                   // Only one grandchild is resident; crucially neither the root nor the mid-tile [0] is loaded.
-        let loaded: HashSet<Vec<u32>> = HashSet::from([vec![0, 0]]);
+        let p = params_at(2000.0); // near → root→mids→leaves all refine
 
-        // Frame 1 (cold): [0,0] renders; [0,1]/[1,*] queue. The active-subtree fallback must NOT fire yet —
-        // nothing rendered last frame — so the interior [0] is NOT in the load set.
-        let s1 = select_tree_implicit(
+        // (a) Root resident + one grandchild: the unloaded interior mid-tiles ARE queued (the ladder), along
+        // with the unloaded leaves — everything the cut needs to descend one level at a time.
+        let with_root: HashSet<Vec<u32>> = HashSet::from([vec![], vec![0, 0]]);
+        let s_cov = select_tree_implicit(
             &ts.root,
             &e,
             &p,
-            &mut |q: &[u32]| loaded.contains(q),
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |q: &[u32], _| with_root.contains(q),
+            &mut |_, _| false,
+            &mut |_, _| Visibility::Visible,
+            &cold(),
+            &mut NoImplicit,
+        );
+        let load = paths(&s_cov.load);
+        assert!(
+            load.contains(&vec![0]) && load.contains(&vec![1]),
+            "unloaded refining interiors are queued (the ladder), got {load:?}"
+        );
+
+        // (b) NOTHING resident: the whole chain (root + mids + leaves) queues — the cold-approach warm.
+        let s_cold = select_tree_implicit(
+            &ts.root,
+            &e,
+            &p,
+            &mut PathArena::new(),
+            &mut |_, _| false,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
         );
         assert!(
-            paths(&s1.render).contains(&vec![0, 0]),
-            "the one loaded grandchild renders"
-        );
-        assert!(
-            !paths(&s1.load).contains(&vec![0]),
-            "cold frame: no eager ancestor load — only the unloaded leaves queue"
-        );
-        assert_eq!(paths(&s1.load), BTreeSet::from([vec![0, 1], vec![1, 0], vec![1, 1]]));
-
-        // Frame 2: [0]'s subtree is now active ([0,0] rendered last frame) but still incomplete ([0,1] not
-        // loaded) and has no loaded ancestor → [0] is loaded as the coarse fallback. [1]'s subtree drew
-        // nothing last frame, so its interior is NOT loaded — the load stays bounded to active subtrees.
-        let s2 = select_tree_implicit(
-            &ts.root,
-            &e,
-            &p,
-            &mut |q: &[u32]| loaded.contains(q),
-            &mut |_| false,
-            &mut |_, _| Visibility::Visible,
-            &s1.state,
-            &mut NoImplicit,
-        );
-        assert!(
-            paths(&s2.load).contains(&vec![0]),
-            "active, ancestor-less, incomplete subtree [0] loads its coarse fallback"
-        );
-        assert!(
-            !paths(&s2.load).contains(&vec![1]),
-            "inactive subtree [1] does not load an interior fallback"
+            paths(&s_cold.load).contains(&vec![]),
+            "with no resident ancestor the root itself is queued too, got {:?}",
+            paths(&s_cold.load)
         );
     }
 
@@ -1596,31 +2474,32 @@ mod tests {
         let ts = nested_tileset();
         let e = Ellipsoid::wgs84();
         // Near camera, all loaded → root + both mid-children Refined; the four grandchildren Rendered.
+        // The state is node-keyed; map ids back to paths through the arena for the assertions.
+        let arena = &mut PathArena::new();
         let sel = select_tree_implicit(
             &ts.root,
             &e,
             &params_at(2000.0),
-            &mut |_| true,
-            &mut |_| false,
+            arena,
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
         );
-        let refined: BTreeSet<Vec<u32>> = sel
-            .state
-            .iter()
-            .filter(|(_, &r)| r == SelectionResult::Refined)
-            .map(|(p, _)| p.clone())
-            .collect();
-        assert_eq!(refined, BTreeSet::from([vec![], vec![0], vec![1]]));
-        let rendered: BTreeSet<Vec<u32>> = sel
-            .state
-            .iter()
-            .filter(|(_, &r)| r == SelectionResult::Rendered)
-            .map(|(p, _)| p.clone())
-            .collect();
+        let by_result = |want: SelectionResult| -> BTreeSet<Vec<u32>> {
+            sel.state
+                .iter()
+                .filter(|(_, &r)| r == want)
+                .map(|(&n, _)| arena.path_of(n))
+                .collect()
+        };
         assert_eq!(
-            rendered,
+            by_result(SelectionResult::Refined),
+            BTreeSet::from([vec![], vec![0], vec![1]])
+        );
+        assert_eq!(
+            by_result(SelectionResult::Rendered),
             BTreeSet::from([vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1]])
         );
     }
@@ -1639,8 +2518,9 @@ mod tests {
             &ts.root,
             &e,
             &p,
-            &mut |_| true,
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
@@ -1653,17 +2533,20 @@ mod tests {
 
         // Hysteretic: same view, but the children were `Refined` last frame → they hold their split because
         // SSE 14 > 16/(1+0.25)=12.8. This is the anti-pop dead-band: no parent↔children flip on the threshold.
+        // The prior state is node-keyed: intern its paths in the SAME arena the pass uses.
         p.hysteresis = 0.25;
+        let arena = &mut PathArena::new();
         let prev = SelectionState::from([
-            (vec![0u32], SelectionResult::Refined),
-            (vec![1u32], SelectionResult::Refined),
+            (arena.intern_path(&[0]), SelectionResult::Refined),
+            (arena.intern_path(&[1]), SelectionResult::Refined),
         ]);
         let hyst = select_tree_implicit(
             &ts.root,
             &e,
             &p,
-            &mut |_| true,
-            &mut |_| false,
+            arena,
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &prev,
             &mut NoImplicit,
@@ -1704,8 +2587,9 @@ mod tests {
             &ts.root,
             &e,
             &params_at(2000.0),
-            &mut |_| true,
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
@@ -1760,8 +2644,9 @@ mod tests {
             &root,
             &e,
             &params_at(2000.0),
-            &mut |_| true,
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
@@ -1791,8 +2676,9 @@ mod tests {
                     &root,
                     &e,
                     &params_at(2000.0),
-                    &mut |_| true,
-                    &mut |_| false,
+                    &mut PathArena::new(),
+                    &mut |_, _| true,
+                    &mut |_, _| false,
                     &mut |_, _| Visibility::Visible,
                     &cold(),
                     &mut NoImplicit,
@@ -1891,7 +2777,15 @@ mod tests {
     }
 
     impl AvailabilityProvider for MapProvider {
-        fn tile_availability(&mut self, _: &ImplicitContext, level: u32, x: u32, y: u32, z: u32) -> TileAvailability {
+        fn tile_availability(
+            &mut self,
+            _: &ImplicitContext,
+            _: &PathArena,
+            level: u32,
+            x: u32,
+            y: u32,
+            z: u32,
+        ) -> TileAvailability {
             self.asked.borrow_mut().push((level, x, y, z));
             if let Some(p) = self.pending_below {
                 if level >= p {
@@ -1908,7 +2802,15 @@ mod tests {
                 TileAvailability::Unavailable
             }
         }
-        fn content_availability(&mut self, _: &ImplicitContext, level: u32, x: u32, y: u32, z: u32) -> bool {
+        fn content_availability(
+            &mut self,
+            _: &ImplicitContext,
+            _: &PathArena,
+            level: u32,
+            x: u32,
+            y: u32,
+            z: u32,
+        ) -> bool {
             self.subtree.is_content_available(0, level, x, y, z)
         }
     }
@@ -1960,6 +2862,7 @@ mod tests {
             fov_y_radians: std::f64::consts::FRAC_PI_3,
             viewport_height: 1080.0,
             max_screen_space_error: 16.0,
+            distant_screen_space_error: 32.0,
             culled_screen_space_error: 64.0,
             hysteresis: 0.0,
         }
@@ -1976,8 +2879,9 @@ mod tests {
             &root,
             &e,
             &implicit_params(2000.0), // near → would refine deep IF children existed
-            &mut |_| true,
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             &mut NoImplicit,
@@ -2015,12 +2919,20 @@ mod tests {
             "refine each available branch to its deepest available tile"
         );
 
-        // URL substitution: the [0,0] tile is implicit level 2, global coord (0,0) → content/2/0/0.glb. The
-        // [1] tile is level 1, global coord (1,0) → content/1/1/0.glb.
+        // RENDER tiles carry no content URIs (audit 2026-06-10 §4.7 — never consumed downstream). URL
+        // substitution is checked below through the LOAD set of a nothing-loaded pass.
         let by_path = |p: &[u32]| sel.render.iter().find(|t| t.path == p).unwrap();
-        assert_eq!(by_path(&[0, 0]).content_uris, vec!["content/2/0/0.glb".to_string()]);
-        assert_eq!(by_path(&[1]).content_uris, vec!["content/1/1/0.glb".to_string()]);
-        assert_eq!(by_path(&[2]).content_uris, vec!["content/1/0/1.glb".to_string()]);
+        assert!(by_path(&[0, 0]).content_uris.is_empty(), "render tiles carry no URIs");
+
+        // URL substitution (LOAD flavor): rerun the same view with NOTHING loaded — the queued tiles carry
+        // their templated content URIs. [0,0] is implicit level 2, global (0,0) → content/2/0/0.glb; [1] is
+        // level 1, global (1,0) → content/1/1/0.glb; [2] is level 1, global (0,1) → content/1/0/1.glb.
+        let mut provider2 = MapProvider::new(subtree_with(&avail, 4), 3);
+        let cold_sel = select_implicit_tree_loaded(&root, &e, &implicit_params(50.0), &mut provider2, &|_| false);
+        let by_load = |p: &[u32]| cold_sel.load.iter().find(|t| t.path == p).unwrap();
+        assert_eq!(by_load(&[0, 0]).content_uris, vec!["content/2/0/0.glb".to_string()]);
+        assert_eq!(by_load(&[1]).content_uris, vec!["content/1/1/0.glb".to_string()]);
+        assert_eq!(by_load(&[2]).content_uris, vec!["content/1/0/1.glb".to_string()]);
 
         // Bounds: a synthesized tile's sphere must equal `bounding_sphere_ecef(subdivide_bounds(...))`. Check
         // the [1] tile (level 1, coord (1,0)) against the spec subdivision of the root region.
@@ -2180,8 +3092,9 @@ mod tests {
             root,
             e,
             params,
-            &mut |_| true,
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |_, _| true,
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             provider,
@@ -2200,8 +3113,9 @@ mod tests {
             root,
             e,
             params,
-            &mut |p| is_loaded(p),
-            &mut |_| false,
+            &mut PathArena::new(),
+            &mut |p, _| is_loaded(p),
+            &mut |_, _| false,
             &mut |_, _| Visibility::Visible,
             &cold(),
             provider,

@@ -19,7 +19,21 @@ logi_3dtiles_io = { path = "../logi_3dtiles_io" }
 logi_semantic = { path = "../logi_semantic" }
 # Procedural-terrain origin (lon/lat/height) → ECEF for the one-engine procedural lane.
 logi_geospatial = { path = "../logi_geospatial" }
+# ENU→UE axis map for the v15 sky anchor (earth center in render space) — geodesy single-homed in Rust.
+logi_geo_mesh = { path = "../logi_geo_mesh" }
+# LogiSky S2 (ADR-0022): the Rust-owned atmosphere model behind the v18 sky lane (frame + LUT sentences).
+logi_sky = { path = "../logi_sky" }
+glam = { workspace = true }
 # Global allocator for the logi_geo.dll Rust heap (set in lib.rs). Same contract as logi_ffi.
 mimalloc = { workspace = true }
 # SwissTable membership set reused on the per-frame baked-tile select path (ffi_baked).
 hashbrown = { workspace = true }
+
+[features]
+# Forwards the HTTP/2 CyperSource fetch lane down through the scene crate. Now ON BY DEFAULT — the live keyed
+# P3DT A/B promoted it, so the shipping `logi_geo` cdylib carries the h2 lane and `from_ion`'s Auto policy
+# selects CyperSource for Google P3DT (LogiRuntime plan §7.1). The runtime FFI `fetch_backend` knob
+# (LogiGlobeCreateInfo, ABI v11) then chooses Auto / force-ureq / force-cyper at world-create time. Build
+# `--no-default-features` for the lean ureq-only cdylib (no h2/hyper/compio stack).
+default = ["cyper-h2"]
+cyper-h2 = ["logi_3dtiles_scene/cyper-h2"]

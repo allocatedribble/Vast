@@ -213,17 +213,20 @@ public:
 			return; // upload not finished / degenerate tile
 		}
 
+		// GetViewRelevance sets bDynamicRelevance = bWireframe, so this dynamic path is reached ONLY for the
+		// wireframe view (the opaque view is served by the cached DrawStaticElements path). Bail otherwise.
 		const bool bWireframe = AllowDebugViewmodes() && ViewFamily.EngineShowFlags.Wireframe;
-		FColoredMaterialRenderProxy* WireframeMaterialInstance = nullptr;
-		if (bWireframe)
+		if (!bWireframe)
 		{
-			WireframeMaterialInstance = new FColoredMaterialRenderProxy(
-				GEngine->WireframeMaterial ? GEngine->WireframeMaterial->GetRenderProxy() : nullptr,
-				FLinearColor(0, 0.5f, 1.f));
-			Collector.RegisterOneFrameMaterialProxy(WireframeMaterialInstance);
+			return;
 		}
 
-		FMaterialRenderProxy* MaterialProxy = bWireframe ? WireframeMaterialInstance : Material->GetRenderProxy();
+		FColoredMaterialRenderProxy* WireframeMaterialInstance = new FColoredMaterialRenderProxy(
+			GEngine->WireframeMaterial ? GEngine->WireframeMaterial->GetRenderProxy() : nullptr,
+			FLinearColor(0, 0.5f, 1.f));
+		Collector.RegisterOneFrameMaterialProxy(WireframeMaterialInstance);
+
+		FMaterialRenderProxy* MaterialProxy = WireframeMaterialInstance;
 
 		for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ViewIndex++)
 		{
@@ -232,7 +235,7 @@ public:
 				FMeshBatch& Mesh = Collector.AllocateMesh();
 				FMeshBatchElement& BatchElement = Mesh.Elements[0];
 				BatchElement.IndexBuffer = &IndexBuffer;
-				Mesh.bWireframe = bWireframe;
+				Mesh.bWireframe = true;
 				Mesh.VertexFactory = &VertexFactory;
 				Mesh.MaterialRenderProxy = MaterialProxy;
 
@@ -452,7 +455,25 @@ void ULogiTileMeshComponent::SetTileGeometry(
 	FMemory::Memcpy(NewPayload->Indices.GetData(), Indices, static_cast<int64>(ICount) * sizeof(uint32));
 
 	Payload = MoveTemp(NewPayload);
-	LocalBounds = FBoxSphereBounds(FVector(BoundsCenter), FVector(BoundsRadius), BoundsRadius);
+
+	// TIGHT render bounds for frustum + occlusion culling. The Rust side supplies a bounding SPHERE
+	// (BoundsCenter + BoundsRadius); building LocalBounds as a CUBE of that radius (the old code) over-estimated a
+	// thin terrain tile's VERTICAL extent by its horizontal half-diagonal — ~10-100× — so a 5 km-wide coarse tile
+	// got a 5 km-TALL cull box that intersects the view frustum from almost anywhere and is NEVER culled. Instead
+	// scan the real per-axis AABB from the vertex positions (leading 3 floats of each 32-byte vertex), so the box
+	// hugs the actual surface and off-screen tiles drop out. Render-shell concern, owned by the host (ADR-0007);
+	// O(verts) and cache-warm right after the Memcpy (far lighter than the render-thread de-interleave). Verts are
+	// absolute world cm (SetAbsolute ⇒ LocalToWorld identity), matching how BoundsCenter was used.
+	FBox Box(ForceInit);
+	for (uint32 v = 0; v < VCount; ++v)
+	{
+		float P[3];
+		FMemory::Memcpy(P, Vertices + static_cast<uint64>(v) * Stride, sizeof(P)); // aligned copy (Rust buffer is *u8)
+		Box += FVector(P[0], P[1], P[2]);
+	}
+	LocalBounds = Box.IsValid
+		? FBoxSphereBounds(Box)
+		: FBoxSphereBounds(FVector(BoundsCenter), FVector(BoundsRadius), BoundsRadius); // empty scan ⇒ Rust sphere
 
 	// Rebuild THIS tile's proxy only (O(1) — the documented per-tile-component design). MarkRenderStateDirty
 	// recreates the scene proxy, which runs the render-thread bulk upload above. UpdateBounds first so the new
@@ -470,6 +491,76 @@ void ULogiTileMeshComponent::ClearTileGeometry()
 	Payload.Reset();
 	LocalBounds = FBoxSphereBounds(ForceInit);
 	MarkRenderStateDirty(); // drop the proxy (O(1): this tile only)
+}
+
+void ULogiTileMeshComponent::SetTileMaterial(UMaterialInterface* NewMaterial)
+{
+	// Keep the component's override slot authoritative — GetMaterial(0) and any future GENUINE proxy
+	// recreation (SetTileGeometry, engine-driven recreates) read it — WITHOUT MarkRenderStateDirty (the whole
+	// point: no proxy recreate, no geometry re-upload; audit 2026-06-10 C4c).
+	if (OverrideMaterials.Num() < 1)
+	{
+		OverrideMaterials.SetNum(1);
+	}
+	if (OverrideMaterials[0] == NewMaterial)
+	{
+		return; // already drawn with this material — nothing to swap
+	}
+	OverrideMaterials[0] = NewMaterial;
+	if (SceneProxy != nullptr)
+	{
+		// A material POINTER swap CANNOT be applied in place. The scene caches an FStaticMeshBatch from
+		// DrawStaticElements with the material's render proxy baked into the batch, and the re-cache path
+		// (RequestStaticMeshUpdate -> FPrimitiveSceneInfo::UpdateStaticMeshes, engine-source-verified 5.8)
+		// rebuilds draw commands FROM THE STORED BATCH — it never re-runs DrawStaticElements. So an in-place
+		// Proxy->Material write never reaches what is drawn: the tile keeps rendering the OLD MID forever
+		// (the 2026-06-10 stale-material regression — un-clipped stand-ins z-fighting their children, and
+		// pool-recycled MIDs later rebound to ANOTHER tile's atlas showing wrong imagery). Recreate the proxy
+		// (the pre-C4c cost; base swaps are per-clip-edge, far rarer than visibility flips). PARAMETER
+		// updates on the bound MID (atlas, FadeAlpha, clip boxes) stay in-place via the MID's own proxy, and
+		// SetTileVisible keeps its in-place path (relevance reads DrawInGame live, not from cached batches).
+		MarkRenderStateDirty();
+	}
+	// No live proxy (pooled/idle/hidden-birth component): the override alone suffices — the eventual proxy
+	// creation reads it (and a pending SetTileGeometry dirty coalesces into the same single recreate).
+}
+
+void ULogiTileMeshComponent::SetTileVisible(bool bNewVisible)
+{
+	if (GetVisibleFlag() == bNewVisible)
+	{
+		return;
+	}
+	// Component flag first (no OnVisibilityChanged -> no MarkRenderStateDirty on the in-place path): a future
+	// genuine proxy recreation reads IsVisible() into DrawInGame, so game-thread state stays authoritative.
+	SetVisibleFlag(bNewVisible);
+	if (FPrimitiveSceneProxy* Proxy = SceneProxy)
+	{
+		// LIVE proxy: flip its drawn state in place — no proxy recreate, no geometry re-upload (C4c). Route
+		// through the scene's UpdatePrimitivesIsDrawn_RenderThread (the engine's intended wrapper, the one
+		// UpdatePrimitivesDrawnInGame deprecation points at): beyond the DrawInGame/DrawInEditor flip +
+		// uniform-buffer/GPU-Scene updates, it also adds/removes the primitive from the DISTANCE FIELD scene
+		// and Lumen scene — which software Lumen (the project default) needs for hidden<->shown terrain.
+		ENQUEUE_RENDER_COMMAND(LogiTileSetVisible)(
+			[Proxy, bNewVisible](FRHICommandListImmediate&)
+			{
+				FPrimitiveSceneProxy* Proxies[1] = { Proxy };
+				Proxy->GetScene().UpdatePrimitivesIsDrawn_RenderThread(Proxies, bNewVisible);
+			});
+	}
+	else if (bNewVisible)
+	{
+		// HIDDEN-BIRTH component (the globe lane's "prepare" tiles): when the render state was created with
+		// the visible flag false, UPrimitiveComponent::CreateRenderState_Concurrent SKIPPED the scene add
+		// entirely (ShouldComponentAddToScene() requires ShouldRender() unless bCastHiddenShadow /
+		// bAffectIndirectLightingWhileHidden — engine-source-verified 5.8), so there is NO proxy to flip —
+		// the in-place path alone left every prepare tile permanently invisible (the 2026-06-10 black-planet
+		// regression). The FIRST reveal must pay the one engine-path recreate that adds the primitive to the
+		// scene (identical cost to the old SetVisibility reveal); every LATER flip on the then-live proxy
+		// takes the cheap in-place branch above.
+		MarkRenderStateDirty();
+	}
+	// (Hide with no proxy: the flag alone is correct — there is nothing in the scene to remove.)
 }
 
 FPrimitiveSceneProxy* ULogiTileMeshComponent::CreateSceneProxy()

@@ -29,9 +29,10 @@ pub struct Tileset {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Asset {
+    /// 3D Tiles spec version — validated to the `1.x` family by [`parse_tileset`] (fail-loud, ADR-0004).
+    /// (The spec's optional informational `tilesetVersion` used to be parsed alongside; it had no consumer
+    /// anywhere in the stack, so it was dropped — serde ignores the key when present.)
     pub version: String,
-    #[serde(default)]
-    pub tileset_version: Option<String>,
 }
 
 /// One node of the tile tree.
@@ -84,8 +85,8 @@ impl Tile {
     /// The memoized ECEF enclosing sphere `(center, radius)` of a `region` bounding volume — computed once
     /// (via `compute`) and cached in [`Self::bounds_memo`] for every subsequent frame (S3). `compute` is the
     /// 8-corner-on-the-ellipsoid fold the selection traversal does; it is invoked at most once per tile because
-    /// a region's sphere is transform-independent and its inputs never change. Returns `None` for a non-region
-    /// volume (the caller computes those directly — they depend on the per-frame transform). Stored as plain
+    /// a region's sphere is transform-independent and its inputs never change. Only called for region volumes
+    /// (the caller discriminates); returns the memoized region bounding sphere. Stored as plain
     /// arrays/scalars (not `glam` types) so the tileset crate keeps zero extra deps for the cache.
     #[inline]
     pub fn region_sphere_ecef(&self, compute: impl FnOnce() -> ([f64; 3], f64)) -> ([f64; 3], f64) {
@@ -127,7 +128,8 @@ pub enum Refine {
     Replace,
 }
 
-/// A tile's renderable content (glTF/GLB, or — when the URI ends in `.json` — an external tileset).
+/// A tile's renderable content (glTF/GLB, or — when the URI PATH (query/fragment stripped) has a `.json`
+/// extension — an external tileset).
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Content {
@@ -246,6 +248,17 @@ pub fn subdivide_bounds(
     let octree = matches!(scheme, SubdivisionScheme::Octree);
     match root {
         BoundingVolume::Region([west, south, east, north, min_h, max_h]) => {
+            // Antimeridian unwrap (mirrors the selector's `bounding_sphere_ecef`): a region root crossing ±π
+            // parses with east < west, which would make `lon_w` NEGATIVE and longitudinally invert every
+            // synthesized child. Unwrap east by +2π so the slices subdivide the SHORT way round; children may
+            // then carry longitudes > π, which every consumer survives (trig is periodic, and the sphere
+            // builder applies this same unwrap).
+            let (west, south, north, min_h, max_h) = (*west, *south, *north, *min_h, *max_h);
+            let east = if *east < west {
+                *east + std::f64::consts::TAU
+            } else {
+                *east
+            };
             // Longitude ← x, latitude ← y, height ← z (octree only). Each axis: pick cell i of n equal slices.
             let lon_w = (east - west) / n;
             let lat_w = (north - south) / n;
@@ -255,7 +268,7 @@ pub fn subdivide_bounds(
                 let h_w = (max_h - min_h) / n;
                 (min_h + h_w * z as f64, min_h + h_w * (z as f64 + 1.0))
             } else {
-                (*min_h, *max_h) // quadtree: height spans the full root extent
+                (min_h, max_h) // quadtree: height spans the full root extent
             };
             BoundingVolume::Region([w, s, w + lon_w, s + lat_w, mn, mx])
         }
@@ -293,9 +306,19 @@ pub fn subdivide_bounds(
     }
 }
 
-/// Parse a `tileset.json` document.
+/// Parse a `tileset.json` document, validating `asset.version` against the 3D Tiles **1.x** family this
+/// stack implements: an incompatible major version fails LOUD here (ADR-0004's no-silent-compat rule)
+/// instead of parsing leniently and streaming subtly wrong. (`extensionsRequired` gating stays the caller's
+/// job — root check in `from_tileset_with_decoder`, graft check in `graft_external`.)
 pub fn parse_tileset(json: &[u8]) -> Result<Tileset, serde_json::Error> {
-    serde_json::from_slice(json)
+    let ts: Tileset = serde_json::from_slice(json)?;
+    if !ts.asset.version.starts_with("1.") {
+        return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+            "unsupported 3D Tiles version '{}' (this stack implements the 1.x family)",
+            ts.asset.version
+        )));
+    }
+    Ok(ts)
 }
 
 #[cfg(test)]

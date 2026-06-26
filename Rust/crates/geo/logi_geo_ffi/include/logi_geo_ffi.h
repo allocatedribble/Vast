@@ -10,13 +10,32 @@
  * a field reorder/retype/insert that diverges from this header fails the Rust build. When you change a
  * struct here you MUST update those offset asserts (and bump LOGI_ABI_VERSION) to match.
  * See Docs/Architecture/ADR-0007-Actorless-Rust-Terrain.md.
- * ABI version 8 (glam-typed: f32 render-local + f64 world; globe set_view takes a LogiGlobeView struct —
+ * Current ABI version: LOGI_GEO_ABI_VERSION below — the number lives THERE (and in src/lib.rs's
+ * LOGI_ABI_VERSION) only, never in this prose, so the banner can't rot against the define. Changelog
+ * (base: glam-typed — f32 render-local + f64 world; globe set_view takes a LogiGlobeView struct —
  * camera basis + aspect — for the view frustum; LogiGlobeTile's former pad is a `flags` field, bit 0 =
  * unlit. v7: LogiGlobeTile + LogiBakedTile gain a `depth` (u32, refinement tree depth / pyramid level,
  * root = 0) and `geometric_error` (f32, metres) tail for the debug-visualisation + telemetry tools —
  * globe tile 80→88; baked tile reuses its former `_pad` for `depth` and appends `geometric_error`, 64→72.
  * v8: LogiGlobeFrame carries a per-poll DELTA (added_indices + removed_keys + counts) and a monotonic
- * frame_id for O(Δ) reconcile / unchanged-frame skip — 48→80; new entry logi_globe_world_tile_by_key).
+ * frame_id for O(Δ) reconcile / unchanged-frame skip — 48→80; new entry logi_globe_world_tile_by_key.
+ * v9: invisible LOD loading — new entry logi_globe_world_set_textured_keys (renderer reports textured tiles;
+ * selector holds the coarse parent until the fine tile is textured), LogiGlobeTile.flags bit 1 = HIDDEN
+ * (a built-but-not-shown "prepare" tile). Byte layout unchanged; the renderer MUST call set_textured_keys.
+ * v10: cache-effectiveness telemetry + the persisted decoded-geometry tier. New ADDITIVE entries
+ * logi_globe_world_flash_cache_stats / _disk_cache_stats / _geom_cache_stats (each packed (hits<<32)|misses)
+ * + _warm_cache_bytes (packed (flash_mib<<32)|geom_mib) so the host can observe hit-rates + occupancy and
+ * tune the budgets (audit L1). The geometry tier (audit M3) persists decoded TileGeometry under
+ * <cache_dir>/geom keyed by (origin, tile_key), so a cold revisit skips the Draco decode — enabled
+ * transparently when the disk cache is on (no new create-info field). Byte layout of every existing struct
+ * unchanged (new functions only); bumped to advertise the new surface.
+ * v11: LogiGlobeCreateInfo gains `fetch_backend` (u32: 0=Auto, 1=ureq, 2=CyperSource) + a `_reserved` pad
+ * (56->64) — the runtime tile-fetch backend knob (Auto = HTTP/3 QUIC for Google P3DT when built with cyper-h2).
+ * v12: geometric hole-clip. LogiGlobeTile gains a `clip_boxes` (const LogiClipBox*) + `clip_box_count` (u32) +
+ * `_pad_clip` (u32) tail (88->104), plus a new LogiClipBox POD (center + 3 half-axis vectors, render-space cm).
+ * A coarse REPLACE stand-in carries the OBBs of the finer tiles loaded over it; the renderer selects the masked
+ * clip material and discards the coarse fragments inside them — coarse + fine tile the ground with no coplanar
+ * overlap (replaces the failed Pixel Depth Offset; keeps SkyAtmosphere depth clean). Empty for almost every tile.)
  */
 #ifndef LOGI_GEO_FFI_H
 #define LOGI_GEO_FFI_H
@@ -26,12 +45,27 @@
 
 /* ABI version. Must match logi_geo_abi_version() in the loaded DLL (mirrors LOGI_ABI_VERSION
  * in Rust/crates/geo/logi_geo_ffi/src/lib.rs). Callers verify before any other call. */
-#define LOGI_GEO_ABI_VERSION 8u
+#define LOGI_GEO_ABI_VERSION 17u
 
 /* LogiGlobeTile.flags bits. Bit 0: the tile's material is unlit (glTF KHR_materials_unlit) — render it
  * emissive (it bakes its own lighting; Google P3DT bakes real-world sun/shadow into the albedo) rather than
  * applying scene lighting on top. Other bits reserved (0). Mirrors LOGI_GLOBE_TILE_FLAG_UNLIT in src/ffi.rs. */
 #define LOGI_GLOBE_TILE_FLAG_UNLIT 1u
+
+/* LogiGlobeTile.flags bit 1: a "prepare" tile — geometry-resident but NOT yet textured. The renderer must BUILD
+ * it (to decode its atlas) but keep it HIDDEN: the selector is still drawing the coarse parent over its footprint,
+ * and showing the untextured tile would flash gray. When the renderer textures it and reports it via
+ * logi_globe_world_set_textured_keys, the gate promotes it (next poll this bit clears and it shows). Mirrors
+ * LOGI_GLOBE_TILE_FLAG_HIDDEN in src/ffi.rs. */
+#define LOGI_GLOBE_TILE_FLAG_HIDDEN 2u
+
+/* LogiGlobeCreateInfo.fetch_backend values (ABI v11). Auto picks the CyperSource lane (HTTP/3 over QUIC via
+ * Alt-Svc, HTTP/2 fallback) for Google P3DT when the DLL was built with the cyper-h2 feature (the default),
+ * and the ureq HttpSource pool (HTTP/1.1) otherwise; Ureq / Cyper force a backend (the live ureq-vs-h3 A/B).
+ * A zero-initialised create-info gets Auto. */
+#define LOGI_GLOBE_FETCH_BACKEND_AUTO  0u
+#define LOGI_GLOBE_FETCH_BACKEND_UREQ  1u
+#define LOGI_GLOBE_FETCH_BACKEND_CYPER 2u
 
 #ifdef __cplusplus
 extern "C" {
@@ -101,10 +135,21 @@ typedef struct LogiGlobeCreateInfo {
     double   origin_latitude_deg;
     double   origin_height_m;
     double   max_tile_distance_m;    /* spatial cull radius (metres) around the camera */
-    uint32_t workers;                /* fetch threads (clamped 1..64) */
-    uint32_t mesh_cache_budget_mb;   /* in-memory decoded-tile (mesh+texture) warm cache budget (MiB); 0 = default */
+    uint32_t workers;                /* fetch threads (clamped 1..64); sizes only the ureq HttpSource pool */
+    uint32_t flash_cache_budget_mb;  /* in-memory decoded-tile (mesh+texture) warm "flash" cache budget (MiB); 0 = default */
     uint64_t cache_budget_bytes;     /* persistent disk-cache budget (bytes); 0 disables (dir = cache_dir arg) */
+    uint32_t fetch_backend;          /* LOGI_GLOBE_FETCH_BACKEND_* (v11): 0=Auto, 1=ureq, 2=CyperSource (HTTP/3) */
+    uint32_t _reserved;              /* alignment pad / future knob; set 0 */
 } LogiGlobeCreateInfo;
+
+/* One hole-clip oriented bounding box (UE render space, cm): center + three half-extent axis vectors. The
+ * renderer discards a coarse stand-in tile's fragments inside any of its boxes, so the coarse mesh never
+ * overlaps the finer tiles drawn over it (no z-fight, no Pixel Depth Offset). 48 bytes, align 4. Mirrors
+ * LogiClipBox in src/ffi.rs. */
+typedef struct LogiClipBox {
+    float center[3];
+    float half_axes[3][3];
+} LogiClipBox;
 
 typedef struct LogiGlobeTile {
     uint64_t       tile_key;          /* stable hash of the tile path — key for C++ section caching */
@@ -114,13 +159,16 @@ typedef struct LogiGlobeTile {
     uint32_t       vertex_stride;     /* = 32 */
     const uint8_t* indices;           /* index_count little-endian uint32 indices */
     uint32_t       index_count;
-    uint32_t       flags;             /* bit 0 = LOGI_GLOBE_TILE_FLAG_UNLIT (KHR_materials_unlit); else 0 */
+    uint32_t       flags;             /* bit 0 = UNLIT (KHR_materials_unlit); bit 1 = HIDDEN ("prepare" tile) */
     const uint8_t* texture_jpeg;      /* raw encoded image bytes (JPEG/PNG), decode C++-side; may be empty */
     uint64_t       texture_jpeg_len;
     float          bounds_center[3];  /* UE render space (cm) */
     float          bounds_radius;
     uint32_t       depth;             /* refinement tree depth (root = 0; higher = more refined) — debug-viz/telemetry */
     float          geometric_error;   /* 3D Tiles geometric error (metres; lower = finer) — debug-viz/telemetry */
+    const LogiClipBox* clip_boxes;    /* v12 hole-clip: clip_box_count OBBs, valid until next poll(); NULL/0 if none */
+    uint32_t       clip_box_count;    /* >0 only for a coarse stand-in over loaded finer tiles (masked clip material) */
+    uint32_t       _pad_clip;         /* alignment pad to 8 (the clip_boxes pointer); always 0 */
 } LogiGlobeTile;
 
 typedef struct LogiGlobeFrame {
@@ -139,7 +187,11 @@ typedef struct LogiGlobeFrame {
 
 /* Blocking (ion resolve + root fetch); call off the render thread. Returns NULL on failure. `cache_dir`
  * (UTF-8 path, or NULL/empty) + info.cache_budget_bytes enable the persistent on-disk tile cache. The
- * returned world advances on its own Rust stream thread — drive it with set_view + poll (below). */
+ * returned world advances on its own Rust stream thread — drive it with set_view + poll (below).
+ * Multi-instance: every world is fully per-handle (own stream thread, caches, fetch pool; the process-wide
+ * statics are stateless/thread-local — multi-globe probe 2026-06-09). The ONE shared resource is a common
+ * `cache_dir`: two worlds over the same dir stay CORRECT (CRC-named files; worst case one re-fetch when
+ * budget trims race) but fight each other's byte budget — give concurrent worlds distinct dirs. */
 LogiGlobeWorld* logi_globe_world_create(const LogiGlobeCreateInfo* info, const char* ion_token, const char* cache_dir);
 
 /* The camera view pushed each frame (UE space). forward(dir) + up + aspect + fov build the view frustum for
@@ -161,21 +213,73 @@ typedef struct LogiGlobeView {
  * to out_frame (non-blocking — an empty frame before the first one); the frame's tile buffers are zero-copy
  * views into Rust-owned geometry, valid until the next poll() on this world. */
 LogiStatus      logi_globe_world_set_view(LogiGlobeWorld* world, const LogiGlobeView* view);
+/* Report the COMPLETE set of tile_keys the renderer has fully TEXTURED (newest-wins; pass the whole set each
+ * time it changes). The selector treats a tile as renderable — eligible to replace its coarse parent — only when
+ * it is geometry-resident AND in this set, so the coarse parent stays drawn until the fine tile is textured: LOD
+ * loading shows no gray placeholder. The renderer MUST call this (never calling leaves the gate empty → nothing
+ * promotes → nothing renders). keys may be NULL/0 (empty set). Single-consumer (game thread), like set_view. */
+LogiStatus      logi_globe_world_set_textured_keys(LogiGlobeWorld* world, const uint64_t* keys, uint32_t count);
 LogiStatus      logi_globe_world_poll(LogiGlobeWorld* world, LogiGlobeFrame* out_frame);
 /* Look up one tile in the CURRENT polled frame by tile_key (zero-copy view into out_tile, valid until the next
  * poll()). Ok if present; InvalidHandle for a null world or a key not in the current frame; NullArg if out_tile is
  * NULL. Lets the renderer re-drive a specific tile's atlas decode without re-scanning the frame (the delta path
  * never visits resident tiles). Single-consumer (game thread), like set_view/poll. */
 LogiStatus      logi_globe_world_tile_by_key(LogiGlobeWorld* world, uint64_t tile_key, LogiGlobeTile* out_tile);
-uint64_t        logi_globe_world_cached_bytes(const LogiGlobeWorld* world); /* disk-cache resident bytes (telemetry) */
-/* Tiles that gave up loading, packed (decode_failed << 32) | fetch_failed. fetch_failed = bytes never
- * arrived (network/dead URL/expired session); decode_failed = bytes arrived but didn't parse (unsupported
- * format e.g. Draco/KTX2, or corrupt). Tells WHY a stuck tile shows its coarse/blurry ancestor (telemetry). */
-uint64_t        logi_globe_world_failed_counts(const LogiGlobeWorld* world);
-/* Tiles stuck coarse because refinement couldn't DESCEND, packed (graft_failed << 32) | url_resolve_failed.
- * graft_failed = a child tileset.json manifest fetched but didn't parse/graft (subtree never appears);
- * url_resolve_failed = a content URI couldn't be resolved. Both were silent — the patchy-stuck-blur cause. */
-uint64_t        logi_globe_world_refine_failures(const LogiGlobeWorld* world);
+/* The UNIFIED streaming telemetry block (v16; reshaped at v17 to the TWO-cache model) — REPLACES the
+ * v10–v15 per-counter accessors (_cached_bytes, _failed_counts, _refine_failures,
+ * _flash/_disk/_geom_cache_stats, _pool_stats, _evict_stats, _hold_stats, _warm_cache_bytes; all REMOVED).
+ * Every field is uint64_t (offset = index * 8, total size 208) and mirrors Rust's LogiGlobeTelemetry
+ * field-for-field; the Rust build locks every offset.
+ * THE TWO CACHES (v17): flash = the in-memory cell (decoded-geometry LRU, fed by every dropped resident
+ * mesh); disk = ONE cell with two internal tiers (raw fetched bytes + persisted decoded geometry) under
+ * one total budget — disk_hits counts ANY tier serving (a geometry restore that skipped fetch+decode, or
+ * cached bytes that skipped the network), disk_misses counts requests that needed the network,
+ * disk_bytes is both tiers' occupancy.
+ * Diagnostics guide: pool_exhausted_total climbing while evicted_total stays flat at a full pool = the
+ * eviction-dead starvation stall (2026-06-11). A stuck-coarse SCAR = hold_leaf_under_sse /
+ * fetch_skip_grafted sustained while the pipeline is quiescent (hold_kick / hold_loading are normal
+ * convergence and fall to zero at settle). Climbing step_panics = a deterministically-bad tile/input
+ * (the stream lane catches per-step panics and keeps running). */
+typedef struct LogiGlobeTelemetry {
+    uint64_t resident_tiles;           /* resident decoded tiles after the last step */
+    uint64_t in_flight;                /* outstanding/undrained tile fetches */
+    uint64_t produced_frames;          /* frames published into the stream mailbox */
+    uint64_t step_panics;              /* caught stream-step panics (v16; lane keeps running) */
+    uint64_t free_slots;               /* pool slots free now (0 = admissions silently dropped) */
+    uint64_t max_resident;             /* the LRU evict target the pool is sized above */
+    uint64_t evicted_total;            /* cumulative Resident->Free LRU reclaims */
+    uint64_t pool_exhausted_total;     /* cumulative admissions dropped for want of a slot */
+    uint64_t decode_failed_total;      /* bytes arrived but didn't parse (terminal give-up) */
+    uint64_t fetch_failed_total;       /* bytes never arrived after retries (dead URL/network/session) */
+    uint64_t graft_failed_total;       /* child tileset fetched but never grafted (region stuck coarse) */
+    uint64_t url_resolve_failed_total; /* content URI never resolved (never even fetched) */
+    uint64_t fetches_cancelled_total;  /* in-flight fetches cancelled as stale (v16; fast camera) */
+    uint64_t session_refreshes_total;  /* P3DT root re-fetches for a fresh ?session= (v16) */
+    uint64_t flash_hits;               /* the MEMORY cache: hits / misses / occupancy bytes */
+    uint64_t flash_misses;
+    uint64_t flash_bytes;
+    uint64_t disk_hits;                /* the DISK cache (both tiers): hits / misses / occupancy bytes */
+    uint64_t disk_misses;
+    uint64_t disk_bytes;
+    uint64_t hold_kick;                /* the selection X-ray: last full step's hold-reason snapshot */
+    uint64_t hold_dead;
+    uint64_t hold_loading;
+    uint64_t hold_leaf_under_sse;
+    uint64_t hold_pending_subtree;
+    uint64_t fetch_skip_grafted;
+} LogiGlobeTelemetry;
+
+/* Fill `out` with the WHOLE telemetry block (v17) — one call per HUD/bench sample. Returns
+ * sizeof(LogiGlobeTelemetry) (208) on success, 0 for a null world/out; check the return equals your own
+ * sizeof as a layout handshake. */
+size_t          logi_globe_world_telemetry(const LogiGlobeWorld* world, LogiGlobeTelemetry* out);
+/* The planet-true sky anchor (ABI v15): fills `out` with up to `len` of [earth_center_x_cm,
+ * earth_center_y_cm, earth_center_z_cm, geocentric_radius_km] — the WGS84 earth center in UE render space
+ * under this world's ENU origin + the origin's geocentric surface radius; returns the count written (4).
+ * Anchor the SkyAtmosphere with these (PlanetCenterAtComponentTransform at the center, BottomRadius = the
+ * radius; VolumetricCloud follows the atmosphere's planet) so sky/cloud shells track the streamed WGS84
+ * globe instead of a fixed-radius sphere pinned at the UE world origin. Constant per world. */
+size_t          logi_globe_world_sky_anchor(const LogiGlobeWorld* world, double* out, size_t len);
 void            logi_globe_world_destroy(LogiGlobeWorld* world);
 
 /* --- Baked semantic-tile world (ADR-0011, Milestone HE-0) — additive; see src/ffi_baked.rs. Opens an

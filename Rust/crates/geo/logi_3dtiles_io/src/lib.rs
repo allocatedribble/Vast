@@ -3,19 +3,36 @@
 //! kernel's existing `Provider`. The selection traversal decides *which* tiles to load; a
 //! [`TileContentSource`] fetches their content bytes and hands them back when ready.
 //!
-//! Two sources implement the same trait: the deterministic [`SyntheticSource`] (latency + payload derived
-//! from the request id — reproducible, no network, the test/offline lane) and the production [`HttpSource`]
-//! (HTTP via `ureq` + gzip + an on-disk cache, fetched on a worker pool and drained here).
+//! Three sources implement the same trait: the deterministic [`SyntheticSource`] (latency + payload derived
+//! from the request id — reproducible, no network, the test/offline lane); the blocking [`HttpSource`] (HTTP
+//! via `ureq` + gzip + an on-disk cache, fetched on a worker pool and drained here); and — under the
+//! default `cyper-h2` feature (legacy name) — the **HTTP/3-over-QUIC** `CyperSource` (compio-quic =
+//! quinn-proto on the compio reactor, upgraded via Alt-Svc; h2 over compio-net + rustls as bootstrap +
+//! fallback, all on one owned thread). The scene's `from_ion` picks `CyperSource` for Google P3DT by
+//! default; the runtime FFI `fetch_backend` knob can force either at world-create time.
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+// The HTTP/3 tile-fetch backend (feature `cyper-h2` — the legacy feature name predates the h3 upgrade — ON
+// BY DEFAULT): a vendored `cyper::Client` on one dedicated owned thread, HTTP/3 over QUIC via Alt-Svc
+// auto-upgrade with h2-over-compio-net+rustls bootstrap/fallback. Adopted on STRUCTURAL grounds (connection
+// economy at the capped worker count, 1-RTT QUIC connect, keep-alive idle survival): the live keyed-P3DT A/B
+// (`tests/cyper_p3dt_bench.rs`) measures ~parity with `ureq` on warm real-body bursts — the h2/h3 win is the
+// handshake/RTT collapse, not bandwidth. Build `--no-default-features` for the lean ureq-only cdylib (no
+// QUIC/h2 stack). See `cyper_source.rs` for the design.
+#[cfg(feature = "cyper-h2")]
+mod cyper_source;
+#[cfg(feature = "cyper-h2")]
+pub use cyper_source::CyperSource;
+
+use std::collections::{BTreeMap, BinaryHeap};
 
 use hashbrown::{HashMap, HashSet};
+use std::cell::RefCell;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -36,16 +53,21 @@ pub type RequestId = u64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Loaded {
     pub id: RequestId,
-    /// `Ok(bytes)` — the content, already gzip-inflated by the source; an empty `Vec` is a valid empty-200.
+    /// `Ok(bytes)` — the content as a shared `Arc<[u8]>` (already gzip-inflated by the source; an empty slice
+    /// is a valid empty-200). The source hands back an `Arc` so the owner can park it on the entity
+    /// (`FetchedBytes`) with a cheap clone/move — the one alloc+copy happens **on the worker**, not on the
+    /// serial owner thread that drains results (audit L4).
     /// `Err(e)` — a classified failure the owner can act on without guessing.
-    pub result: Result<Vec<u8>, FetchError>,
+    pub result: Result<Arc<[u8]>, FetchError>,
 }
 
 /// An async tile-content source driven on the owner thread: `request` enqueues, `poll_completed` drains
 /// finished fetches, `cancel` drops one. Implementations do the actual IO/decoding off-thread; nothing
-/// here blocks the kernel. `now_tick` is the kernel's monotonic step counter.
+/// here blocks the kernel. `now_tick` is the kernel's monotonic step counter. `priority` (higher = more
+/// urgent — the selector's `fetch_priority`) lets a worker pool SERVICE the most render-critical pending tile
+/// first instead of FIFO (audit H1); sources without a worker pool may ignore it.
 pub trait TileContentSource {
-    fn request(&mut self, id: RequestId, url: &str, now_tick: u64);
+    fn request(&mut self, id: RequestId, url: &str, priority: f64, now_tick: u64);
     fn poll_completed(&mut self, now_tick: u64, out: &mut Vec<Loaded>);
     fn cancel(&mut self, id: RequestId);
     fn in_flight(&self) -> usize;
@@ -53,6 +75,21 @@ pub trait TileContentSource {
     /// sources without a cache (e.g. the synthetic test source).
     fn cached_bytes(&self) -> u64 {
         0
+    }
+    /// Cumulative hits / misses of a persistent cache behind this source (telemetry; audit L1 — un-blinds
+    /// disk-cache hit-rate so the budget can be tuned). Default `0` for cacheless sources.
+    fn cache_hits(&self) -> u64 {
+        0
+    }
+    fn cache_misses(&self) -> u64 {
+        0
+    }
+    /// The source's fetch CONCURRENCY — how many requests it can service simultaneously (its worker count). The
+    /// owner sizes its outstanding-fetch cap as a small multiple of this (audit H2), so the cap tracks the one
+    /// knob that actually governs download parallelism instead of a magic constant. Default `32` for sources
+    /// without a worker pool (the synthetic/test lane), preserving the prior 128 cap at `IN_FLIGHT_PER_WORKER=4`.
+    fn fetch_concurrency(&self) -> usize {
+        32
     }
 }
 
@@ -111,7 +148,7 @@ pub fn synthetic_payload(id: RequestId, len: usize) -> Vec<u8> {
 }
 
 impl TileContentSource for SyntheticSource {
-    fn request(&mut self, id: RequestId, _url: &str, now_tick: u64) {
+    fn request(&mut self, id: RequestId, _url: &str, _priority: f64, now_tick: u64) {
         let ready = now_tick.saturating_add(self.latency_for(id));
         let len = self.bytes_for(id);
         self.pending.insert(id, (ready, len));
@@ -134,7 +171,7 @@ impl TileContentSource for SyntheticSource {
             // payload is `Ok`, not bare bytes, so it shares the typed channel with the HTTP source).
             out.push(Loaded {
                 id,
-                result: Ok(synthetic_payload(id, len)),
+                result: Ok(synthetic_payload(id, len).into()),
             });
         }
     }
@@ -269,6 +306,13 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(30); // per read / per write
 const HTTP_OVERALL_TIMEOUT: Duration = Duration::from_secs(60); // whole call, incl. body transfer
 
+/// Idle keep-alive connection pool sizes for the shared ureq agent. `PER_HOST` MUST be ≥ the max fetch-worker
+/// count (the FFI clamps workers to 64) so every worker reuses a warm connection to the one P3DT host instead
+/// of re-paying a TLS handshake per request — the #1 throughput bug (8 threads → ~8 MB/s of re-handshaking).
+/// Keep `PER_HOST` in lockstep with `logi_geo_ffi`'s `MAX_FETCH_WORKERS`.
+const HTTP_MAX_IDLE_CONNECTIONS: usize = 256;
+const HTTP_MAX_IDLE_PER_HOST: usize = 64;
+
 /// Process-wide shared [`ureq::Agent`] with bounded connect/read/write/overall timeouts, reused by every
 /// fetch (this crate's [`http_get`] and the ion resolver) so requests share a connection pool and no
 /// request can block indefinitely (audit H9). Built once on first use.
@@ -284,11 +328,12 @@ pub fn http_agent() -> &'static ureq::Agent {
             // (≈1 per host), so with N workers all hammering ONE host (P3DT's `tile.googleapis.com`) only one
             // connection is reused — the other N-1 close after each request and re-pay a TLS handshake
             // (~1-2 RTT) on the next one, throttling throughput to the *handshake* rate, not the link rate.
-            // Sizing the per-host idle pool above the worker cap (32) lets every worker keep reusing a warm
-            // keep-alive connection, so the pool streams at the link's real bandwidth (audit: the #1 reason
-            // 8 fetch threads only managed ~8 MB/s — they were re-handshaking, not downloading).
-            .max_idle_connections(256)
-            .max_idle_connections_per_host(64)
+            // Sizing the per-host idle pool AT the worker cap (`HTTP_MAX_IDLE_PER_HOST` = 64 = the FFI's
+            // `MAX_FETCH_WORKERS` clamp) lets every worker keep reusing a warm keep-alive connection, so the
+            // pool streams at the link's real bandwidth (audit: the #1 reason 8 fetch threads only managed
+            // ~8 MB/s — they were re-handshaking, not downloading).
+            .max_idle_connections(HTTP_MAX_IDLE_CONNECTIONS)
+            .max_idle_connections_per_host(HTTP_MAX_IDLE_PER_HOST)
             .build()
     })
 }
@@ -297,29 +342,51 @@ pub fn http_agent() -> &'static ureq::Agent {
 /// params (e.g. `?key=…` / `?access_token=…`) that the child URI doesn't already carry. Handles absolute,
 /// host-relative (`/v1/…`), and path-relative content URIs.
 pub fn resolve_url(base: &str, content_uri: &str) -> Result<String, FetchError> {
-    let base_url = url::Url::parse(base).map_err(|e| FetchError::Url(e.to_string()))?;
-    let mut joined = base_url.join(content_uri).map_err(|e| FetchError::Url(e.to_string()))?;
-    // SECURITY: only carry the base's auth query params (`access_token` / `key` / `session`) when the
-    // resolved URL stays on the SAME ORIGIN as the base. A tileset's `content.uri` is attacker-influenced
-    // (streamed from a remote, and external tilesets are grafted recursively), and `Url::join` with an
-    // absolute URI replaces the host — carrying the token cross-origin would exfiltrate the user's Cesium
-    // ion / Google credentials to an arbitrary host. Relative / same-host URIs keep the same origin and so
-    // are unaffected.
-    if joined.origin() == base_url.origin() {
-        let have: HashSet<String> = joined.query_pairs().map(|(k, _)| k.into_owned()).collect();
-        let carry: Vec<(String, String)> = base_url
-            .query_pairs()
-            .into_owned()
-            .filter(|(k, _)| !have.contains(k))
-            .collect();
-        if !carry.is_empty() {
-            let mut q = joined.query_pairs_mut();
-            for (k, v) in &carry {
-                q.append_pair(k, v);
+    // Owner-thread parsed-base memo (audit resolve_url-memo): a single selection step resolves hundreds of
+    // tiles against only a HANDFUL of distinct bases (the root + a few grafted subtrees), yet the base was
+    // re-parsed on every call. Cache the parse per distinct base → one `Url::parse` per base per thread, not
+    // one per tile (the join + same-origin auth-carry are genuinely per-`content_uri`, so they stay). This is
+    // owner-thread-only — workers fetch already-resolved URLs — so a thread-local is lock-free + sufficient;
+    // a self-healing `clear` past the cap bounds it (a still-live base just re-parses + re-inserts).
+    const MAX_RESOLVE_BASE_CACHE: usize = 256;
+    thread_local! {
+        static RESOLVE_BASE_CACHE: RefCell<HashMap<String, url::Url>> = RefCell::new(HashMap::new());
+    }
+    RESOLVE_BASE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(base) {
+            // Parse the base ONCE per distinct base (the memoized work). A parse error is returned WITHOUT
+            // caching, so a transient/garbage base can never poison the memo.
+            let parsed = url::Url::parse(base).map_err(|e| FetchError::Url(e.to_string()))?;
+            if cache.len() >= MAX_RESOLVE_BASE_CACHE {
+                cache.clear();
+            }
+            cache.insert(base.to_string(), parsed);
+        }
+        let base_url = cache.get(base).expect("base parsed + inserted directly above");
+        let mut joined = base_url.join(content_uri).map_err(|e| FetchError::Url(e.to_string()))?;
+        // SECURITY: only carry the base's auth query params (`access_token` / `key` / `session`) when the
+        // resolved URL stays on the SAME ORIGIN as the base. A tileset's `content.uri` is attacker-influenced
+        // (streamed from a remote, and external tilesets are grafted recursively), and `Url::join` with an
+        // absolute URI replaces the host — carrying the token cross-origin would exfiltrate the user's Cesium
+        // ion / Google credentials to an arbitrary host. Relative / same-host URIs keep the same origin and so
+        // are unaffected.
+        if joined.origin() == base_url.origin() {
+            let have: HashSet<String> = joined.query_pairs().map(|(k, _)| k.into_owned()).collect();
+            let carry: Vec<(String, String)> = base_url
+                .query_pairs()
+                .into_owned()
+                .filter(|(k, _)| !have.contains(k))
+                .collect();
+            if !carry.is_empty() {
+                let mut q = joined.query_pairs_mut();
+                for (k, v) in &carry {
+                    q.append_pair(k, v);
+                }
             }
         }
-    }
-    Ok(joined.to_string())
+        Ok(joined.to_string())
+    })
 }
 
 /// How many bytes the cancel-aware reader pulls per loop iteration. The cancel flag is probed **once per
@@ -419,14 +486,17 @@ fn fetch_one(cache: Option<&DiskCache>, url: &str, cancel: &AtomicBool) -> Resul
         return Err(FetchError::Cancelled);
     }
     if let Some(c) = cache {
-        // A cache hit costs no bandwidth, so cancellation doesn't matter for it; serve it. (A result the
-        // owner has since cancelled is harmlessly dropped on `poll_completed` via the in-flight backstop.)
-        if let Some(bytes) = c.get(url) {
+        // Hash the URL path to the cache key ONCE (audit L6), then use the key-based get/put — `get(url)` +
+        // `put(url, …)` would each re-hash the same ~150-byte URL across the intervening download (LLVM can't
+        // CSE across it). A cache hit costs no bandwidth, so cancellation doesn't matter for it; serve it. (A
+        // result the owner has since cancelled is harmlessly dropped on `poll_completed` via the in-flight backstop.)
+        let key = cache_key(url);
+        if let Some(bytes) = c.get_raw(key) {
             return Ok(bytes);
         }
         let bytes = http_get_cancellable(url, cancel)?;
         if !bytes.is_empty() {
-            c.put(url, &bytes);
+            c.put_raw(key, &bytes);
         }
         Ok(bytes)
     } else {
@@ -440,7 +510,9 @@ fn fetch_one(cache: Option<&DiskCache>, url: &str, cancel: &AtomicBool) -> Resul
 // doesn't fragment the cache and the same tile replays across sessions. The key is 128-bit (not 64) so a
 // hash collision — which would silently serve one tile's bytes for another URL — is astronomically
 // unlikely across any realistic cache size (audit M16). Survives restarts (the files ARE the cache; the
-// index is rebuilt by scanning the dir).
+// index is rebuilt by scanning the dir). Each entry's bytes carry a CRC-32 baked into its filename
+// (`<key>.<crc>.bin`) and verified on read, so bit-rot / truncation / a partial write surfaces as a clean
+// miss + re-fetch rather than a silently-served corrupt tile (audit M1).
 //
 // LRU recency after a restart: the rebuilt order is the directory-scan order, NOT true last-use order —
 // filesystem mtime is non-monotonic (clock skew, copies, `noatime`) and was deliberately dropped as an
@@ -452,6 +524,7 @@ fn fetch_one(cache: Option<&DiskCache>, url: &str, cancel: &AtomicBool) -> Resul
 struct CacheEntry {
     size: u64,
     used: u64, // monotonic recency tick
+    crc: u32,  // CRC-32 of the stored bytes — baked into the filename, verified on every read (audit M1)
 }
 
 struct CacheIndex {
@@ -471,28 +544,38 @@ impl CacheIndex {
             self.lru.insert(t, key);
         }
     }
-    fn insert(&mut self, key: u128, size: u64) {
+    /// Insert/replace an entry, returning the previous entry's CRC **iff** it differs from the new one — i.e.
+    /// the old content lived in a different `<key>.<crc>.bin` file the caller must now unlink (a re-`put` of
+    /// CHANGED bytes for the same key; rare, since tile content is path-immutable, but bullet-proofed so the
+    /// crc-in-filename scheme can never strand the superseded file). A same-content re-`put` overwrites the
+    /// identical path in place → `None`.
+    fn insert(&mut self, key: u128, size: u64, crc: u32) -> Option<u32> {
         self.tick += 1;
         let t = self.tick;
-        if let Some(old) = self.entries.insert(key, CacheEntry { size, used: t }) {
-            self.lru.remove(&old.used);
-            self.total = self.total.saturating_sub(old.size);
-        }
+        let stale = self
+            .entries
+            .insert(key, CacheEntry { size, used: t, crc })
+            .and_then(|old| {
+                self.lru.remove(&old.used);
+                self.total = self.total.saturating_sub(old.size);
+                (old.crc != crc).then_some(old.crc)
+            });
         self.lru.insert(t, key);
         self.total = self.total.saturating_add(size);
+        stale
     }
-    /// Evict the coldest entries from the in-memory index until back within `budget`, returning the keys whose
-    /// files must be unlinked. **Does no filesystem I/O** — the caller unlinks AFTER dropping the index lock
+    /// Evict the coldest entries from the in-memory index until back within `budget`, returning the
+    /// `(key, crc)` pairs whose files must be unlinked. **Does no filesystem I/O** — the caller unlinks AFTER dropping the index lock
     /// (H5), so a slow `remove_file` (network FS / Windows) can't serialize every other worker's `get`/`put`
     /// behind it. The just-inserted key has the highest tick, so `pop_first` (oldest) never evicts it unless
     /// it is the sole entry (budget < one tile — degenerate); LRU recency is preserved.
-    fn evict_to(&mut self, budget: u64) -> Vec<u128> {
+    fn evict_to(&mut self, budget: u64) -> Vec<(u128, u32)> {
         let mut to_unlink = Vec::new();
         while self.total > budget {
             let Some((_, key)) = self.lru.pop_first() else { break };
             if let Some(e) = self.entries.remove(&key) {
                 self.total = self.total.saturating_sub(e.size);
-                to_unlink.push(key);
+                to_unlink.push((key, e.crc));
             }
         }
         to_unlink
@@ -514,10 +597,34 @@ fn cache_key(url: &str) -> u128 {
     h
 }
 
-/// `<dir>/<first-2-hex>/<32-hex>.bin` — sharded so a 100k-file cache doesn't put everything in one dir.
-fn cache_path(dir: &Path, key: u128) -> PathBuf {
+/// `<dir>/<first-2-hex>/<32-hex-key>.<8-hex-crc>.bin` — sharded so a 100k-file cache doesn't put everything in
+/// one dir, and the CRC-32 of the stored bytes is baked into the name so `open` recovers it by a pure filename
+/// scan (no per-file read) and `get` can verify the bytes against it (audit M1).
+fn cache_path(dir: &Path, key: u128, crc: u32) -> PathBuf {
     let name = format!("{key:032x}");
-    dir.join(&name[..2]).join(format!("{name}.bin"))
+    dir.join(&name[..2]).join(format!("{name}.{crc:08x}.bin"))
+}
+
+/// Parse a cache filename stem `<32-hex-key>.<8-hex-crc>` back into `(key, crc)`. Returns `None` for any stem
+/// that isn't exactly that shape — a stale pre-integrity `<key>` (no embedded CRC) or foreign junk — which
+/// `open` then unlinks (audit M2 / no-compat reclaim). `.tmpN` files never reach here: `open` filters on the
+/// `.bin` extension first, and a half-written temp's extension is `tmpN`.
+fn parse_cache_stem(stem: &str) -> Option<(u128, u32)> {
+    let (k, c) = stem.split_once('.')?;
+    if k.len() != 32 || c.len() != 8 {
+        return None;
+    }
+    Some((u128::from_str_radix(k, 16).ok()?, u32::from_str_radix(c, 16).ok()?))
+}
+
+/// `true` if `p`'s final component is exactly two lowercase-hex chars — a cache shard dir (the shape
+/// [`cache_path`] makes via `&name[..2]`). `open`'s destructive reclaim descends ONLY into shard dirs, so a
+/// FOREIGN nested dir sharing this root (e.g. the M3 geometry tier at `<dir>/geom`) is skipped, never scanned
+/// into and `remove_file`-swept (audit recheck L-3).
+fn is_shard_dir(p: &Path) -> bool {
+    p.file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.len() == 2 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }
 
 /// A persistent, byte-budgeted, LRU on-disk cache of fetched tile bytes. Cheap clones (it's `Arc`-shared
@@ -526,42 +633,57 @@ pub struct DiskCache {
     dir: PathBuf,
     budget: u64,
     idx: Mutex<CacheIndex>,
+    hits: AtomicU64,   // cumulative get_raw hits (audit L1 — un-blinds hit-rate / budget tuning)
+    misses: AtomicU64, // cumulative get_raw misses
 }
 
 impl DiskCache {
     /// Open (creating) a cache at `dir` bounded to `budget_bytes`. Rebuilds its index by scanning the
-    /// existing files. Recency order is the scan order, not mtime: filesystem mtime is non-monotonic and is
+    /// existing files (reclaiming orphaned `.tmpN` temp files + stale pre-integrity entries — audit M2).
+    /// Recency order is the scan order, not mtime: filesystem mtime is non-monotonic and is
     /// deliberately NOT used as an LRU signal (audit M16) — live `touch`/`insert` re-establish real recency
     /// the moment the cache is used, so the only effect is a slightly-arbitrary first cold-start eviction.
     pub fn open(dir: impl Into<PathBuf>, budget_bytes: u64) -> std::io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
-        let mut found: Vec<(u128, u64)> = Vec::new();
+        let mut found: Vec<(u128, u64, u32)> = Vec::new();
         for shard in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            if !shard.path().is_dir() {
+            // Descend ONLY into well-formed 2-hex shard dirs, so the destructive reclaim below can never wander
+            // into a foreign nested cache sharing this root (e.g. the M3 geometry tier at `<dir>/geom`) — recheck L-3.
+            if !shard.path().is_dir() || !is_shard_dir(&shard.path()) {
                 continue;
             }
             for f in std::fs::read_dir(shard.path()).into_iter().flatten().flatten() {
                 let p = f.path();
-                if p.extension().and_then(|e| e.to_str()) != Some("bin") {
+                // Reclaim anything that is NOT a well-formed `<32-hex-key>.<8-hex-crc>.bin`: an orphaned `.tmpN`
+                // from a write killed mid-rename (audit M2 — otherwise never scanned, never budgeted, leaked
+                // forever), a stale pre-integrity `<key>.bin` (no-compat — re-fetched on demand), or foreign junk.
+                // Safe to unlink only HERE: `open` is the constructor, run BEFORE any worker / `put` exists (the
+                // `Arc<DiskCache>` reaches `HttpSource` only after this returns), so there is provably no
+                // concurrent writer and no live reader holding any of these files.
+                let parsed = (p.extension().and_then(|e| e.to_str()) == Some("bin"))
+                    .then(|| p.file_stem().and_then(|s| s.to_str()).and_then(parse_cache_stem))
+                    .flatten();
+                let Some((key, crc)) = parsed else {
+                    let _ = std::fs::remove_file(&p); // unparseable name / orphan .tmpN → reclaim (M2)
                     continue;
-                }
-                let key = p
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| u128::from_str_radix(s, 16).ok());
-                let Some(key) = key else { continue };
-                let Ok(md) = f.metadata() else { continue };
-                found.push((key, md.len()));
+                };
+                let Ok(md) = f.metadata() else {
+                    // Well-formed NAME but a transient metadata() error (AV/indexer lock, permission race): SKIP,
+                    // don't unlink — it's a valid cached tile that reads fine next open, and M1's CRC-on-read
+                    // catches genuine corruption harmlessly. Unlinking it was an over-applied M2 reclaim (recheck L-4).
+                    continue;
+                };
+                found.push((key, md.len(), crc));
             }
         }
         let mut entries = HashMap::new();
         let mut lru = BTreeMap::new();
         let mut total = 0u64;
         let mut tick = 0u64;
-        for (key, size) in found {
+        for (key, size, crc) in found {
             tick += 1;
-            entries.insert(key, CacheEntry { size, used: tick });
+            entries.insert(key, CacheEntry { size, used: tick, crc });
             lru.insert(tick, key);
             total = total.saturating_add(size);
         }
@@ -574,33 +696,73 @@ impl DiskCache {
                 total,
                 tick,
             }),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         })
     }
 
-    /// Cached bytes for `url` if present (bumping LRU recency); reads the file outside the index lock.
+    /// Cached bytes for `url` if present AND intact (bumping LRU recency). Thin wrapper over
+    /// [`get_raw`](Self::get_raw) keyed by the URL-path hash.
     pub fn get(&self, url: &str) -> Option<Vec<u8>> {
-        let key = cache_key(url);
-        {
+        self.get_raw(cache_key(url))
+    }
+
+    /// Cached bytes for a caller-supplied 128-bit `key` if present AND intact (bumping LRU recency); reads the
+    /// file outside the index lock. Bytes are verified against the CRC-32 baked into the filename (audit M1): a
+    /// mismatch — bit-rot, external truncation, a filesystem short read — OR a missing file (a concurrent evict
+    /// unlinked it, or a crash lost it) is a clean miss: the stale index entry + its `total` contribution + its
+    /// file are dropped (self-reconcile — also closes the get-TOCTOU phantom-entry path), so the caller cleanly
+    /// re-fetches/re-builds. Bumps the hit/miss counters (audit L1). A SECOND store reuses this for non-URL
+    /// blobs — the persisted decoded-geometry tier keys on `(origin, tile_key)` (audit M3).
+    pub fn get_raw(&self, key: u128) -> Option<Vec<u8>> {
+        let crc = {
             let idx = self.idx.lock().ok()?;
-            if !idx.entries.contains_key(&key) {
-                return None;
+            match idx.entries.get(&key) {
+                Some(e) => e.crc,
+                None => {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        };
+        let path = cache_path(&self.dir, key, crc);
+        if let Some(bytes) = std::fs::read(&path).ok().filter(|b| crc32fast::hash(b) == crc) {
+            if let Ok(mut idx) = self.idx.lock() {
+                idx.touch(key);
+            }
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Some(bytes);
+        }
+        // Missing or corrupt → drop the poisoned entry (keeping `total`/`lru` honest) and its file, then miss.
+        // Guard on the CRC we tried: if a concurrent `put` already replaced this key with new content (a
+        // different CRC), leave that fresh entry untouched — only this superseded file is stale.
+        if let Ok(mut idx) = self.idx.lock() {
+            if idx.entries.get(&key).is_some_and(|e| e.crc == crc) {
+                if let Some(e) = idx.entries.remove(&key) {
+                    idx.lru.remove(&e.used);
+                    idx.total = idx.total.saturating_sub(e.size);
+                }
             }
         }
-        let bytes = std::fs::read(cache_path(&self.dir, key)).ok()?;
-        if let Ok(mut idx) = self.idx.lock() {
-            idx.touch(key);
-        }
-        Some(bytes)
+        let _ = std::fs::remove_file(&path);
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        None
     }
 
     /// Store `bytes` for `url` (atomic temp+rename so a crash never leaves a partial file), then evict the
-    /// oldest entries until back within budget.
+    /// oldest entries until back within budget. Thin wrapper over [`put_raw`](Self::put_raw).
     pub fn put(&self, url: &str, bytes: &[u8]) {
+        self.put_raw(cache_key(url), bytes);
+    }
+
+    /// Store `bytes` under a caller-supplied 128-bit `key` (no URL) — the geometry tier's `(origin, tile_key)`
+    /// store reuses this (audit M3). Atomic temp+rename; evicts to budget; CRC baked into the filename.
+    pub fn put_raw(&self, key: u128, bytes: &[u8]) {
         if bytes.is_empty() || self.budget == 0 {
             return;
         }
-        let key = cache_key(url);
-        let path = cache_path(&self.dir, key);
+        let crc = crc32fast::hash(bytes);
+        let path = cache_path(&self.dir, key, crc);
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -623,21 +785,98 @@ impl DiskCache {
         // `get`/`put`/`bytes` behind the disk I/O. The worst case of the wider window is a benign cache miss
         // (a key re-`put` between unlock and unlink loses its file but keeps its index entry → next `get`
         // reads a missing file → graceful `None`, then re-fetch) — acceptable for a best-effort cache.
-        let to_unlink = match self.idx.lock() {
+        let (stale, to_unlink) = match self.idx.lock() {
             Ok(mut idx) => {
-                idx.insert(key, bytes.len() as u64);
-                idx.evict_to(self.budget)
+                let stale = idx.insert(key, bytes.len() as u64, crc);
+                (stale, idx.evict_to(self.budget))
             }
             Err(_) => return,
         };
-        for k in to_unlink {
-            let _ = std::fs::remove_file(cache_path(&self.dir, k));
+        // A re-`put` of CHANGED bytes for the same key lands in a different `<key>.<crc>.bin` file — unlink the
+        // superseded one so the crc-in-filename scheme can't strand it (rare; tile content is path-immutable).
+        if let Some(old_crc) = stale {
+            let _ = std::fs::remove_file(cache_path(&self.dir, key, old_crc));
+        }
+        for (k, c) in to_unlink {
+            let _ = std::fs::remove_file(cache_path(&self.dir, k, c));
         }
     }
 
     /// Current resident byte total (for telemetry).
     pub fn bytes(&self) -> u64 {
         self.idx.lock().map(|i| i.total).unwrap_or(0)
+    }
+
+    /// `true` if `key` is currently indexed (no file read). Lets the geometry-tier writer skip re-serializing +
+    /// re-writing a tile already persisted this/last session (audit M3).
+    pub fn contains(&self, key: u128) -> bool {
+        self.idx.lock().map(|i| i.entries.contains_key(&key)).unwrap_or(false)
+    }
+
+    /// Cumulative cache hits / misses since `open` (audit L1 telemetry — un-blinds hit-rate / budget tuning).
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+}
+
+/// THE disk cache — ONE cell (ADR-0019), opened on one root directory with one total budget, containing
+/// two tiers as sub-cells:
+///
+/// * **`bytes`** (`<root>/`) — raw fetched payloads, keyed by URL path (session-independent). Consulted by
+///   the fetch sources before the network; its value is surviving decode-format bumps and serving content
+///   the geometry tier evicted or never held (tileset manifests, `.subtree` files).
+/// * **`geom`** (`<root>/geom/`) — persisted decoded [`TileGeometry`] blobs, keyed by `(origin, tile_key)`
+///   (audit M3). A hit skips the dominant Draco decode + rebase entirely, which is why restores consult it
+///   before any fetch is even issued — it SHADOWS the byte tier for everything previously decoded.
+///
+/// The cell's membrane is its aggregate telemetry: a disk **hit** is any tier serving (geometry restore OR
+/// cached bytes — work the disk saved), a disk **miss** is a request that ultimately needed the network
+/// (the byte tier's miss; a geometry miss that then hits bytes is one HIT, not a miss). The total budget is
+/// split evenly between the tiers: the geometry tier is the high-value half (it shadows bytes for
+/// revisits), and before the merge it ran at a hardcoded fraction of the byte budget and sat pinned at its
+/// cap while the byte tier idled at 9× the size with a ~0% hit rate.
+///
+/// The two tiers stay independently `Arc`-shareable because they live in different cells at runtime — the
+/// fetch source owns the byte tier's probe path, the Geo World owns the geometry tier's — but they are
+/// CREATED, BUDGETED, and OBSERVED as one cell, here.
+pub struct TileDiskCache {
+    pub bytes: Arc<DiskCache>,
+    /// `None` = the geometry tier's subdir couldn't open (degraded: bytes-only, re-decode on every miss).
+    /// Never a zero-budget stand-in on the byte tier's directory — two `DiskCache` indexes over one dir
+    /// would unlink each other's files on trim.
+    pub geom: Option<Arc<DiskCache>>,
+}
+
+impl TileDiskCache {
+    /// Open both tiers under `root`, splitting `total_budget_bytes` evenly between them. Fails only if the
+    /// BYTE tier can't open (no disk caching at all); a geometry-tier failure degrades to bytes-only
+    /// (re-decoding on every miss) with the error returned alongside so the caller can log it.
+    pub fn open(root: impl Into<PathBuf>, total_budget_bytes: u64) -> std::io::Result<(Self, Option<std::io::Error>)> {
+        let root = root.into();
+        let per_tier = (total_budget_bytes / 2).max(1);
+        let bytes = Arc::new(DiskCache::open(&root, per_tier)?);
+        let (geom, geom_error) = match DiskCache::open(root.join("geom"), per_tier) {
+            Ok(g) => (Some(Arc::new(g)), None),
+            Err(e) => (None, Some(e)),
+        };
+        Ok((Self { bytes, geom }, geom_error))
+    }
+
+    /// Aggregate occupancy across both tiers (the cell's one "disk MB" number).
+    pub fn total_bytes(&self) -> u64 {
+        self.bytes.bytes() + self.geom.as_ref().map(|g| g.bytes()).unwrap_or(0)
+    }
+    /// Aggregate hits: any tier serving saved work (geometry restore or cached bytes).
+    pub fn total_hits(&self) -> u64 {
+        self.bytes.hits() + self.geom.as_ref().map(|g| g.hits()).unwrap_or(0)
+    }
+    /// Aggregate misses: requests that needed the network — the BYTE tier's misses only (a geometry miss
+    /// that then hits bytes already counted as a hit; counting it as a miss too would double-count the probe).
+    pub fn total_misses(&self) -> u64 {
+        self.bytes.misses()
     }
 }
 
@@ -650,53 +889,121 @@ impl DiskCache {
 type CancelFlag = Arc<AtomicBool>;
 
 /// The registry of live cancel flags, keyed by request id, shared owner ↔ workers. The owner inserts on
-/// `request`, looks up + flips on `cancel`, and removes on `poll_completed` (when the request's result is
-/// drained — every request, cancelled or not, yields exactly one result, so the entry is always reclaimed
-/// and the map stays bounded by the live in-flight set + a brief drain lag).
+/// `request`, looks up + flips on `cancel`, and reclaims at TWO sites: `poll_completed` (a POPPED request,
+/// cancelled or not, yields exactly one drained result) and `cancel`'s amortized heap purge (a cancelled
+/// request still QUEUED may sit below the live waterline and never pop — its entry is removed when the
+/// oversized heap is rebuilt; re-eval 2026-06-09). Together the map stays bounded by the live in-flight
+/// set + the bounded heap + a brief drain lag.
 type CancelRegistry = Arc<Mutex<HashMap<RequestId, CancelFlag>>>;
 
+/// One queued fetch in the worker pool's PRIORITY queue (audit H1). Workers pop the MAX, so the most
+/// render-critical pending tile downloads first instead of FIFO. `seq` breaks ties FIFO-fairly (older first)
+/// and supplies the total order the `f64` `score` lacks (`f64` is not `Ord`).
+struct PrioReq {
+    score: f64,
+    seq: u64,
+    id: RequestId,
+    url: String,
+    cancel: CancelFlag,
+}
+impl Ord for PrioReq {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Max-heap pops the GREATEST: higher score first; equal score → smaller `seq` is "greater" (older first).
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+impl PartialOrd for PrioReq {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for PrioReq {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for PrioReq {}
+
+/// The shared pending-request priority queue + a shutdown flag behind a `Mutex`; the paired `Condvar` parks
+/// idle workers and wakes them on a new request or on teardown. Replaces the old `flume` FIFO so the owner's
+/// `fetch_priority` ordering governs SERVICE order, not just enqueue order (audit H1).
+struct PendingQueue {
+    heap: BinaryHeap<PrioReq>,
+    shutdown: bool,
+}
+
 pub struct HttpSource {
-    /// `Option` so `Drop` can drop the sender FIRST (disconnecting the channel → workers see `recv()` err and
-    /// exit) before joining the worker handles below. The only `Sender`; workers hold `req_rx` clones. Each
-    /// request carries its own [`CancelFlag`] so the worker can abort the in-progress download (A3).
-    req_tx: Option<flume::Sender<(RequestId, String, CancelFlag)>>,
+    /// Shared pending-request PRIORITY queue (audit H1): the owner pushes `PrioReq`s; workers pop the MAX. The
+    /// `Condvar` wakes one idle worker per push and wakes all on `Drop`'s shutdown.
+    pending: Arc<(Mutex<PendingQueue>, Condvar)>,
     done_rx: flume::Receiver<Loaded>,
     /// Worker thread handles, joined on `Drop` so teardown never leaves fetch threads running detached (they
     /// each hold an `Arc<DiskCache>` clone — a thread + cache-retention leak across world re-creation).
     workers: Vec<JoinHandle<()>>,
     in_flight: HashSet<RequestId>,
+    /// Monotonic sequence for `PrioReq` tie-breaking (FIFO fairness among equal-priority requests).
+    next_seq: u64,
     cache: Option<Arc<DiskCache>>,
-    /// Live per-request cancel flags (audit A3). The previous design was a bare `HashSet<RequestId>` checked
-    /// only *before* a worker dequeued a request — so a worker already inside `http_get` downloaded the
-    /// **entire** tile (up to 64 MiB) and discarded it afterward, the dominant wasted bandwidth under fast
-    /// camera motion. Now `cancel` flips the request's `AtomicBool`, which the worker's chunked read loop
-    /// probes each chunk and aborts on — a *real* mid-download cancel. The flag also short-circuits a
-    /// not-yet-started fetch (the worker's pre-flight load), so it subsumes the old hard-cancel too.
+    /// Live per-request cancel flags (audit A3): `cancel` flips the request's `AtomicBool`, which the worker's
+    /// chunked read loop probes each chunk and aborts on — a real mid-download cancel; it also short-circuits a
+    /// not-yet-started fetch (the worker's pre-flight load). On `Drop` ALL flags are flipped so a worker
+    /// mid-BODY frees promptly instead of finishing up to a 60 s fetch before observing shutdown (audit H3).
+    /// Scope honestly: the flag is probed per body chunk and pre-flight ONLY — a worker blocked inside
+    /// connect/TLS (`HTTP_CONNECT_TIMEOUT`, 10 s) or a stalled read (`HTTP_IO_TIMEOUT`, 30 s) does not see it
+    /// until that phase times out, so a black-holed network can hold `Drop`'s join up to those bounds
+    /// (re-eval 2026-06-09; the default CyperSource lane cancels via task drop and has no such window).
     cancels: CancelRegistry,
 }
 
 impl HttpSource {
-    /// Spawn `workers` (clamped ≥ 1) fetch threads, optionally backed by a persistent [`DiskCache`].
+    /// Spawn `workers` (clamped ≥ 1) fetch threads draining a shared PRIORITY queue, optionally backed by a
+    /// persistent [`DiskCache`]. Each freed worker pops the highest-`fetch_priority` pending request (audit H1).
     pub fn new(workers: usize, cache: Option<Arc<DiskCache>>) -> Self {
-        let (req_tx, req_rx) = flume::unbounded::<(RequestId, String, CancelFlag)>();
+        let pending = Arc::new((
+            Mutex::new(PendingQueue {
+                heap: BinaryHeap::new(),
+                shutdown: false,
+            }),
+            Condvar::new(),
+        ));
         let (done_tx, done_rx) = flume::unbounded::<Loaded>();
         let cancels: CancelRegistry = Arc::new(Mutex::new(HashMap::new()));
         let mut handles = Vec::with_capacity(workers.max(1));
         for _ in 0..workers.max(1) {
-            let req_rx = req_rx.clone();
+            let pending = Arc::clone(&pending);
             let done_tx = done_tx.clone();
             let cache = cache.clone();
             let handle = std::thread::Builder::new()
                 .name("LogiTileFetch".to_string())
                 .spawn(move || {
-                    while let Ok((id, url, cancel)) = req_rx.recv() {
-                        // Cache-first, cancel-aware fetch → a TYPED outcome (audit A10): `Ok(bytes)` (incl.
-                        // a legitimate empty-200) or a classified `Err`. `fetch_one` owns the hit/miss/
-                        // populate + cancellation logic and preserves the "only non-empty success is cached"
-                        // invariant, so a failure is never collapsed to empty bytes and never poisons the cache.
-                        let result = fetch_one(cache.as_deref(), &url, &cancel);
-                        if done_tx.send(Loaded { id, result }).is_err() {
-                            break; // owner gone
+                    let (lock, cvar) = &*pending;
+                    loop {
+                        // Pop the MAX-priority pending request; park on the Condvar while the queue is empty. The
+                        // inner loop re-checks shutdown + pop on every (incl. spurious) wake-up, then re-parks.
+                        let req = {
+                            let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if q.shutdown {
+                                    return; // teardown — exit the worker
+                                }
+                                if let Some(req) = q.heap.pop() {
+                                    break req;
+                                }
+                                q = cvar.wait(q).unwrap_or_else(|e| e.into_inner());
+                            }
+                        };
+                        // Cache-first, cancel-aware fetch → a TYPED outcome (audit A10). `fetch_one` owns the
+                        // hit/miss/populate + cancellation logic; a failure is never collapsed to empty bytes and
+                        // never poisons the cache. The queue lock is released before this blocking call.
+                        // L4: Arc-ify the bytes HERE, on the worker (parallel), so the owner's `drain_raw`
+                        // parks them on the entity with a cheap Arc move — the one alloc+copy stays off the
+                        // serial owner thread. A classified failure stays a typed `Err` (carries no bytes).
+                        let result: Result<Arc<[u8]>, FetchError> =
+                            fetch_one(cache.as_deref(), &req.url, &req.cancel).map(Arc::from);
+                        if done_tx.send(Loaded { id: req.id, result }).is_err() {
+                            return; // owner gone
                         }
                     }
                 })
@@ -704,10 +1011,11 @@ impl HttpSource {
             handles.push(handle);
         }
         Self {
-            req_tx: Some(req_tx),
+            pending,
             done_rx,
             workers: handles,
             in_flight: HashSet::new(),
+            next_seq: 0,
             cache,
             cancels,
         }
@@ -721,13 +1029,23 @@ impl HttpSource {
 
 impl Drop for HttpSource {
     fn drop(&mut self) {
-        // Drop the sender FIRST: that disconnects the request channel, so every idle worker's `req_rx.recv()`
-        // returns `Err` and it exits. THEN join, so teardown never leaves fetch threads running detached —
-        // each holds an `Arc<DiskCache>` clone, so a detached worker would leak both a thread and the cache
-        // retention on every world re-creation / editor hot-reload. A worker mid-`http_get` finishes that one
-        // fetch before observing the disconnect; `HTTP_OVERALL_TIMEOUT` bounds that wait. Mirrors
-        // `GlobeStreamer`'s join-on-`Drop` (the sibling that already did this correctly).
-        drop(self.req_tx.take());
+        // Teardown must never leave a fetch thread running detached (each holds an `Arc<DiskCache>` clone — a
+        // thread + cache-retention leak on every world re-creation / editor hot-reload). (1) Flip EVERY live
+        // cancel flag so a worker mid-`http_get` aborts at its next chunk probe instead of finishing up to a
+        // 60 s download before noticing (audit H3). (2) Set `shutdown` + `notify_all` so idle workers parked on
+        // the Condvar wake and exit. (3) Join. Mirrors `GlobeStreamer`'s join-on-`Drop`.
+        if let Ok(c) = self.cancels.lock() {
+            for flag in c.values() {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+        {
+            let (lock, cvar) = &*self.pending;
+            let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+            q.shutdown = true;
+            drop(q);
+            cvar.notify_all();
+        }
         for h in self.workers.drain(..) {
             let _ = h.join();
         }
@@ -735,26 +1053,35 @@ impl Drop for HttpSource {
 }
 
 impl TileContentSource for HttpSource {
-    fn request(&mut self, id: RequestId, url: &str, _now_tick: u64) {
-        // `req_tx` is `Some` for the whole live lifetime; it is taken only in `Drop`, after which no method
-        // runs. Treat a (impossible-in-practice) `None` as "channel closed" → no enqueue.
-        if let Some(tx) = self.req_tx.as_ref() {
-            // Mint this request's cancel flag and register it BEFORE sending, so a `cancel` racing in right
-            // after the worker dequeues still finds the flag and can abort the in-progress download (A3).
-            let flag: CancelFlag = Arc::new(AtomicBool::new(false));
-            if let Ok(mut c) = self.cancels.lock() {
-                c.insert(id, Arc::clone(&flag));
-            }
-            if tx.send((id, url.to_string(), flag)).is_ok() {
-                self.in_flight.insert(id);
-            } else {
-                // Channel closed (only possible during/after teardown): undo the registry insert so it can't
-                // leak — no worker will ever drain a result for this id to clean it up.
-                if let Ok(mut c) = self.cancels.lock() {
-                    c.remove(&id);
-                }
-            }
+    fn request(&mut self, id: RequestId, url: &str, priority: f64, _now_tick: u64) {
+        // Mint this request's cancel flag and register it BEFORE pushing, so a `cancel` racing in right after a
+        // worker pops it still finds the flag and can abort the in-progress download (A3).
+        let flag: CancelFlag = Arc::new(AtomicBool::new(false));
+        if let Ok(mut c) = self.cancels.lock() {
+            c.insert(id, Arc::clone(&flag));
         }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let (lock, cvar) = &*self.pending;
+        let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if q.shutdown {
+            // Teardown in progress: undo the registry insert so it can't leak (no worker will drain a result).
+            drop(q);
+            if let Ok(mut c) = self.cancels.lock() {
+                c.remove(&id);
+            }
+            return;
+        }
+        q.heap.push(PrioReq {
+            score: priority,
+            seq,
+            id,
+            url: url.to_string(),
+            cancel: flag,
+        });
+        drop(q);
+        cvar.notify_one(); // wake one idle worker to service it
+        self.in_flight.insert(id);
     }
     fn poll_completed(&mut self, _now_tick: u64, out: &mut Vec<Loaded>) {
         while let Ok(loaded) = self.done_rx.try_recv() {
@@ -775,14 +1102,39 @@ impl TileContentSource for HttpSource {
         if self.in_flight.remove(&id) {
             // Flip the live cancel flag (A3): a worker mid-download probes it each chunk and aborts early
             // (returning `Err(Cancelled)` instead of finishing up to 64 MiB it would then discard); a
-            // not-yet-started worker's pre-flight load short-circuits the fetch entirely. Either way the
-            // request still produces one result, which `poll_completed` drains + removes from the registry.
-            // We do NOT remove the registry entry here — the worker may still be reading it; `poll_completed`
-            // owns reclamation. The `Relaxed` store pairs with the worker's `Relaxed` loads (eventual
-            // visibility is all we need; no other memory is published through this flag).
+            // not-yet-started worker's pre-flight load short-circuits the fetch entirely. A POPPED request
+            // still produces one result, which `poll_completed` drains + removes from the registry — so we
+            // do NOT remove a popped request's registry entry here (the worker may be reading the flag).
+            // The `Relaxed` store pairs with the worker's `Relaxed` loads (eventual visibility is all we
+            // need; no other memory is published through this flag).
             if let Ok(c) = self.cancels.lock() {
                 if let Some(flag) = c.get(&id) {
                     flag.store(true, Ordering::Relaxed);
+                }
+            }
+            // Amortized tombstone purge (re-eval 2026-06-09): a cancelled request still QUEUED in the heap
+            // is dead weight a worker only reclaims by popping it — and an entry whose stale score sits
+            // below the live waterline (a cancelled −1e9 prefetch under sustained motion) may never pop, so
+            // heap + registry grew without bound for the duration of continuous flight. When the heap
+            // outgrows the live set, rebuild it without cancelled entries. SAFE to drop their registry
+            // entries directly: a worker only ever touches a request's flag AFTER popping its `PrioReq`,
+            // so an entry still in the heap has no worker reader; and the scene already settled its own
+            // bookkeeping at cancel time (`cancel_stale` removes its in-flight map/path/index entries), so
+            // no `Loaded` result is owed for a purged id. O(heap) rebuild amortized over ≥ half-heap cancels.
+            let (lock, _cvar) = &*self.pending;
+            let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if q.heap.len() > 2 * self.in_flight.len() + 64 {
+                let drained = std::mem::take(&mut q.heap).into_vec();
+                let (keep, purged): (Vec<PrioReq>, Vec<PrioReq>) =
+                    drained.into_iter().partition(|r| !r.cancel.load(Ordering::Relaxed));
+                q.heap = BinaryHeap::from(keep);
+                drop(q);
+                if !purged.is_empty() {
+                    if let Ok(mut c) = self.cancels.lock() {
+                        for r in &purged {
+                            c.remove(&r.id);
+                        }
+                    }
                 }
             }
         }
@@ -792,6 +1144,15 @@ impl TileContentSource for HttpSource {
     }
     fn cached_bytes(&self) -> u64 {
         self.cache.as_ref().map(|c| c.bytes()).unwrap_or(0)
+    }
+    fn cache_hits(&self) -> u64 {
+        self.cache.as_ref().map(|c| c.hits()).unwrap_or(0)
+    }
+    fn cache_misses(&self) -> u64 {
+        self.cache.as_ref().map(|c| c.misses()).unwrap_or(0)
+    }
+    fn fetch_concurrency(&self) -> usize {
+        self.workers.len().max(1)
     }
 }
 
@@ -1013,8 +1374,8 @@ mod fetch_tests {
         // The public surface: a cancelled id leaves the in-flight set and never surfaces from poll_completed
         // (the result, whatever it is, is dropped). Point it at a dead port so the fetch fails fast.
         let mut src = HttpSource::new(2, None);
-        src.request(1, "http://127.0.0.1:1/never", 0);
-        src.request(2, "http://127.0.0.1:1/never", 0);
+        src.request(1, "http://127.0.0.1:1/never", 0.0, 0);
+        src.request(2, "http://127.0.0.1:1/never", 0.0, 0);
         assert_eq!(src.in_flight(), 2);
         src.cancel(1);
         assert_eq!(src.in_flight(), 1, "cancel drops the id from in-flight immediately");
@@ -1032,6 +1393,30 @@ mod fetch_tests {
         assert!(out.iter().any(|l| l.id == 2), "id 2's result should surface");
         assert!(!out.iter().any(|l| l.id == 1), "cancelled id 1 must never surface");
         assert_eq!(src.in_flight(), 0, "all in-flight resolved");
+    }
+
+    #[test]
+    fn prio_req_heap_pops_highest_score_then_fifo() {
+        // The worker pool's priority queue (audit H1) must pop the GREATEST `fetch_priority` first, and among
+        // EQUAL scores the OLDER request (smaller `seq`) — the contract that makes "highest-priority-to-render
+        // fetched first" hold regardless of arrival order across passes.
+        use std::collections::BinaryHeap;
+        let mk = |score: f64, seq: u64, id: RequestId| PrioReq {
+            score,
+            seq,
+            id,
+            url: String::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let mut h = BinaryHeap::new();
+        h.push(mk(1.0, 0, 10)); // low score, but enqueued FIRST
+        h.push(mk(5.0, 1, 20)); // high score
+        h.push(mk(5.0, 2, 21)); // high score, later seq → serviced after 20
+        h.push(mk(3.0, 3, 30)); // mid score
+        assert_eq!(h.pop().unwrap().id, 20, "highest score first");
+        assert_eq!(h.pop().unwrap().id, 21, "equal score → FIFO (smaller seq first)");
+        assert_eq!(h.pop().unwrap().id, 30, "then the mid score");
+        assert_eq!(h.pop().unwrap().id, 10, "then the lowest, despite being enqueued first");
     }
 }
 
@@ -1082,7 +1467,7 @@ mod disk_cache_tests {
         // does this after releasing the lock; this proves the deferred unlink still actually deletes).
         assert!(cache.get("https://h/u1.glb").is_none(), "u1 should have been evicted");
         assert!(
-            !cache_path(&dir, cache_key("https://h/u1.glb")).exists(),
+            !cache_path(&dir, cache_key("https://h/u1.glb"), crc32fast::hash(&[1u8; 60])).exists(),
             "u1's file must be unlinked on eviction"
         );
         // The fresh entry survives and is readable; the byte total reflects only it.
@@ -1112,6 +1497,61 @@ mod disk_cache_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn corrupt_cached_file_is_detected_and_served_as_a_miss() {
+        // M1 integrity: a cached file whose bytes drift from the CRC in its name (bit-rot / external
+        // truncation / a partial write) must NOT be served — `get` detects the mismatch, drops the poisoned
+        // entry + its file + its byte total, and reports a clean miss so `fetch_one` re-fetches.
+        let dir = temp_dir("integrity");
+        let cache = DiskCache::open(&dir, 10_000).expect("open");
+        let url = "https://h/tile.glb";
+        cache.put(url, &[9u8; 200]);
+        assert_eq!(cache.get(url), Some(vec![9u8; 200]), "intact bytes are served");
+
+        // Corrupt the on-disk file in place (same length, different bytes ⇒ same name, wrong CRC).
+        let path = cache_path(&dir, cache_key(url), crc32fast::hash(&[9u8; 200]));
+        std::fs::write(&path, [0u8; 200]).expect("overwrite in place");
+        assert_eq!(cache.get(url), None, "corrupt bytes are rejected as a miss");
+        assert!(!path.exists(), "the poisoned file is unlinked");
+        assert_eq!(cache.bytes(), 0, "and its bytes are dropped from the budget total");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_reclaims_orphaned_tmp_and_stale_files() {
+        // M2 (+ no-compat): a crash between write and rename strands a `<key>.<crc>.tmpN`; a pre-integrity
+        // build leaves a `<key>.bin` (no embedded CRC). Both are invisible to the byte budget and must be
+        // reclaimed on open — not leaked forever — while a real, well-formed entry survives.
+        let dir = temp_dir("reclaim");
+        {
+            let cache = DiskCache::open(&dir, 10_000).expect("open");
+            cache.put("https://h/keep.glb", &[5u8; 100]);
+        }
+        // Hand-plant an orphan temp + a stale legacy file in the (existing) shard dir of the real entry.
+        let name = format!("{:032x}", cache_key("https://h/keep.glb"));
+        let shard = dir.join(&name[..2]);
+        let orphan_tmp = shard.join("deadbeefdeadbeefdeadbeefdeadbeef.cafebabe.tmp7");
+        let legacy_bin = shard.join("00112233445566778899aabbccddeeff.bin");
+        std::fs::write(&orphan_tmp, [0u8; 50]).expect("plant tmp");
+        std::fs::write(&legacy_bin, [0u8; 50]).expect("plant legacy");
+
+        let reopened = DiskCache::open(&dir, 10_000).expect("reopen");
+        assert!(!orphan_tmp.exists(), "orphaned .tmpN reclaimed on open (M2)");
+        assert!(
+            !legacy_bin.exists(),
+            "stale pre-integrity .bin reclaimed on open (no-compat)"
+        );
+        assert_eq!(
+            reopened.get("https://h/keep.glb"),
+            Some(vec![5u8; 100]),
+            "the real, well-formed entry survives reclaim"
+        );
+        assert_eq!(reopened.bytes(), 100, "budget total counts only the real entry");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -1136,7 +1576,7 @@ mod tests {
     fn request_completes_after_its_latency() {
         let mut src = SyntheticSource::new();
         let id = 7;
-        src.request(id, "tile://7", 0);
+        src.request(id, "tile://7", 0.0, 0);
         assert_eq!(src.in_flight(), 1);
 
         let latency = src.latency_for(id);
@@ -1150,15 +1590,15 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, id);
         // The synthetic lane always succeeds → `Ok(payload)` (audit A10: typed outcome, not bare bytes).
-        assert_eq!(out[0].result, Ok(synthetic_payload(id, src.bytes_for(id))));
+        assert_eq!(out[0].result, Ok(synthetic_payload(id, src.bytes_for(id)).into()));
         assert_eq!(src.in_flight(), 0);
     }
 
     #[test]
     fn cancel_removes_an_in_flight_request() {
         let mut src = SyntheticSource::new();
-        src.request(3, "u", 0);
-        src.request(4, "u", 0);
+        src.request(3, "u", 0.0, 0);
+        src.request(4, "u", 0.0, 0);
         assert_eq!(src.in_flight(), 2);
         src.cancel(3);
         assert_eq!(src.in_flight(), 1);
@@ -1204,7 +1644,7 @@ mod tests {
         fn run() -> Vec<Loaded> {
             let mut src = SyntheticSource::new();
             for id in 0..20 {
-                src.request(id, "u", 0);
+                src.request(id, "u", 0.0, 0);
             }
             let mut out = Vec::new();
             for tick in 0..=12 {

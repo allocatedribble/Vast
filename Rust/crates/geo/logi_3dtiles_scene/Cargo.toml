@@ -10,7 +10,7 @@ publish = false
 logi_collada = { path = "../logi_collada" }
 logi_geospatial = { path = "../logi_geospatial" }
 glam = { workspace = true }
-# SwissTable maps/sets for the streaming bookkeeping (tile index, in-flight, grafts, mesh cache).
+# SwissTable maps/sets for the streaming bookkeeping (tile index, in-flight, grafts, flash cache).
 hashbrown = { workspace = true }
 # The streaming tileset world (3D Tiles): traversal + worker-pool fetch + glTF decode + ECEF→ENU rebase.
 logi_3dtiles_tileset = { path = "../logi_3dtiles_tileset" }
@@ -33,7 +33,18 @@ bytemuck = "1"
 # Surface external-tileset graft failures (audit M17) instead of silently dropping the subtree.
 tracing = { workspace = true }
 # Geo ECS orchestration (ADR-0012 Addendum A): tiles become entities and the stream thread runs a bevy_ecs
-# schedule whose heavy systems `par_iter` on the SHARED ComputeTaskPool. This is the one geo crate that takes
-# a bevy dependency — the orchestration layer. Rationale + constraints: Docs/Research/ECS-Multithreading-for-Geo.md.
+# schedule. ADR-0018: that schedule is fully chained, so it runs SingleThreaded over the active working-set —
+# no per-step `par_iter`. This is the one geo crate that takes a bevy dependency — the orchestration layer.
+# Rationale + constraints: Docs/Research/ECS-Multithreading-for-Geo.md.
 bevy_ecs = { workspace = true }
 bevy_tasks = { workspace = true }
+# Physical-core count to size the shared ComputeTaskPool off real cores (not SMT siblings) — see
+# `geo_compute_threads`. Tiny, dependency-free utility; already vendored in the tree.
+num_cpus = "1"
+
+[features]
+# `cyper-h2` forwards to `logi_3dtiles_io/cyper-h2`, enabling the HTTP/2 CyperSource lane (~4× on the tile
+# workload). Now ON BY DEFAULT — the live keyed P3DT A/B promoted it (LogiRuntime plan §7.1); `from_ion`'s
+# Auto policy then picks CyperSource for Google P3DT hosts. `--no-default-features` keeps the lean ureq lane.
+default = ["cyper-h2"]
+cyper-h2 = ["logi_3dtiles_io/cyper-h2"]

@@ -7,6 +7,11 @@
 #
 # `max_width = 120` matches the codebase's existing wide style (only ~19 lines exceeded it), so the
 # one-shot reformat reflows almost no code beyond the tab→space conversion.
+#
+# The logi_ecs fork (ADR-0020) stays at UPSTREAM bevy formatting (max_width 100, its own idioms):
+# reformatting ~30k adopted lines to house style would bury every real divergence in whitespace and
+# make upstream cherry-picks diff-noisy. `ignore` is nightly-rustfmt (we are pinned nightly).
+ignore = ["crates/logi_ecs", "crates/logi_ecs_macros"]
 edition = "2021"
 hard_tabs = false
 tab_spaces = 4

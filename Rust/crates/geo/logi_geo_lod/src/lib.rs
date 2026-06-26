@@ -1,9 +1,39 @@
 //! LOD selection: screen-space error driven refinement (the same model 3D Tiles / CDLOD use).
 
+/// Precompute `tan(fov_y/2)` ONCE per selection pass, clamped away from 0/π so it can't go to 0 or blow up
+/// (inf/NaN SSE). Pass the result via [`RefineParams::tan_half_fov_y`] / to [`screen_space_error_with_tan`] so
+/// the **per-tile** refine decision never pays a transcendental on the hot path (the selection traversal calls
+/// the criterion once per visited tile per frame; the FOV is constant across the whole pass).
+#[inline]
+pub fn tan_half_fov_y(fov_y_radians: f64) -> f64 {
+    (fov_y_radians.clamp(1e-3, std::f64::consts::PI - 1e-3) * 0.5)
+        .tan()
+        .max(1e-4)
+}
+
 /// Screen-space error in pixels for a feature of `geometric_error` world-units viewed at `distance`,
-/// with vertical FOV `fov_y_radians` and `viewport_height` pixels.
+/// with vertical FOV `fov_y_radians` and `viewport_height` pixels. Convenience wrapper that computes
+/// `tan(fov_y/2)` each call — for the per-tile hot path prefer [`screen_space_error_with_tan`] with a
+/// [`tan_half_fov_y`] precomputed once per pass.
 #[inline]
 pub fn screen_space_error(geometric_error: f64, distance: f64, fov_y_radians: f64, viewport_height: f64) -> f64 {
+    screen_space_error_with_tan(
+        geometric_error,
+        distance,
+        viewport_height,
+        tan_half_fov_y(fov_y_radians),
+    )
+}
+
+/// [`screen_space_error`] with `tan(fov_y/2)` already computed (see [`tan_half_fov_y`]) — keeps the
+/// transcendental out of the per-tile inner loop.
+#[inline]
+pub fn screen_space_error_with_tan(
+    geometric_error: f64,
+    distance: f64,
+    viewport_height: f64,
+    tan_half_fov_y: f64,
+) -> f64 {
     // M1 (SSE edge): a feature with zero geometric error contributes zero screen-space error at ANY
     // distance — including the degenerate camera-on-feature case. Check this BEFORE the distance clamp so
     // `ge == 0` at `distance ~ 0` yields 0 (already at target), not INFINITY (which would refine forever).
@@ -13,11 +43,7 @@ pub fn screen_space_error(geometric_error: f64, distance: f64, fov_y_radians: f6
     if distance <= 1e-6 {
         return f64::INFINITY;
     }
-    // FIX 4: clamp fov away from 0/PI so tan() can't go to 0 or blow up (inf/NaN SSE).
-    let t = (fov_y_radians.clamp(1e-3, std::f64::consts::PI - 1e-3) * 0.5)
-        .tan()
-        .max(1e-4);
-    let pixels_per_unit = viewport_height / (2.0 * distance * t);
+    let pixels_per_unit = viewport_height / (2.0 * distance * tan_half_fov_y);
     geometric_error * pixels_per_unit
 }
 
@@ -28,7 +54,10 @@ pub fn screen_space_error(geometric_error: f64, distance: f64, fov_y_radians: f6
 /// transform and a streaming fallback); only the refine *decision* below is shared.
 #[derive(Clone, Copy, Debug)]
 pub struct RefineParams {
-    pub fov_y_radians: f64,
+    /// `tan(fov_y/2)`, precomputed ONCE per pass via [`tan_half_fov_y`] (the FOV is constant across a pass), so
+    /// the per-tile [`should_refine`] does no transcendental. Replaces a raw `fov_y_radians` field that forced a
+    /// `tan()` on every visited tile every frame.
+    pub tan_half_fov_y: f64,
     pub viewport_height: f64,
     /// Target screen-space error in pixels: refine while a tile's SSE exceeds this.
     pub sse_target: f64,
@@ -46,11 +75,13 @@ pub struct RefineParams {
 /// one home for the criterion + hysteresis dead-band (audit M22/DUP-2).
 #[inline]
 pub fn should_refine(geometric_error: f64, distance: f64, params: &RefineParams, was_refined: bool) -> bool {
-    let sse = screen_space_error(
+    let sse = screen_space_error_with_tan(
         geometric_error,
+        // Conservative 1-metre world-unit floor: a near-camera (≈0 m) tile still yields a
+        // large-but-finite SSE instead of dividing by ~0.
         distance.max(1.0),
-        params.fov_y_radians,
         params.viewport_height,
+        params.tan_half_fov_y, // precomputed once per pass — no transcendental here
     );
     let threshold = if was_refined && params.hysteresis > 0.0 {
         params.sse_target / (1.0 + params.hysteresis)
@@ -83,7 +114,7 @@ mod tests {
     #[test]
     fn should_refine_refines_above_target_keeps_below() {
         let p = RefineParams {
-            fov_y_radians: 1.0,
+            tan_half_fov_y: tan_half_fov_y(1.0),
             viewport_height: 1080.0,
             sse_target: 4.0,
             hysteresis: 0.0,
@@ -101,7 +132,7 @@ mod tests {
     #[test]
     fn hysteresis_dead_band_holds_a_refined_tile() {
         let plain = RefineParams {
-            fov_y_radians: 1.0,
+            tan_half_fov_y: tan_half_fov_y(1.0),
             viewport_height: 1080.0,
             sse_target: 4.0,
             hysteresis: 0.0,

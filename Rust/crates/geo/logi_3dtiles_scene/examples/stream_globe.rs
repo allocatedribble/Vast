@@ -4,7 +4,7 @@
 //! `$env:CESIUM_ION_TOKEN="<token>"; cargo run -p logi_3dtiles_scene --example stream_globe --release`
 
 use glam::DVec3;
-use logi_3dtiles_scene::{GeoView, GeoWorld};
+use logi_3dtiles_scene::{FetchBackend, GeoView, GeoWorld};
 use logi_geospatial::{Cartographic, Ellipsoid, EnuFrame};
 
 fn main() {
@@ -16,10 +16,24 @@ fn main() {
     let enu = EnuFrame::from_cartographic(&Ellipsoid::wgs84(), origin);
     let camera = enu.local_to_ecef(DVec3::new(0.0, -800.0, 1500.0)); // 800 m south, 1.5 km up
 
-    // Blocking: ion resolve + root fetch, then a streaming Geo World on an 8-worker HTTP pool, 6 km cull.
-    let mut world = GeoWorld::from_ion(2275207, &token, lon, lat, 0.0, 8, 6000.0, None, 5120, 4096)
-        .expect("build Geo World from ion");
-    println!("streaming P3DT over Manhattan via the bevy_ecs Geo World (8 workers, 6 km cull)…");
+    // Blocking: ion resolve + root fetch, then a streaming Geo World, 6 km cull. `FetchBackend::Auto` selects
+    // the HTTP/2 CyperSource for this Google P3DT asset when built with the default `cyper-h2` feature (else the
+    // 8-worker ureq pool). Force `FetchBackend::Ureq` here to A/B the blocking pool.
+    let mut world = GeoWorld::from_ion(
+        2275207,
+        &token,
+        lon,
+        lat,
+        0.0,
+        8,
+        FetchBackend::Auto,
+        6000.0,
+        None,
+        5120,
+        4096,
+    )
+    .expect("build Geo World from ion");
+    println!("streaming P3DT over Manhattan via the bevy_ecs Geo World (Auto fetch backend, 6 km cull)…");
 
     let view = |frame: u64| GeoView {
         camera_ecef: camera,
@@ -31,6 +45,10 @@ fn main() {
     };
 
     for step in 0..80u64 {
+        // Stamp the wall-clock each step (H5), exactly as the production stream loop does before
+        // `advance_from_ue`: the retry-backoff deadlines are `Instant`-based now, so without this the clock
+        // would be frozen and a transiently-failed tile (a real 429/5xx/timeout) would never retry this run.
+        world.set_now(std::time::Instant::now());
         world.advance_streaming(view(step + 1));
         if step % 10 == 0 {
             let frame = world.latest_frame();

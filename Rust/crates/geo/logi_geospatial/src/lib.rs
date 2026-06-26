@@ -104,8 +104,8 @@ impl Ellipsoid {
     ///
     /// At/near the geocenter the lon/lat/height are undefined (no surface point, no "up" direction); rather
     /// than emit `NaN` lat/lon — which would silently poison every derived ENU frame — this returns the
-    /// sentinel `Cartographic { longitude: 0, latitude: 0, height: -semi_minor_axis }` (the geocenter is
-    /// one semi-minor axis "below" the prime-meridian/equator surface point). Callers feeding untrusted
+    /// sentinel `Cartographic { longitude: 0, latitude: 0, height: -semi_minor_axis }` — an out-of-range
+    /// negative height used as a degenerate-input sentinel. Callers feeding untrusted
     /// ECEF should treat a near-`-semi_minor_axis` height as "degenerate input".
     pub fn cartesian_to_cartographic(&self, ecef: DVec3) -> Cartographic {
         let surface = self.scale_to_geodetic_surface(ecef);

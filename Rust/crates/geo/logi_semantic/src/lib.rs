@@ -59,7 +59,8 @@ impl TileId {
         ((self.level as u64) << 56) | (((self.x as u64) & 0x0FFF_FFFF) << 28) | ((self.y as u64) & 0x0FFF_FFFF)
     }
 
-    /// The tile's filename within the store (`tiles/` subdir).
+    /// The tile's LEAF file name (`L{level}_X{x}_Y{y}.lst`); the store joins it under its `tiles/` subdir —
+    /// no path component is included here.
     pub fn file_name(self) -> String {
         format!("L{}_X{}_Y{}.lst", self.level, self.x, self.y)
     }

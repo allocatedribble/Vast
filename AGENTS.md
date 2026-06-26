@@ -21,6 +21,17 @@ The constitution is refined by ADRs in [`Docs/Architecture/`](Docs/Architecture/
 - **[ADR-0009](Docs/Architecture/ADR-0009-Native-Rust-3DTiles-Stack.md)** — native Rust OGC 3D Tiles / real-world-earth stack (Milestone F).
 - **[ADR-0011](Docs/Architecture/ADR-0011-Semantic-Tile-Enrichment.md)** — offline semantic-tile bake; ML stays offline, the runtime stays lean, render data is non-authoritative.
 - **[ADR-0012](Docs/Architecture/ADR-0012-Poll-Based-FFI-Decoupled-Sim-Thread.md)** — poll-based FFI: the sim/stream loop runs on Rust-owned threads, Unreal only pushes view/input and pulls the latest snapshot. Amends ADR-0005's owner-thread (relocated off the game thread, not removed); plan in [Docs/Plans/Async-Sim-Decoupling-and-Geo-Performance.md](Docs/Plans/Async-Sim-Decoupling-and-Geo-Performance.md).
+- **[ADR-0013](Docs/Architecture/ADR-0013-Terrain-Static-Relevance-GPU-Scene.md)** — proc-mesh tile proxies render via static relevance (GPU-Scene cached draw commands), implementing ADR-0008's non-Nanite option.
+- **[ADR-0014](Docs/Architecture/ADR-0014-LogiRuntime-Unified-Executor-Reactor.md)** — LogiRuntime: two lanes (work-stealing CPU + compio completion I/O) under one core arbiter; generalizes ADR-0012. Plan in [Docs/Plans/LogiRuntime-Design.md](Docs/Plans/LogiRuntime-Design.md).
+- **[ADR-0015](Docs/Architecture/ADR-0015-Simulation-LOD.md)** — simulation-LOD: the active set is bounded by **budget, not population**; statistical far field; deterministic keyed-seed promotion.
+- **[ADR-0016](Docs/Architecture/ADR-0016-Per-Lane-Determinism.md)** — per-lane determinism: a bounded deterministic near-set + a free far field, bridged by a typed `Promoted<T>`; counter-based RNG.
+- **[ADR-0017](Docs/Architecture/ADR-0017-GPU-Resident-Statistical-Offload.md)** — GPU-resident statistical offload — **deferred / dark by default**, gated on a measured bandwidth-bound profile.
+- **[ADR-0018](Docs/Architecture/ADR-0018-Geo-Streaming-Parallelism.md)** — the Geo step is bounded by the active working-set, never the entity pool; O(active + Δ) per step.
+- **[ADR-0019](Docs/Architecture/ADR-0019-Cells-Within-Cells-Interlinked.md)** — the structural precedent: every abstraction is cells within cells, interlinked — bounded self-similar units, nested, coupled only through narrow explicit links; new work follows it or argues, in an ADR, why it can't.
+- **[ADR-0020](Docs/Architecture/ADR-0020-LogiEcs-Incremental-World-Cell.md)** — the ECS is ours: bevy_ecs adopted as the **`logi_ecs`** fork (`Rust/crates/logi_ecs`, ledger in its `FORK.md`); the World is refactored into an incremental, interlinked cell — bounded by budget, interior O(Δ), narrow typed links. Consumers still say `bevy_ecs` (dependency key; crate symbol pinned by a rustc ParamSet hack until D-paramset).
+- **[ADR-0021](Docs/Architecture/ADR-0021-Sim-Tiles-Temporal-Simulation-LOD.md)** — **sim-tiles**: simulation LOD gains a second refinement axis, **time** — a sim-cell's timestep is a resolution (frame → day → *never*: seed + lazy fast-forward; determinism-from-seed is the compression scheme). The sim-cell contract = bounds + exported error metric + conserving flux links + commitments + replay-stable hazard triggers. Entity count is unbounded; one million agents is the floor, never a ceiling a design may bake in.
+- **[ADR-0022](Docs/Architecture/ADR-0022-LogiSky-Rust-Modeled-Atmosphere.md)** — LogiSky: the atmosphere remade as a Rust-owned model (parameters, sun, WGS84 single-homed with the terrain) baking LUTs for a thin UE GPU shell; aerial perspective analytic from ellipsoid depth, never scene depth — the tile quilt becomes unrepresentable. Scope: ALL atmospheric rendering, one cell. Plan in [Docs/Plans/LogiSky-Atmosphere-Remake.md](Docs/Plans/LogiSky-Atmosphere-Remake.md).
+- **[ADR-0023](Docs/Architecture/ADR-0023-One-Truth-Many-Formulas.md)** — one truth, many formulas (the resolution-ladder precedent, brother to ADR-0019): every continuously-evaluated quantity = one parameter truth + a family of formulas at declared, TESTED (cost, error) tiers — reference form always in-repo as the oracle, seamless tier handoffs, joint coverage of every scale.
 - **[ADR-0001](Docs/Architecture/ADR-0001-Mass-First-Unreal.md)** / **[ADR-0002](Docs/Architecture/ADR-0002-Rust-Terrain-Kernel.md)** / **[ADR-0003](Docs/Architecture/ADR-0003-Representation-LOD.md)** / **[ADR-0004](Docs/Architecture/ADR-0004-No-Compatibility-Code.md)** — superseded in part; their Determinism, "Unreal is a shell", terrain-truth, significance-budget, and no-compat clauses still hold.
 
 > **The real-world terrain / earth stack is the "Geo" engine** — `Rust/crates/geo/` (crates `logi_geo_*`
@@ -36,11 +47,11 @@ Vast is a **near-Earth-scale, dynamic planet simulation** — a first- and third
 world. The logistics layer the project was named for is now **one mode** inside it:
 
 - **Planetary / near-Earth scale**, continuous zoom from orbital flows down to **a single character on foot** (or one courier carrying one package).
-- **Millions of simulated agents.**
+- **Millions of simulated agents — as the floor.** The entity count itself is unbounded ([ADR-0021](Docs/Architecture/ADR-0021-Sim-Tiles-Temporal-Simulation-LOD.md)): what is bounded is the active cut — by budget, never population (ADR-0015) — in space *and in time* (a cell's timestep is a resolution, frame → day → never).
 - **"Real where you look, faked where you don't"** — full fidelity inside the player's attention; aggregate modeling elsewhere.
-- **Deterministic, fixed-step simulation** wherever replay or snapshot equality is required.
+- **Deterministic, fixed-step simulation** wherever replay or snapshot equality is required — and determinism-from-seed doubles as the compression scheme that makes the unbounded count runnable (state you can regenerate is state you don't store).
 
-When in doubt, choose the option that still works at **one million agents**.
+When in doubt, choose the option that still works at **one million agents** — and that never hard-caps at *any* population ([ADR-0021](Docs/Architecture/ADR-0021-Sim-Tiles-Temporal-Simulation-LOD.md)).
 
 ---
 
@@ -356,6 +367,7 @@ Do **not** introduce Mass (`Fragment`, `Processor`, `Trait`, `FMassCommandBuffer
 
 | Path | Role | Owns gameplay truth? |
 |---|---|---|
+| `Rust/crates/logi_ecs` (+ `logi_ecs_macros`) | **The Vast ECS** — our adopted bevy_ecs fork (ADR-0020); the World-as-cell refactor lives here. Divergence ledger: `FORK.md`. | Mechanism, not truth. |
 | `Rust/crates/logi_runtime` | Owns the Bevy `World`, Schedules, Resources. | **Yes — the authority.** |
 | `Rust/crates/logi_sim` | Gameplay Components + Systems (incl. the coarse deterministic terrain field). | **Yes.** |
 | `Rust/crates/logi_render_extract` | Per-frame snapshots handed to Unreal. | Projection of truth. |
@@ -403,6 +415,10 @@ Do **not** introduce Mass (`Fragment`, `Processor`, `Trait`, `FMassCommandBuffer
   `staticlib`. `rebuild-editor.ps1` does the full close-editor → build Rust + C++ → relaunch loop.
 - **Live editor + MCP:** a running editor exposes MCP tools at `http://localhost:3000/mcp`. Prefer
   non-destructive operations; new modules/plugins require a from-scratch build (Live Coding can't add them).
+- **Text search: use `rg` (ripgrep) by default**, not `grep`/`Select-String` — in shell commands, scripts,
+  and tooling alike. It is markedly faster on this tree (engine source + a large workspace), respects
+  `.gitignore` (so `target/`, `Binaries/`, `Saved/` never pollute results — pass `-uu` when you really mean
+  to search them), and its defaults (recursive, line numbers) match how results get consumed.
 
 ### Repository conventions
 - **Git LFS** for binary assets; build output (`Binaries/`, `Intermediate/`, `Saved/`, `DerivedDataCache/`,

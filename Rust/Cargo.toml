@@ -9,6 +9,10 @@
 [workspace]
 resolver = "2"
 members = [
+	# The Vast ECS — our adopted fork of bevy_ecs 0.19.0-rc.2 (ADR-0020). The World is being
+	# refactored into an incremental, interlinked cell; divergence ledger in crates/logi_ecs/FORK.md.
+	"crates/logi_ecs",
+	"crates/logi_ecs_macros",
 	# Gameplay authority tower (ADR-0005).
 	"crates/logi_ffi",
 	"crates/logi_runtime",
@@ -37,6 +41,9 @@ members = [
 	"crates/geo/logi_3dtiles_scene",
 	"crates/geo/logi_3dtiles_ion",
 	"crates/geo/logi_semantic",
+	"crates/geo/logi_sky",       # LogiSky (ADR-0022): the Rust-owned atmosphere model + LUT bakers (S1)
+	# Tools — developer-facing CLIs, never linked into the game or editor.
+	"crates/tools/logi_bench",      # geo-bench: standardized Geo test/bench harness (Docs/Testing/Geo-Bench.md)
 ]
 
 [workspace.package]
@@ -45,13 +52,20 @@ version = "0.1.0"
 license = "Proprietary"
 
 [workspace.dependencies]
-# `multi_threaded` is OFF in bevy's default features — without it `par_iter`/`par_iter_mut` degrade to a
+# The ECS is OUR fork: `logi_ecs` (ADR-0020), adopted from bevy_ecs 0.19.0-rc.2 (fork point + divergence
+# ledger in crates/logi_ecs/FORK.md). The dependency KEY stays `bevy_ecs` so (a) every consumer crate's
+# `use bevy_ecs::…` and `bevy_ecs = { workspace = true }` lines are untouched, and (b) the derive macros'
+# path resolution (`bevy_macro_utils::BevyManifest` looks this key up in the consumer manifest) keeps
+# emitting `::bevy_ecs::…` paths that resolve to the fork. A source-level `use logi_ecs::` sweep is a
+# deliberate later step (needs a macro-utils fork for path resolution — ADR-0020 §R-rename).
+# `multi_threaded` is OFF in the default features — without it `par_iter`/`par_iter_mut` degrade to a
 # serial fold and the "MultiThreaded" executor runs on a 1-thread pool (all our parallelism was a no-op).
-# Enabling it turns on the real work-stealing pool the geo `decode` + per-agent gameplay systems fan out
-# over. Pulls in only `arrayvec` + `async-channel` (no GPU/runtime crates) — within the §10 / ADR-0004 rule.
-# Pinned EXACTLY (`=`) to the 0.19.0 release candidate: pre-releases can carry breaking changes between
-# RCs, so `cargo update` must not silently jump to rc.3 / 0.19.0-final. Re-pin deliberately when bumping.
-bevy_ecs = { version = "=0.19.0-rc.2", features = ["multi_threaded"] }
+# Enabling it turns on the real work-stealing pool the per-agent gameplay systems fan out over (the geo
+# stream loop runs SingleThreaded over its working-set — ADR-0018 — sharing that pool only for the measure-
+# gated decode decouple). Pulls in only `arrayvec` + `async-channel` (no GPU/runtime crates) — within the §10 / ADR-0004 rule.
+bevy_ecs = { package = "logi_ecs", path = "crates/logi_ecs", features = ["multi_threaded"] }
+# bevy_tasks stays the crates.io release, pinned EXACTLY (`=`) to the same RC the fork point came from
+# (pre-releases can carry breaking changes between RCs; `cargo update` must not silently jump it).
 bevy_tasks = { version = "=0.19.0-rc.2", features = ["multi_threaded"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -82,3 +96,15 @@ divan = "0.1"
 panic = "abort"
 lto = "thin"
 codegen-units = 1
+
+# ── Vendored-crate overrides ──────────────────────────────────────────────────────────────────────────────
+# `cyper` is vendored + patched (a sanctioned third-party fork — same precedent as logi_draco's vendored Draco)
+# to expose a quinn-proto `TransportConfig` seam on its HTTP/3 client. Upstream `cyper::Client` builds the QUIC
+# endpoint with all-default transport, so `keep_alive_interval` stays `None` and a pooled tile connection that
+# goes idle >30 s (camera paused / between teleports) is torn down — forcing a fresh QUIC handshake on the next
+# render-critical tile. The patch adds `ClientBuilder::h3_transport_config(...)` so the Geo I/O lane can set
+# keep-alive (and later initial_rtt / congestion controller). Source under Rust/third_party/cyper/, pinned to the
+# same 0.9.0 we forked; INTERNAL to logi_3dtiles_io's `cyper-h2` feature → NO FFI/ABI change, and inert in the
+# `--no-default-features` (ureq-only) cdylib (which never compiles cyper). See [[geo-h3-lane-optimization]].
+[patch.crates-io]
+cyper = { path = "third_party/cyper" }

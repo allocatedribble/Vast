@@ -64,6 +64,38 @@ public:
 	/** Drop this tile's geometry (recycle path): empties the section so the pooled component renders nothing. */
 	void ClearTileGeometry();
 
+	/**
+	 * Swap this tile's material IN PLACE (audit 2026-06-10 C4c). UMeshComponent::SetMaterial marks the render
+	 * state dirty, which DESTROYS and RECREATES the scene proxy — re-running the full render-thread vertex
+	 * de-interleave + RHI buffer upload just to change a material (the hole-clip opaque<->masked swap and the
+	 * debug-view binds paid this per call). This instead updates OverrideMaterials[0] (so GetMaterial(0) and any
+	 * future genuine proxy recreation agree), then enqueues a render command that swaps the live proxy's
+	 * material + relevance and requests a cached-mesh-draw-command re-cache via
+	 * FSceneInterface::UpdateCachedRenderStates (the Landscape-proven path) — no proxy churn, no re-upload.
+	 * `NewMaterial` must outlive the swap (callers hold it via FTileEntry / the MID pool).
+	 */
+	void SetTileMaterial(UMaterialInterface* NewMaterial);
+
+	/**
+	 * Show/hide this tile, in place when possible (audit 2026-06-10 C4c). USceneComponent::SetVisibility
+	 * routes through OnVisibilityChanged -> MarkRenderStateDirty — a full proxy recreate + geometry re-upload
+	 * PER FLIP. With a LIVE proxy this instead flips its drawn state on the render thread
+	 * (FSceneInterface::UpdatePrimitivesIsDrawn_RenderThread — also keeps the distance-field + Lumen scenes
+	 * in sync). A HIDDEN-BIRTH component has NO proxy (the engine skips the scene add for non-rendering
+	 * components — ShouldComponentAddToScene), so its FIRST reveal falls back to one MarkRenderStateDirty
+	 * recreate (the pre-C4c cost); later flips are in-place.
+	 */
+	void SetTileVisible(bool bVisible);
+
+	/** Geometry size of the current payload (verts, triangles) — the bench harness sums these across built
+	 *  tiles. Zero when no geometry is set. The payload is retained for the tile's residency (proxy
+	 *  recreations re-upload from it), so this is always answerable without touching the render thread. */
+	void GetTileGeometryStats(uint64& OutVerts, uint64& OutTris) const
+	{
+		OutVerts = Payload.IsValid() ? Payload->VertexCount : 0;
+		OutTris = Payload.IsValid() ? static_cast<uint64>(Payload->Indices.Num()) / 3 : 0;
+	}
+
 	//~ UPrimitiveComponent / UMeshComponent
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;

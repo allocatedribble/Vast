@@ -35,13 +35,16 @@ impl ViewFrustum {
     pub(crate) fn new(apex: DVec3, forward: DVec3, up: DVec3, fov_y_radians: f64, aspect: f64, margin: f64) -> Self {
         let f = forward.normalize_or_zero();
         let r = f.cross(up).normalize_or_zero();
-        if f == DVec3::ZERO || r == DVec3::ZERO {
-            return Self::default(); // no usable orientation → accept everything
+        if f == DVec3::ZERO || r == DVec3::ZERO || !fov_y_radians.is_finite() || !aspect.is_finite() {
+            return Self::default(); // no usable orientation / a NaN-Inf FOV or aspect → accept everything
         }
         let u = r.cross(f); // re-orthonormalized up (unit: r ⟂ f, both unit)
         let lim = std::f64::consts::FRAC_PI_2 - 1e-3; // keep half-angles < 90° so the planes stay sane
-        let half_v = (fov_y_radians * 0.5 + margin).clamp(0.0, lim);
-        let half_h = (((fov_y_radians * 0.5).tan() * aspect.max(1e-3)).atan() + margin).clamp(0.0, lim);
+                                                      // Clamp the INPUT angle exactly like `logi_geo_lod::tan_half_fov_y` (1e-3..π−1e-3): past π the raw
+                                                      // `tan(fov/2)` flips NEGATIVE and the result-side clamp would collapse half_h to a degenerate sliver.
+        let half_fov = (fov_y_radians.clamp(1e-3, std::f64::consts::PI - 1e-3)) * 0.5;
+        let half_v = (half_fov + margin).clamp(0.0, lim);
+        let half_h = ((half_fov.tan() * aspect.max(1e-3)).atan() + margin).clamp(0.0, lim);
         let (sv, cv) = half_v.sin_cos();
         let (sh, ch) = half_h.sin_cos();
         // Each inward normal is `forward·sin(half) ± axis·cos(half)`: it's ⟂ to that frustum edge and points

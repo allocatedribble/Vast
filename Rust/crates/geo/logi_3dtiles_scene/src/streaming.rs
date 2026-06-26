@@ -48,12 +48,96 @@ pub struct TileGeometry {
 
 impl TileGeometry {
     /// Approximate heap footprint of the renderer-bound buffers (bytes) — the budget unit for the decoded-
-    /// mesh LRU (`MeshCache`). Counts the three owned buffers; the small fixed-size bounds fields are noise.
+    /// flash cache (`FlashCache`). Counts the three owned buffers; the small fixed-size bounds fields are noise.
     #[inline]
     pub fn byte_size(&self) -> usize {
         self.vertices.len() + self.indices.len() * 4 + self.texture.len()
     }
 }
+
+/// On-disk format tag for a serialized [`TileGeometry`] blob (the persisted geometry tier, audit M3). Bumped on
+/// ANY layout OR content-semantics change so a stale blob from an older build is rejected by
+/// [`deserialize_geometry`] and re-decoded (no migration — discard-and-rebuild, ADR-0004).
+/// "LGM2": skirts (2026-06-11) — pre-skirt blobs must re-decode or the cracks they were cut to fix persist.
+/// "LGM3": skirt drop re-scaled (same day) — LGM2's 500 m cap left coarse-LOD cracks open (the orbital
+/// flat-purple triangles); blobs with the under-sized skirts must re-decode.
+const GEOM_BLOB_MAGIC: u32 = 0x4C47_4D33; // "LGM3"
+/// Fixed header: magic(4) + 3 buffer lengths(u32) + center[f32;3](12) + radius(f32)(4) + unlit(u8)(1) + pad(3).
+const GEOM_BLOB_HEADER: usize = 36;
+/// Per-buffer sanity cap so a corrupt/hostile header can't request a giant allocation (a decoded tile's buffers
+/// are far below the 64 MiB tile ceiling).
+const GEOM_BLOB_MAX_BUF: usize = 64 * 1024 * 1024;
+
+/// Serialize a decoded [`TileGeometry`] to a flat blob for the persisted geometry tier (audit M3): a fixed
+/// header (magic + buffer lengths + bounds + unlit) then the three raw POD buffers (no serde). Whole-blob
+/// integrity is the geometry `DiskCache`'s CRC-in-filename; the magic + exact-length check in
+/// [`deserialize_geometry`] is belt-and-suspenders against a format mismatch / truncation.
+pub(crate) fn serialize_geometry(g: &TileGeometry) -> Vec<u8> {
+    let mut out = Vec::with_capacity(GEOM_BLOB_HEADER + g.vertices.len() + g.indices.len() * 4 + g.texture.len());
+    out.extend_from_slice(&GEOM_BLOB_MAGIC.to_le_bytes());
+    out.extend_from_slice(&(g.vertices.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(g.indices.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(g.texture.len() as u32).to_le_bytes());
+    for c in g.bounds_center {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+    out.extend_from_slice(&g.bounds_radius.to_le_bytes());
+    out.push(g.unlit as u8);
+    out.extend_from_slice(&[0u8; 3]); // pad to GEOM_BLOB_HEADER
+    out.extend_from_slice(&g.vertices);
+    for i in &g.indices {
+        out.extend_from_slice(&i.to_le_bytes());
+    }
+    out.extend_from_slice(&g.texture);
+    out
+}
+
+/// Inverse of [`serialize_geometry`]. Returns `None` on a magic mismatch (stale format → re-decode), an
+/// over-cap length (corrupt header), or a size that doesn't match the declared buffers (truncation) — it never
+/// panics on bad bytes.
+pub(crate) fn deserialize_geometry(b: &[u8]) -> Option<TileGeometry> {
+    if b.len() < GEOM_BLOB_HEADER {
+        return None;
+    }
+    let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    if u32_at(0) != GEOM_BLOB_MAGIC {
+        return None;
+    }
+    let (vlen, ilen, tlen) = (u32_at(4) as usize, u32_at(8) as usize, u32_at(12) as usize);
+    if vlen > GEOM_BLOB_MAX_BUF || ilen > GEOM_BLOB_MAX_BUF || tlen > GEOM_BLOB_MAX_BUF {
+        return None;
+    }
+    let f32_at = |o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let bounds_center = [f32_at(16), f32_at(20), f32_at(24)];
+    let bounds_radius = f32_at(28);
+    let unlit = b[32] != 0;
+    // Exact-size check (truncation guard); `checked` math so a hostile length can't wrap.
+    let want = GEOM_BLOB_HEADER
+        .checked_add(vlen)?
+        .checked_add(ilen.checked_mul(4)?)?
+        .checked_add(tlen)?;
+    if b.len() != want {
+        return None;
+    }
+    let (vstart, istart) = (GEOM_BLOB_HEADER, GEOM_BLOB_HEADER + vlen);
+    let tstart = istart + ilen * 4;
+    let indices = b[istart..tstart]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    Some(TileGeometry {
+        vertices: b[vstart..istart].to_vec(),
+        indices,
+        texture: b[tstart..].to_vec(),
+        bounds_center,
+        bounds_radius,
+        unlit,
+    })
+}
+
+// (The axis-aligned `vertex_aabb` hole-clip helper was deleted 2026-06-09: the producer is now
+// `geo_world::oriented_clip_box`, which bounds the mesh in the tile's OWN ground frame — an axis-aligned box
+// over-cut tilted far-from-origin tiles, the PIE jagged-reveal + gap-ring artifact.)
 
 /// Combine a decoded glTF's primitives into one mesh in **Unreal render space** (cm), rebasing each vertex
 /// tile-local → ECEF (`world·yup2zup·node`, the P3DT placement) → ENU-local at `enu`'s origin → Unreal space
@@ -79,7 +163,9 @@ pub(crate) fn rebase_gltf(enu: &EnuFrame, g: logi_gltf::DecodedGltf, world: DMat
     // so the per-vertex loop applies a SINGLE matrix (~half the matrix ops/vertex). Identical math, in f64.
     let to_local = ecef_to_local_affine(enu);
     for prim in &g.primitives {
-        let node = glam::Mat4::from_cols_array_2d(&prim.node_transform).as_dmat4();
+        // `node_transform` is already f64 (re-read from the GLB JSON in logi_gltf — the `gltf` crate's f32
+        // would quantise P3DT's Earth-radius placement to a ~0.76 m PER-TILE grid → tile-aligned depth seams).
+        let node = glam::DMat4::from_cols_array_2d(&prim.node_transform);
         let m_local = to_local * (world * yup2zup * node);
         // Normals transform by the INVERSE-TRANSPOSE of the linear part (3D Tiles 1.1 / glTF). For a rotation
         // (Google P3DT) this equals the linear part itself (orthogonal ⇒ R⁻ᵀ = R), so it's a no-op there; it
@@ -153,10 +239,15 @@ pub(crate) fn rebase_gltf(enu: &EnuFrame, g: logi_gltf::DecodedGltf, world: DMat
                 }
             }
         }
-        // Rebase indices into the combined buffer; skip on overflow rather than wrapping (hostile input).
-        for &i in &prim.indices {
-            if let Some(idx) = i.checked_add(base) {
-                indices.push(idx);
+        // Rebase indices into the combined buffer. Both decode lanes already validated every index
+        // `< positions.len()` (logi_gltf / logi_draco), so `i + base` can only overflow if the AGGREGATE
+        // vertex count approaches u32::MAX — unreachable under the 64 MiB fetch cap, but if it ever fires,
+        // drop this primitive's WHOLE triangle list (C5, audit 2026-06-10): the old per-index skip silently
+        // shifted every subsequent index by one, garbling the rest of the list into random triangles.
+        // The primitive's already-emitted vertices stay as harmless unreferenced orphans.
+        if (base as u64) + (vcount as u64) <= u32::MAX as u64 {
+            for &i in &prim.indices {
+                indices.push(i + base);
             }
         }
         base = base.saturating_add(vcount);
@@ -186,6 +277,20 @@ pub(crate) fn rebase_gltf(enu: &EnuFrame, g: logi_gltf::DecodedGltf, world: DMat
             .find(|d| !d.is_empty())
             .unwrap_or_default(),
     };
+    // SKIRTS (2026-06-11 — the symmetric triangular see-through holes): adjacent tiles at DIFFERENT LODs
+    // don't share boundary vertices, so their edges crack open and a grazing view sees clean through the
+    // shell to the planet's far side (rows of regular dark triangles along cut boundaries — geometry gaps,
+    // not clip artifacts: fragment discard cuts box-edge shapes, these were triangle-shaped). The standard
+    // invisible fix (cesium quantized-mesh ships it natively): extrude every boundary edge DOWN along the
+    // geocentric axis by a fraction of the tile's extent, stretching the edge texel over the apron.
+    {
+        let earth_center = {
+            let ec = enu_pos_to_ue(enu.ecef_to_local(DVec3::ZERO));
+            glam::Vec3::new(ec[0], ec[1], ec[2])
+        };
+        let centroid = glam::Vec3::new((mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, (mn[2] + mx[2]) * 0.5);
+        add_skirts(&mut vertices, &mut indices, centroid, earth_center, &mut mn, &mut mx);
+    }
     let (bounds_center, bounds_radius) = aabb_to_sphere(mn, mx);
     // Reject non-finite bounds (all-NaN / degenerate geometry) — they would poison culling/placement (M14).
     if !bounds_center.iter().all(|c| c.is_finite()) || !bounds_radius.is_finite() {
@@ -199,6 +304,99 @@ pub(crate) fn rebase_gltf(enu: &EnuFrame, g: logi_gltf::DecodedGltf, world: DMat
         bounds_radius,
         unlit,
     })
+}
+
+/// Skirt sizing: drop = this fraction of the tile's AABB diagonal, clamped to [min, max] cm. The drop must
+/// cover the vertical mismatch between adjacent LODs ≈ the coarser neighbour's geometric error — and P3DT
+/// halves BOTH tile size and geometric error per level, so a fixed fraction of the tile's own extent tracks
+/// that mismatch at every depth (5% of diag ≈ 2× the tile's own GE). The original 500 m max silenced exactly
+/// the coarse-LOD cracks skirts exist to close (the 2026-06-11 orbital flat-purple triangles: rendered cut
+/// depth 2–10, GE up to ~5.3 km ⇒ mismatch ~10 km); 25 km covers the deepest rendered mismatch with margin
+/// and still bounds a degenerate planet-root tile. Cost: 2 triangles per boundary edge (boundary ≈ O(√T) of
+/// a tile's T triangles) + side-facing fill only along cut edges.
+const SKIRT_DROP_FRACTION: f32 = 0.05;
+const SKIRT_DROP_MIN_CM: f32 = 100.0; // 1 m
+const SKIRT_DROP_MAX_CM: f32 = 2_500_000.0; // 25 km
+
+/// Append SKIRTS to a rebased tile mesh: every BOUNDARY edge (used by exactly one triangle) is extruded
+/// `drop` centimetres toward the earth center, closing the see-through cracks where adjacent tiles at
+/// different LODs don't share edge vertices (the 2026-06-11 symmetric-triangle holes). Skirt vertices copy
+/// the parent vertex's normal + UV — the edge texel stretches over the apron, invisible from above — and
+/// the skirt quad inherits the boundary edge's winding AS WOUND in its owning triangle, so it faces the
+/// same way the surface does. `mn`/`mx` are extended so the tile's bounds (culling + clip boxes) cover the
+/// apron. Interior mesh holes (rare) get harmless skirts too — hidden beneath the surface.
+fn add_skirts(
+    vertices: &mut Vec<u8>,
+    indices: &mut Vec<u32>,
+    centroid: glam::Vec3,
+    earth_center: glam::Vec3,
+    mn: &mut [f32; 3],
+    mx: &mut [f32; 3],
+) {
+    const STRIDE: usize = 32; // pos f3 | normal f3 | uv f2 (logi_geo_mesh::VERTEX_STRIDE)
+    if indices.len() < 3 || vertices.len() < STRIDE {
+        return;
+    }
+    let down = (earth_center - centroid).normalize_or_zero();
+    if down == glam::Vec3::ZERO {
+        return; // centroid at the earth center — hostile/degenerate content; no skirt is always safe
+    }
+    let diag = (glam::Vec3::from(*mx) - glam::Vec3::from(*mn)).length();
+    let drop = (diag * SKIRT_DROP_FRACTION).clamp(SKIRT_DROP_MIN_CM, SKIRT_DROP_MAX_CM);
+    // Boundary edges: undirected use-count over all triangles, keeping the DIRECTED first occurrence so the
+    // skirt inherits the surface winding. O(T) hashing.
+    let mut edges: hashbrown::HashMap<(u32, u32), (u32, u32, u32)> = hashbrown::HashMap::with_capacity(indices.len());
+    for t in indices.chunks_exact(3) {
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            edges
+                .entry((a.min(b), a.max(b)))
+                .and_modify(|e| e.0 += 1)
+                .or_insert((1, a, b));
+        }
+    }
+    let vcount = (vertices.len() / STRIDE) as u32;
+    let boundary: Vec<(u32, u32)> = edges
+        .into_values()
+        .filter(|&(count, a, b)| count == 1 && a < vcount && b < vcount)
+        .map(|(_, a, b)| (a, b))
+        .collect();
+    if boundary.is_empty() {
+        return; // a closed mesh — nothing to skirt
+    }
+    // Duplicate each boundary vertex once (displaced down, attributes copied), then stitch the quads.
+    let mut skirt_of: hashbrown::HashMap<u32, u32> = hashbrown::HashMap::with_capacity(boundary.len());
+    for &(a, b) in &boundary {
+        for i in [a, b] {
+            skirt_of.entry(i).or_insert_with(|| {
+                let off = i as usize * STRIDE;
+                let mut v: [u8; STRIDE] = vertices[off..off + STRIDE].try_into().expect("stride slice");
+                let f32_at =
+                    |v: &[u8; STRIDE], k: usize| f32::from_le_bytes(v[k * 4..k * 4 + 4].try_into().expect("f32"));
+                // PER-VERTEX drop direction: toward the earth center from THIS vertex, not from the tile
+                // centroid — a constant centroid direction goes tangent at the corners of large curved tiles
+                // (a hemisphere-scale tile's corner "down" differs by up to ~90°), and at km-scale drops a
+                // tangent skirt is a visible flap poking through the surface instead of a hidden apron.
+                let pos = glam::Vec3::new(f32_at(&v, 0), f32_at(&v, 1), f32_at(&v, 2));
+                let dir = (earth_center - pos).normalize_or_zero();
+                let disp = if dir == glam::Vec3::ZERO { down } else { dir } * drop;
+                for (k, d) in [disp.x, disp.y, disp.z].into_iter().enumerate() {
+                    let p = f32_at(&v, k) + d;
+                    v[k * 4..k * 4 + 4].copy_from_slice(&p.to_le_bytes());
+                    mn[k] = mn[k].min(p);
+                    mx[k] = mx[k].max(p);
+                }
+                let new_index = (vertices.len() / STRIDE) as u32;
+                vertices.extend_from_slice(&v);
+                new_index
+            });
+        }
+    }
+    indices.reserve(boundary.len() * 6);
+    for (a, b) in boundary {
+        let (a2, b2) = (skirt_of[&a], skirt_of[&b]);
+        // Edge wound a→b in its owning triangle ⇒ the apron (a, b, b2) + (a, b2, a2) faces with the surface.
+        indices.extend_from_slice(&[a, b, b2, a, b2, a2]);
+    }
 }
 
 /// The ECEF→ENU-local rebase as one affine `DMat4`: rotate by `enu.ecef_to_enu`, translate by −R·origin
@@ -246,6 +444,128 @@ pub(crate) fn tile_at_mut<'a>(root: &'a mut Tile, path: &[u32]) -> Option<&'a mu
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
+
+    #[test]
+    fn skirts_extrude_every_boundary_edge_downward() {
+        // An open quad (4 verts, 2 triangles) above the origin; "down" toward an earth center at -Z.
+        // All 4 outer edges are boundary (the diagonal is shared) ⇒ +4 skirt verts, +8 skirt triangles.
+        const STRIDE: usize = 32;
+        let pos = [
+            [0.0f32, 0.0, 1000.0],
+            [100.0, 0.0, 1000.0],
+            [100.0, 100.0, 1000.0],
+            [0.0, 100.0, 1000.0],
+        ];
+        let mut vertices = Vec::new();
+        for p in pos {
+            let v8 = [p[0], p[1], p[2], 0.0, 0.0, 1.0, 0.25, 0.75]; // pos | normal | uv
+            vertices.extend_from_slice(bytemuck::cast_slice(&v8));
+        }
+        let mut indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
+        let (mut mn, mut mx) = ([0.0f32, 0.0, 1000.0], [100.0f32, 100.0, 1000.0]);
+        add_skirts(
+            &mut vertices,
+            &mut indices,
+            glam::Vec3::new(50.0, 50.0, 1000.0),
+            glam::Vec3::new(50.0, 50.0, -1.0e9), // earth center far below ⇒ down = -Z
+            &mut mn,
+            &mut mx,
+        );
+        assert_eq!(vertices.len() / STRIDE, 8, "4 boundary verts duplicated once each");
+        assert_eq!(indices.len(), 6 + 4 * 6, "2 surface + 8 skirt triangles");
+        // diag ≈ 141 cm ⇒ 5% ≈ 7 cm, clamped UP to the 100 cm floor: every skirt vertex exactly 100 below
+        // its parent, bounds extended to match, normal + uv copied verbatim.
+        assert_eq!(
+            (mn[2], mx[2]),
+            (900.0, 1000.0),
+            "bounds extended downward by the clamped drop"
+        );
+        for i in 4..8 {
+            let off = i * STRIDE;
+            let z = f32::from_le_bytes(vertices[off + 8..off + 12].try_into().unwrap());
+            assert_eq!(z, 900.0, "skirt vertex {i} dropped by the 100 cm floor (z={z})");
+            let nz = f32::from_le_bytes(vertices[off + 20..off + 24].try_into().unwrap());
+            let u = f32::from_le_bytes(vertices[off + 24..off + 28].try_into().unwrap());
+            assert_eq!((nz, u), (1.0, 0.25), "normal + uv copied from the parent vertex");
+        }
+        // Winding: each skirt quad's first triangle reuses its boundary edge AS WOUND (a, b, b').
+        for q in indices[6..].chunks_exact(6) {
+            assert!(
+                q[0] < 4 && q[1] < 4 && q[2] >= 4,
+                "apron tri = (surface a, surface b, skirt b')"
+            );
+        }
+    }
+
+    #[test]
+    fn skirt_drop_scales_with_coarse_tile_extent() {
+        // The 2026-06-11 orbital flat-purple triangles: coarse-LOD cracks are km-scale (GE up to ~5.3 km in
+        // the rendered cut), and the original 500 m drop cap couldn't close them. A 100 km tile must get a
+        // ~7 km skirt (5% of its diagonal), NOT a 500 m one.
+        const STRIDE: usize = 32;
+        const KM100: f32 = 1.0e7; // cm
+        let pos = [
+            [0.0f32, 0.0, 0.0],
+            [KM100, 0.0, 0.0],
+            [KM100, KM100, 0.0],
+            [0.0, KM100, 0.0],
+        ];
+        let mut vertices = Vec::new();
+        for p in pos {
+            let v8 = [p[0], p[1], p[2], 0.0, 0.0, 1.0, 0.5, 0.5];
+            vertices.extend_from_slice(bytemuck::cast_slice(&v8));
+        }
+        let mut indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
+        let (mut mn, mut mx) = ([0.0f32, 0.0, 0.0], [KM100, KM100, 0.0]);
+        add_skirts(
+            &mut vertices,
+            &mut indices,
+            glam::Vec3::new(KM100 * 0.5, KM100 * 0.5, 0.0),
+            glam::Vec3::new(KM100 * 0.5, KM100 * 0.5, -6.4e8), // earth center ~6,400 km below
+            &mut mn,
+            &mut mx,
+        );
+        // drop = 5% × diag (≈ 1.414e7) ≈ 7.07e5 cm ≈ 7.07 km; per-vertex direction tilts ≤ ~0.8% off -Z.
+        assert_eq!(vertices.len() / STRIDE, 8, "4 boundary verts duplicated");
+        assert!(
+            (-7.2e5..=-6.9e5).contains(&mn[2]),
+            "a 100 km tile's skirt drops ~7 km (got {} cm) — the old 500 m cap must not bind",
+            mn[2]
+        );
+    }
+
+    #[test]
+    fn geometry_blob_roundtrips_and_rejects_corruption() {
+        // M3: serialize → deserialize must reconstruct the geometry EXACTLY, and a magic/length corruption must
+        // be rejected (`None`) rather than producing a bad mesh — the persisted geometry tier relies on both.
+        let g = TileGeometry {
+            vertices: (0..96u8).collect(), // 3 vertices × 32-byte layout
+            indices: vec![0u32, 1, 2, 2, 1, 0],
+            texture: vec![0xFF, 0xD8, 0xFF, 0xAA], // a few "JPEG" bytes
+            bounds_center: [1.5, -2.0, 3.25],
+            bounds_radius: 12.5,
+            unlit: true,
+        };
+        let blob = serialize_geometry(&g);
+        let back = deserialize_geometry(&blob).expect("roundtrip");
+        assert_eq!(back.vertices, g.vertices);
+        assert_eq!(back.indices, g.indices);
+        assert_eq!(back.texture, g.texture);
+        assert_eq!(back.bounds_center, g.bounds_center);
+        assert_eq!(back.bounds_radius, g.bounds_radius);
+        assert_eq!(back.unlit, g.unlit);
+
+        // Truncation → None (the exact-size guard); wrong magic → None (a stale-format blob is re-decoded, not
+        // mis-read); too short for even the header → None.
+        assert!(
+            deserialize_geometry(&blob[..blob.len() - 1]).is_none(),
+            "truncated blob rejected"
+        );
+        let mut bad = blob.clone();
+        bad[0] ^= 0xFF;
+        assert!(deserialize_geometry(&bad).is_none(), "bad magic rejected");
+        assert!(deserialize_geometry(&[0u8; 4]).is_none(), "too short rejected");
+    }
 
     #[test]
     fn ecef_to_local_affine_matches_two_step() {
@@ -309,7 +629,7 @@ mod streaming_tests {
                 base_color_factor: [1.0; 4],
                 base_color_texture: base_color,
                 unlit: false,
-                node_transform: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                node_transform: glam::DMat4::IDENTITY.to_cols_array_2d(),
             }],
             images,
         }
