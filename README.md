@@ -2,6 +2,8 @@
 
 **A near-Earth-scale planet simulation where the *game* lives in Rust and Unreal Engine is a rendering shell.**
 
+NOT NEAR EARTH-SCALE YET.
+
 Vast is a first- and third-person game set in a living, streamed planet — continuous from orbital
 flows down to a single character on foot. It is built on one unusual bet, carried all the way through:
 
