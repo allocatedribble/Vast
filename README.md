@@ -200,9 +200,7 @@ commits — the constitution is how a small project stays coherent.
 
 ## License
 
-**To be determined.** Treat the source as all-rights-reserved by the author until a `LICENSE` file is
-added. If you want to build on it, open an issue first — licensing intent will be settled before
-outside contributions are merged.
+Free
 
 ---
 
